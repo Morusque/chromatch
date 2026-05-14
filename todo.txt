@@ -1,0 +1,25 @@
+- scroll bar isn't always there
+- button to remove track from list
+- option to report closest froma/tempo matching couples from all combinations
+- actual checkbox for "keep", not [-] one
+- beat sync at downbeat
+- beat seeker
+- make it play nicely
+- tempo slider
+- integrate track infos from the former tool
+- add the "match/supermatch" marking logic
+- export graphviz graphfs
+- idea : export as traktor/mixxx file
+- idea : inverse match with eq profile
+- idea : automix
+- clean unused columns
+- better chroma graphical display
+- redefine "sort by similarity" buttons vs selection vs sorting (single "target" button)
+- why sorting by chroma/tempo often leads to similar tempi first? that sounds wrong
+- better playback
+- handle variations in tempo and chroma
+- handle time signatures
+- display tags (artist etc)
+- optimize the csv (or another in/out format) export?
+
+

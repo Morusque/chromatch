@@ -10,6 +10,7 @@ import threading
 import time
 import tkinter as tk
 from dataclasses import dataclass, field, replace
+from datetime import datetime
 from pathlib import Path
 from io import BytesIO
 from tkinter import filedialog, messagebox, ttk
@@ -94,6 +95,7 @@ class AnalysisRow:
     method: str
     detail: str
     error: str = ""
+    analyzed_at: str = ""
 
 
 @dataclass
@@ -167,6 +169,10 @@ def parse_optional_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def analysis_timestamp() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
 
 
 def encode_array(values: np.ndarray) -> str:
@@ -873,6 +879,8 @@ class TempoWindow:
             variable=self.ignore_target_tempo_var,
             command=self.update_playback_settings_from_ui,
         ).pack(side="left", padx=(8, 0))
+        self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
+        self.play_all_button.pack(side="left", padx=(16, 0))
 
         self.waveform_container = ttk.Frame(panel)
         self.waveform_container.pack(fill="x", pady=(8, 0))
@@ -1062,6 +1070,7 @@ class TempoWindow:
             method=record.get("method", ""),
             detail=record.get("detail", ""),
             error=record.get("error", ""),
+            analyzed_at=record.get("analyzed_at", ""),
         )
 
     def handle_drop(self, event) -> None:
@@ -1969,6 +1978,17 @@ class TempoWindow:
         else:
             self.start_waveform(slot)
 
+    def play_all_waveforms(self) -> None:
+        if not self.waveform_slots:
+            messagebox.showinfo("Chromatch", "Display one or more tracks before using Play all.")
+            return
+
+        for slot in list(self.waveform_slots):
+            if not slot.is_playing:
+                self.start_waveform(slot)
+        playing = sum(1 for slot in self.waveform_slots if slot.is_playing)
+        self.result.configure(text=f"Playing {playing} displayed track(s).")
+
     def start_waveform(self, slot: WaveformSlot) -> None:
         global sd, SOUNDDEVICE_IMPORT_ERROR
 
@@ -2237,6 +2257,7 @@ class TempoWindow:
                     method="" if estimate is None else estimate.method,
                     detail="" if estimate is None else estimate.detail,
                     error="; ".join(errors),
+                    analyzed_at=analysis_timestamp(),
                 )
 
                 self.result_queue.put(("row", row, processed, remaining))
@@ -2340,6 +2361,7 @@ class TempoWindow:
                     "uncertainty_bpm",
                     "confidence_0_100",
                     "tapped_tempo_bpm",
+                    "analyzed_at",
                     "chroma_similarity_0_100",
                     "chroma_tempo_similarity_0_100",
                     "chroma_top_peaks",
@@ -2363,6 +2385,7 @@ class TempoWindow:
                         "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
                         "" if row.confidence is None else f"{row.confidence:.0f}",
                         "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
+                        row.analyzed_at,
                         "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
                         "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",
                         "" if row.chroma is None else row.chroma.top_peaks,

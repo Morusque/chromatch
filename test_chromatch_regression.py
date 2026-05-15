@@ -110,6 +110,18 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertNotIn("BPM", values[1])
         self.assertEqual(3, len(values[5].split()))
 
+    def test_csv_loader_preserves_analysis_timestamp(self):
+        row = self.app.row_from_csv_record(
+            {
+                "filepath": "track.wav",
+                "detected_tempo_bpm": "123.45",
+                "analyzed_at": "2026-05-15T10:20:30+02:00",
+            },
+            Path("."),
+        )
+
+        self.assertEqual("2026-05-15T10:20:30+02:00", row.analyzed_at)
+
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
             mixer_lock = chromatch.threading.RLock()
@@ -199,6 +211,23 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(1.0, slot.tempo_multiplier)
         self.assertAlmostEqual(1.0, slot.volume)
+
+    def test_play_all_starts_displayed_tracks_without_stopping_active_ones(self):
+        first = chromatch.WaveformSlot(row_id="first", row=self.make_row("first.wav"), is_playing=True)
+        second = chromatch.WaveformSlot(row_id="second", row=self.make_row("second.wav"), is_playing=False)
+        started = []
+        self.app.waveform_slots = [first, second]
+        original_start = self.app.start_waveform
+        self.app.start_waveform = lambda slot: (started.append(slot.row_id), setattr(slot, "is_playing", True))
+
+        try:
+            self.app.play_all_waveforms()
+        finally:
+            self.app.start_waveform = original_start
+
+        self.assertEqual(["second"], started)
+        self.assertTrue(first.is_playing)
+        self.assertTrue(second.is_playing)
 
     def test_sort_heading_shows_direction_marker(self):
         self.app.sort_by_column("filename")

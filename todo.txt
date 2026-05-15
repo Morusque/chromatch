@@ -2,17 +2,16 @@
 done, to review :
 
 todo soon :
-- add an analysis date in the csv so that it's easier to know what file to update if analysis improvements are made
 
 zoomed :
 - the zoomed in view could have a better resolution (maybe threaded or cached or something if that's too much to compute)
 - in zoomed view beat bars and waveform could move more in sync with each other when shifted, zoomed etc
 - (probably to be done later) allow to manually place two or more beats to help with tempo detection
+- beat bars don't appear right regarding the tempo (eg on "Superbad - lb..." tempo is right, and a full bar passes while an eneven number of bars seem tohave passed)
 
 sync :
 - have a master metronome (with a checkbox to hear it), sync beats to it
 - option (checkbox) beat sync to metronome when pressin play on a track
-- have a "play all" button on the "target tempo, etc" lane that starts every currently displayed track
 - if sync option activated, keep a track in sync even when placing the playhead somewhere else while playing (eg going to the closest sync point or waiting for the current one to be in sync)
 
 UI :
@@ -22,6 +21,7 @@ detection :
 - handle variations in tempo and chroma
 - handle time signatures
 - define cues for structure parts and loops
+- a spoken track ("000 godxiliary - ...") with a flatter chroma profile seems to appear always closer to any other track, isn't that wrong somehow?
 
 todo at some point :
 - add a button to export a picture of currently selected track : evolving chromagram, like a spectrogram but evoleving over time (time = horizontal, notes in octave = vertical, bin gain = from dark to bright)

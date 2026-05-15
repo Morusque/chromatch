@@ -139,6 +139,22 @@ def confidence_from_uncertainty(bpm: float, uncertainty_bpm: float) -> float:
     return max(0.0, min(100.0, 100.0 - ratio * 300.0))
 
 
+def refine_tempo_from_beats(beats: np.ndarray) -> float | None:
+    if len(beats) < 3:
+        return None
+
+    beat_indexes = np.arange(len(beats), dtype=float)
+    try:
+        interval_seconds, _offset = np.polyfit(beat_indexes, beats, 1)
+    except Exception:
+        return None
+
+    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
+        return None
+
+    return fold_bpm(60.0 / float(interval_seconds))
+
+
 def parse_optional_float(value: str | None) -> float | None:
     if value is None:
         return None
@@ -504,15 +520,8 @@ def simple_chroma_peaks(chroma: ChromaEstimate | None) -> str:
     if chroma is None:
         return ""
 
-    strongest = np.argsort(chroma.histogram)[-3:][::-1]
-    names = []
-    for index in strongest:
-        note_index = int((index / len(chroma.histogram)) * len(NOTE_NAMES)) % len(NOTE_NAMES)
-        name = NOTE_NAMES[note_index]
-        if name not in names:
-            names.append(name)
-
-    return " ".join(names)
+    strongest_notes = np.argsort(chroma.note_values)[-3:][::-1]
+    return " ".join(NOTE_NAMES[index] for index in strongest_notes)
 
 
 def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
@@ -547,14 +556,16 @@ def estimate_tempo_with_librosa(path: Path) -> TempoEstimate:
     if not np.isfinite(tempo) or tempo <= 0 or len(beats) < 2:
         raise ValueError("No clear beat was found.")
 
-    tempo = fold_bpm(tempo)
+    tracker_tempo = fold_bpm(tempo)
+    refined_tempo = refine_tempo_from_beats(np.asarray(beats, dtype=float))
+    tempo = refined_tempo if refined_tempo is not None else tracker_tempo
 
     interval_bpms = np.array([fold_bpm(60 / interval) for interval in np.diff(beats) if interval > 0])
     if interval_bpms.size >= 3:
         median_bpm = float(np.median(interval_bpms))
         mad = float(np.median(np.abs(interval_bpms - median_bpm)))
         uncertainty_bpm = max(1.0, min(30.0, 1.4826 * mad))
-        detail = f"{len(beats)} beats tracked"
+        detail = f"{len(beats)} beats tracked; tracker {tracker_tempo:.2f} BPM"
     else:
         uncertainty_bpm = 12.0
         detail = "few beats tracked"
@@ -704,8 +715,11 @@ class TempoWindow:
         self.queue_lock = threading.Lock()
         self.sort_column: str | None = None
         self.sort_descending = False
+        self.similarity_target_ids: set[str] = set()
+        self.table_headings: dict[str, str] = {}
         self.tap_times: list[float] = []
         self.current_tapped_bpm: float | None = None
+        self.ctrl_pressed = False
         self.tapped_tempo_var = tk.StringVar(value="")
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
@@ -731,6 +745,10 @@ class TempoWindow:
         )
 
         self._build_ui()
+        self.root.bind_all("<KeyPress-Control_L>", self.set_ctrl_pressed)
+        self.root.bind_all("<KeyPress-Control_R>", self.set_ctrl_pressed)
+        self.root.bind_all("<KeyRelease-Control_L>", self.clear_ctrl_pressed)
+        self.root.bind_all("<KeyRelease-Control_R>", self.clear_ctrl_pressed)
 
     def _build_ui(self) -> None:
         self.root.configure(bg="#f4f1ec")
@@ -762,6 +780,9 @@ class TempoWindow:
 
         remove_selected = ttk.Button(actions, text="Remove selected", command=self.remove_selected_rows)
         remove_selected.pack(side="left", padx=(8, 0))
+
+        reanalyze_selected = ttk.Button(actions, text="Re-analyze selected", command=self.reanalyze_selected_rows)
+        reanalyze_selected.pack(side="left", padx=(8, 0))
 
         self.similarity_button = ttk.Button(
             actions,
@@ -838,6 +859,7 @@ class TempoWindow:
             variable=self.target_tempo_slider_var,
             command=self.set_target_tempo_from_slider,
         )
+        self.target_tempo_slider.bind("<Double-Button-1>", self.reset_target_tempo_slider)
         self.target_tempo_slider.pack(side="left", padx=(0, 16))
         ttk.Checkbutton(
             controls,
@@ -899,6 +921,7 @@ class TempoWindow:
             "title": "Title",
             "album": "Album",
         }
+        self.table_headings = headings
         for column, text in headings.items():
             self.table.heading(
                 column,
@@ -922,14 +945,22 @@ class TempoWindow:
             yscrollcommand=lambda first, last: self.sync_table_scroll(scrollbar, first, last),
             xscrollcommand=horizontal_scrollbar.set,
         )
+        self.table.tag_configure("similarity_target", background="#fff3c4")
         self.table.grid(row=0, column=1, sticky="nsew")
         scrollbar.grid(row=0, column=2, sticky="ns")
         horizontal_scrollbar.grid(row=1, column=1, sticky="ew")
         self.table.bind("<<TreeviewSelect>>", self.handle_table_selection)
+        self.update_sort_headings()
 
     def scroll_tables(self, *args) -> None:
         self.table.yview(*args)
         self.play_table.yview(*args)
+
+    def set_ctrl_pressed(self, _event=None) -> None:
+        self.ctrl_pressed = True
+
+    def clear_ctrl_pressed(self, _event=None) -> None:
+        self.ctrl_pressed = False
 
     def sync_table_scroll(self, scrollbar: ttk.Scrollbar, first: str, last: str) -> None:
         scrollbar.set(first, last)
@@ -974,6 +1005,7 @@ class TempoWindow:
         self.is_analyzing = False
         self.sort_column = None
         self.sort_descending = False
+        self.similarity_target_ids.clear()
         self.export_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
@@ -1057,6 +1089,7 @@ class TempoWindow:
         with self.mixer_lock:
             self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id not in selected_ids]
         self.rows = [row for row in self.rows if self.row_id(row) not in selected_ids]
+        self.similarity_target_ids.difference_update(selected_ids)
 
         with self.queue_lock:
             self.analysis_queue = [path for path in self.analysis_queue if str(path.resolve()) not in selected_ids]
@@ -1100,6 +1133,41 @@ class TempoWindow:
             worker.start()
             self.root.after(50, self.process_analysis_results)
 
+    def reanalyze_selected_rows(self) -> None:
+        selected_ids = set(self.table.selection())
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        selected_paths = []
+        for row in self.rows:
+            if self.row_id(row) in selected_ids:
+                selected_paths.append(row.path)
+
+        if not selected_paths:
+            messagebox.showinfo("Chromatch", "No selected rows were found.")
+            return
+
+        with self.queue_lock:
+            queued_ids = {str(path) for path in self.analysis_paths}
+            new_paths = [path for path in selected_paths if str(path.resolve()) not in queued_ids]
+            self.analysis_queue.extend(new_paths)
+            self.analysis_paths.update(path.resolve() for path in new_paths)
+
+        if not new_paths:
+            self.result.configure(text="Selected rows are already queued")
+            return
+
+        self.export_button.configure(state="disabled")
+        self.pairs_button.configure(state="disabled")
+        self.result.configure(text=f"Queued {len(new_paths)} selected tracks for re-analysis")
+
+        if not self.is_analyzing:
+            self.is_analyzing = True
+            worker = threading.Thread(target=self._analyze_queue_in_background, daemon=True)
+            worker.start()
+            self.root.after(50, self.process_analysis_results)
+
     def sort_by_column(self, column: str) -> None:
         if self.sort_column == column:
             self.sort_descending = not self.sort_descending
@@ -1111,7 +1179,19 @@ class TempoWindow:
                 "chroma_tempo_similarity",
             }
 
+        self.update_sort_headings()
         self.refresh_table()
+
+    def update_sort_headings(self) -> None:
+        for column, text in self.table_headings.items():
+            marker = ""
+            if column == self.sort_column:
+                marker = " v" if self.sort_descending else " ^"
+            self.table.heading(
+                column,
+                text=f"{text}{marker}",
+                command=lambda column=column: self.sort_by_column(column),
+            )
 
     def set_similarity_target(self) -> None:
         targets = self.selected_target_rows()
@@ -1119,6 +1199,7 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "Select one or more target rows first.")
             return
 
+        self.similarity_target_ids = {self.row_id(row) for row in targets}
         self.update_similarity_scores(targets)
         self.refresh_table()
         self.result.configure(text=f"Similarity target set from {len(targets)} selected tracks")
@@ -1139,6 +1220,13 @@ class TempoWindow:
                 rows.append(row)
         return rows
 
+    def current_similarity_target_rows(self) -> list[AnalysisRow]:
+        rows = []
+        for row in self.rows:
+            if self.row_id(row) in self.similarity_target_ids and row.chroma is not None:
+                rows.append(row)
+        return rows
+
     def row_by_id(self, row_id: str) -> AnalysisRow | None:
         for row in self.rows:
             if self.row_id(row) == row_id:
@@ -1150,7 +1238,7 @@ class TempoWindow:
 
     def update_similarity_scores(self, targets: list[AnalysisRow] | None = None) -> None:
         if targets is None:
-            targets = self.selected_target_rows()
+            targets = self.current_similarity_target_rows() or self.selected_target_rows()
 
         if not targets:
             self.rows = [
@@ -1217,10 +1305,20 @@ class TempoWindow:
             return
 
         tempo = float(value)
+        tempo = round(tempo, 2 if self.ctrl_pressed else 1)
         self.auto_target_tempo_var.set(False)
         self.target_tempo_var.set(f"{tempo:.1f}")
         with self.mixer_lock:
             self.playback_target_tempo = tempo
+            self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+        self.draw_all_waveforms()
+
+    def reset_target_tempo_slider(self, _event=None) -> None:
+        self.auto_target_tempo_var.set(False)
+        self.target_tempo_var.set("120.0")
+        self.target_tempo_slider_var.set(120.0)
+        with self.mixer_lock:
+            self.playback_target_tempo = 120.0
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
         self.draw_all_waveforms()
 
@@ -1321,7 +1419,8 @@ class TempoWindow:
         for row in self.sorted_rows():
             row_id = self.row_id(row)
             self.play_table.insert("", "end", iid=row_id, values=("Play",))
-            self.table.insert("", "end", iid=row_id, values=self.row_values(row))
+            tags = ("similarity_target",) if row_id in self.similarity_target_ids else ()
+            self.table.insert("", "end", iid=row_id, values=self.row_values(row), tags=tags)
 
         existing_ids = set(self.table.get_children())
         restored_selection = [row_id for row_id in selected_ids if row_id in existing_ids]
@@ -1502,7 +1601,7 @@ class TempoWindow:
             speed_frame.pack(side="left", padx=(4, 0))
             slot.tempo_multiplier_label = ttk.Label(speed_frame, text=f"x{slot.tempo_multiplier:.2f}", width=5)
             slot.tempo_multiplier_label.pack(side="left")
-            ttk.Scale(
+            tempo_scale = ttk.Scale(
                 speed_frame,
                 from_=0.5,
                 to=2.0,
@@ -1510,13 +1609,15 @@ class TempoWindow:
                 length=105,
                 variable=slot.tempo_multiplier_var,
                 command=lambda value, slot=slot: self.set_slot_tempo_multiplier(slot, value),
-            ).pack(side="left")
+            )
+            tempo_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_tempo_multiplier(slot))
+            tempo_scale.pack(side="left")
             slot.volume_var = tk.DoubleVar(value=slot.volume)
             volume_frame = ttk.Frame(controls)
             volume_frame.pack(side="left", padx=(4, 0))
             slot.volume_label = ttk.Label(volume_frame, text=f"{slot.volume:.0%}", width=5)
             slot.volume_label.pack(side="left")
-            ttk.Scale(
+            volume_scale = ttk.Scale(
                 volume_frame,
                 from_=0.0,
                 to=1.0,
@@ -1524,7 +1625,9 @@ class TempoWindow:
                 length=90,
                 variable=slot.volume_var,
                 command=lambda value, slot=slot: self.set_slot_volume(slot, value),
-            ).pack(side="left")
+            )
+            volume_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_volume(slot))
+            volume_scale.pack(side="left")
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
                 controls,
@@ -1808,20 +1911,36 @@ class TempoWindow:
 
     def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
         multiplier = max(0.5, min(2.0, float(value)))
+        multiplier = round(multiplier, 3 if self.ctrl_pressed else 2)
         with self.mixer_lock:
             slot.tempo_multiplier = multiplier
+        if slot.tempo_multiplier_var is not None and abs(slot.tempo_multiplier_var.get() - multiplier) > 1e-9:
+            slot.tempo_multiplier_var.set(multiplier)
         if slot.tempo_multiplier_label is not None:
             slot.tempo_multiplier_label.configure(text=f"x{multiplier:.2f}")
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
 
+    def reset_slot_tempo_multiplier(self, slot: WaveformSlot) -> None:
+        if slot.tempo_multiplier_var is not None:
+            slot.tempo_multiplier_var.set(1.0)
+        self.set_slot_tempo_multiplier(slot, "1.0")
+
     def set_slot_volume(self, slot: WaveformSlot, value: str) -> None:
         volume = max(0.0, min(1.0, float(value)))
+        volume = round(volume, 3 if self.ctrl_pressed else 2)
         with self.mixer_lock:
             slot.volume = volume
+        if slot.volume_var is not None and abs(slot.volume_var.get() - volume) > 1e-9:
+            slot.volume_var.set(volume)
         if slot.volume_label is not None:
             slot.volume_label.configure(text=f"{volume:.0%}")
+
+    def reset_slot_volume(self, slot: WaveformSlot) -> None:
+        if slot.volume_var is not None:
+            slot.volume_var.set(1.0)
+        self.set_slot_volume(slot, "1.0")
 
     def set_waveform_keep(self, slot: WaveformSlot) -> None:
         slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
@@ -1980,21 +2099,44 @@ class TempoWindow:
 
     def tap_tempo(self) -> None:
         now = time.perf_counter()
-        if self.tap_times and now - self.tap_times[-1] > 3.0:
+        if self.tap_times and now - self.tap_times[-1] > 5.0:
             self.tap_times.clear()
 
         self.tap_times.append(now)
-        self.tap_times = self.tap_times[-8:]
+        self.tap_times = self.tap_times[-16:]
 
         if len(self.tap_times) < 2:
             self.tapped_tempo_var.set("")
             self.current_tapped_bpm = None
             return
 
-        intervals = np.diff(self.tap_times)
-        bpm = 60.0 / float(np.mean(intervals))
+        bpm = self.estimate_tapped_bpm()
+        if bpm is None:
+            return
+
         self.current_tapped_bpm = bpm
-        self.tapped_tempo_var.set(f"{bpm:.1f}")
+        self.tapped_tempo_var.set(f"{bpm:.2f}")
+
+    def estimate_tapped_bpm(self) -> float | None:
+        if len(self.tap_times) < 2:
+            return None
+
+        tap_times = np.array(self.tap_times, dtype=float)
+        intervals = np.diff(tap_times)
+        intervals = intervals[intervals > 0]
+        if intervals.size == 0:
+            return None
+
+        median_interval = float(np.median(intervals))
+        regression_bpm = refine_tempo_from_beats(tap_times)
+        median_bpm = fold_bpm(60.0 / median_interval)
+        bpm = regression_bpm if regression_bpm is not None else median_bpm
+
+        if self.current_tapped_bpm is not None and len(self.tap_times) >= 4:
+            inertia = min(0.85, 0.45 + len(self.tap_times) * 0.025)
+            bpm = self.current_tapped_bpm * inertia + bpm * (1.0 - inertia)
+
+        return bpm
 
     def reset_tap_tempo(self) -> None:
         self.tap_times.clear()
@@ -2130,12 +2272,31 @@ class TempoWindow:
         with self.queue_lock:
             self.analysis_paths.discard(row.path.resolve())
 
-        self.rows.append(row)
-        if self.table.selection():
+        row_id = self.row_id(row)
+        replaced = False
+        updated_rows = []
+        for existing_row in self.rows:
+            if self.row_id(existing_row) == row_id:
+                updated_rows.append(row)
+                replaced = True
+            else:
+                updated_rows.append(existing_row)
+        if replaced:
+            self.rows = updated_rows
+        else:
+            self.rows.append(row)
+
+        for slot in self.waveform_slots:
+            if slot.row_id == row_id:
+                slot.row = row
+
+        if self.current_similarity_target_rows() or self.table.selection():
             self.update_similarity_scores()
         self.refresh_table()
-        self.result.configure(text=f"Analyzed {processed}; {remaining} queued")
-        self.table.yview_moveto(1.0)
+        action = "Re-analyzed" if replaced else "Analyzed"
+        self.result.configure(text=f"{action} {processed}; {remaining} queued")
+        if not replaced:
+            self.table.yview_moveto(1.0)
 
     def _finish_analysis(self) -> None:
         with self.queue_lock:

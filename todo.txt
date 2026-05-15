@@ -2,17 +2,20 @@
 done, to review :
 
 todo soon :
+- add an analysis date in the csv so that it's easier to know what file to update if analysis improvements are made
 
 zoomed :
 - the zoomed in view could have a better resolution (maybe threaded or cached or something if that's too much to compute)
 - in zoomed view beat bars and waveform could move more in sync with each other when shifted, zoomed etc
+- (probably to be done later) allow to manually place two or more beats to help with tempo detection
 
 sync :
 - have a master metronome (with a checkbox to hear it), sync beats to it
 - option (checkbox) beat sync to metronome when pressin play on a track
+- have a "play all" button on the "target tempo, etc" lane that starts every currently displayed track
+- if sync option activated, keep a track in sync even when placing the playhead somewhere else while playing (eg going to the closest sync point or waiting for the current one to be in sync)
 
 UI :
-- indicate current target(s) in list somehow, in a different way than selection
 
 detection :
 - why sorting by chroma/tempo often leads to similar tempi first top of the list? that sounds wrong but I'm not sure why, investigate it
@@ -21,6 +24,8 @@ detection :
 - define cues for structure parts and loops
 
 todo at some point :
+- add a button to export a picture of currently selected track : evolving chromagram, like a spectrogram but evoleving over time (time = horizontal, notes in octave = vertical, bin gain = from dark to bright)
+- some tracks (eg "02 - Le Chien...") are cropped when loaded to the display
 
 playback :
 - playback is better now, still has some occasional glitch when another track starts while some already play
@@ -30,6 +35,7 @@ need the other tool inspection first :
 - integrate track infos from the former tool
 - add the "match/supermatch" marking logic
 - export Graphviz graphs
+- separate the concept of "base" and chroma, allow for defining/detecting both of them
 
 even later :
 - export as traktor/mixxx file

@@ -47,6 +47,13 @@ class ChromatchRegressionTests(unittest.TestCase):
         decoded = chromatch.decode_array(chromatch.encode_array(values))
         self.assertTrue(np.allclose(values, decoded))
 
+    def test_refine_tempo_from_beats_recovers_non_quantized_tempo(self):
+        expected_bpm = 127.37
+        interval = 60.0 / expected_bpm
+        beats = np.arange(128, dtype=float) * interval
+
+        self.assertAlmostEqual(expected_bpm, chromatch.refine_tempo_from_beats(beats), places=2)
+
     def test_slider_callback_does_not_reenter_when_tempo_is_set_programmatically(self):
         calls = []
         original_draw = self.app.draw_all_waveforms
@@ -101,7 +108,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         values = self.app.row_values(row)
         self.assertEqual("123.03 (A)", values[1])
         self.assertNotIn("BPM", values[1])
-        self.assertEqual("A", values[5].split()[0])
+        self.assertEqual(3, len(values[5].split()))
 
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
@@ -166,6 +173,15 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(0.75, slot.tempo_multiplier)
         self.assertAlmostEqual(1.125, self.app.playback_rate_for_slot(slot))
 
+    def test_ctrl_slider_mode_keeps_finer_multiplier_precision(self):
+        row = self.make_row(bpm=100)
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+        self.app.ctrl_pressed = True
+
+        self.app.set_slot_tempo_multiplier(slot, "0.7534")
+
+        self.assertAlmostEqual(0.753, slot.tempo_multiplier)
+
     def test_per_track_volume_slider_value_updates_slot_volume(self):
         row = self.make_row()
         slot = chromatch.WaveformSlot(row_id="track", row=row)
@@ -173,6 +189,87 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.set_slot_volume(slot, "0.35")
 
         self.assertAlmostEqual(0.35, slot.volume)
+
+    def test_double_click_reset_helpers_restore_slider_defaults(self):
+        row = self.make_row()
+        slot = chromatch.WaveformSlot(row_id="track", row=row, tempo_multiplier=0.75, volume=0.35)
+
+        self.app.reset_slot_tempo_multiplier(slot)
+        self.app.reset_slot_volume(slot)
+
+        self.assertAlmostEqual(1.0, slot.tempo_multiplier)
+        self.assertAlmostEqual(1.0, slot.volume)
+
+    def test_sort_heading_shows_direction_marker(self):
+        self.app.sort_by_column("filename")
+        self.assertTrue(self.app.table.heading("filename")["text"].endswith(" ^"))
+        self.app.sort_by_column("filename")
+        self.assertTrue(self.app.table.heading("filename")["text"].endswith(" v"))
+
+    def test_tap_tempo_estimate_uses_longer_stable_history(self):
+        self.app.tap_times = [index * 0.5 for index in range(12)]
+        self.app.current_tapped_bpm = 121.0
+
+        bpm = self.app.estimate_tapped_bpm()
+
+        self.assertAlmostEqual(120.75, bpm, places=2)
+
+    def test_similarity_target_marker_persists_after_selection_changes(self):
+        first = self.make_chroma_row("first.wav", 120, 0)
+        second = self.make_chroma_row("second.wav", 120, 20)
+        self.app.rows = [first, second]
+        first_id = self.app.row_id(first)
+        second_id = self.app.row_id(second)
+
+        self.app.refresh_table()
+        self.app.table.selection_set(first_id)
+        self.app.set_similarity_target()
+        self.app.table.selection_set(second_id)
+        self.app.refresh_table()
+
+        self.assertEqual({first_id}, self.app.similarity_target_ids)
+        self.assertIn("similarity_target", self.app.table.item(first_id, "tags"))
+
+    def test_removed_row_is_removed_from_similarity_targets(self):
+        row = self.make_chroma_row("first.wav", 120, 0)
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.similarity_target_ids = {row_id}
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+
+        self.app.remove_selected_rows()
+
+        self.assertEqual(set(), self.app.similarity_target_ids)
+
+    def test_reanalyze_selected_rows_queues_existing_paths(self):
+        row = self.make_row("first.wav")
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.is_analyzing = True
+
+        self.app.reanalyze_selected_rows()
+
+        self.assertEqual([row.path], self.app.analysis_queue)
+        self.assertIn(row.path.resolve(), self.app.analysis_paths)
+
+    def test_add_result_replaces_existing_row_when_reanalyzed(self):
+        old_row = self.make_row("first.wav", bpm=100)
+        new_row = self.make_row("first.wav", bpm=127.37)
+        row_id = self.app.row_id(old_row)
+        self.app.rows = [old_row]
+        slot = chromatch.WaveformSlot(row_id=row_id, row=old_row)
+        self.app.waveform_slots = [slot]
+        self.app.analysis_paths = {old_row.path.resolve()}
+
+        self.app._add_result(new_row, 1, 0)
+
+        self.assertEqual(1, len(self.app.rows))
+        self.assertAlmostEqual(127.37, self.app.rows[0].bpm)
+        self.assertIs(slot.row, new_row)
+        self.assertNotIn(old_row.path.resolve(), self.app.analysis_paths)
 
     def test_zoomed_waveform_click_positions_playhead(self):
         row = self.make_row(bpm=120)

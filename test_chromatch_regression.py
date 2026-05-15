@@ -1,4 +1,5 @@
 import unittest
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -103,6 +104,51 @@ class ChromatchRegressionTests(unittest.TestCase):
         similarity = self.app.calculate_pair_chroma_tempo_similarity(first, second)
         self.assertLess(similarity, 1.0)
 
+    def test_flat_chroma_profile_does_not_match_everything(self):
+        target = np.zeros(chromatch.CHROMA_BINS, dtype=np.float32)
+        target[0] = 1.0
+        flat = np.ones(chromatch.CHROMA_BINS, dtype=np.float32)
+
+        self.assertEqual(0.0, chromatch.chroma_similarity_score(flat, target))
+
+    def test_evolving_chromagram_renderer_exports_image(self):
+        sample_rate = 8_000
+        seconds = 1.0
+        t = np.linspace(0.0, seconds, int(sample_rate * seconds), endpoint=False)
+        audio = np.sin(2 * np.pi * 220.0 * t).astype(np.float32)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "tone.wav"
+            chromatch.sf.write(path, audio, sample_rate)
+
+            image = chromatch.render_evolving_chromagram(
+                path,
+                bins=48,
+                fft_size=1024,
+                hop_size=256,
+                max_width=120,
+                max_freq=3500,
+            )
+
+        self.assertEqual("RGB", image.mode)
+        self.assertGreater(image.width, 0)
+        self.assertGreaterEqual(image.height, 360)
+
+    def test_waveform_overview_stretches_short_files_to_full_width(self):
+        sample_rate = 8_000
+        audio = np.zeros(100, dtype=np.float32)
+        audio[-1] = 1.0
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "click.wav"
+            chromatch.sf.write(path, audio, sample_rate)
+
+            peaks, duration = chromatch.waveform_overview(path, width=200)
+
+        self.assertEqual(200, peaks.size)
+        self.assertAlmostEqual(100 / sample_rate, duration)
+        self.assertGreater(peaks[-1], 0.9)
+
     def test_row_values_use_compact_tempo_and_chroma_display(self):
         row = self.make_chroma_row("track.wav", 123.034, 180)
         values = self.app.row_values(row)
@@ -162,6 +208,44 @@ class ChromatchRegressionTests(unittest.TestCase):
         chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 16, None, None)
 
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN * 0.25))
+
+    def test_looping_track_wraps_in_mixer_and_keeps_playing(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+        row = self.make_row()
+        audio = np.ones((8, 2), dtype=np.float32)
+        slot = chromatch.WaveformSlot(
+            row_id="loop",
+            row=row,
+            is_playing=True,
+            loop=True,
+            audio=audio,
+            sample_rate=44_100,
+            position_samples=6.0,
+        )
+        DummyApp.waveform_slots = [slot]
+        outdata = np.zeros((8, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 8, None, None)
+
+        self.assertTrue(slot.is_playing)
+        self.assertLess(slot.position_samples, len(audio) - 1)
+        self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN))
+
+    def test_waveform_loop_toggle_updates_slot_state(self):
+        row = self.make_row()
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+        slot.loop_var = chromatch.tk.BooleanVar(master=self.app.root, value=True)
+
+        self.app.set_waveform_loop(slot)
+
+        self.assertTrue(slot.loop)
 
     def test_chroma_histogram_draws_shifted_bins(self):
         row = self.make_chroma_row("track.wav", 120, 0)

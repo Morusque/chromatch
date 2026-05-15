@@ -1,5 +1,5 @@
 
-done, to review :
+to review :
 
 todo soon :
 
@@ -21,15 +21,11 @@ detection :
 - handle variations in tempo and chroma
 - handle time signatures
 - define cues for structure parts and loops
-- a spoken track ("000 godxiliary - ...") with a flatter chroma profile seems to appear always closer to any other track, isn't that wrong somehow?
 
 todo at some point :
-- add a button to export a picture of currently selected track : evolving chromagram, like a spectrogram but evoleving over time (time = horizontal, notes in octave = vertical, bin gain = from dark to bright)
-- some tracks (eg "02 - Le Chien...") are cropped when loaded to the display
 
 playback :
 - playback is better now, still has some occasional glitch when another track starts while some already play
-- allow loops
 
 need the other tool inspection first :
 - integrate track infos from the former tool
@@ -43,3 +39,4 @@ even later :
 - mixing tools (eg filters)
 - automix
 - limit tempo differences when searching for similar tracks or weight it
+- some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)

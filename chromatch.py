@@ -26,6 +26,11 @@ from scipy.signal import resample_poly
 from tkinterdnd2 import DND_FILES, TkinterDnD
 
 try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
+try:
     import sounddevice as sd
 except ImportError:
     sd = None
@@ -105,6 +110,7 @@ class WaveformSlot:
     tempo_multiplier: float = 1.0
     volume: float = 1.0
     kept: bool = False
+    loop: bool = False
     playhead: float = 0.0
     zoom_seconds: float = 8.0
     zoom_drag_last_x: int | None = None
@@ -116,6 +122,7 @@ class WaveformSlot:
     chroma_canvas: tk.Canvas | None = None
     button: ttk.Button | None = None
     keep_var: tk.BooleanVar | None = None
+    loop_var: tk.BooleanVar | None = None
     tempo_multiplier_var: tk.DoubleVar | None = None
     tempo_multiplier_label: ttk.Label | None = None
     volume_var: tk.DoubleVar | None = None
@@ -396,6 +403,80 @@ def analyze_chroma_histogram(
     return histogram
 
 
+def render_evolving_chromagram(
+    path: Path,
+    max_width: int = 1600,
+    bins: int = CHROMA_BINS,
+    fft_size: int = CHROMA_FFT_SIZE,
+    hop_size: int = CHROMA_HOP_SIZE,
+    min_freq: int = CHROMA_MIN_FREQ,
+    max_freq: int = CHROMA_MAX_FREQ,
+    attenuation_exponent: float = CHROMA_ATTENUATION_EXPONENT,
+    smoothing: float = CHROMA_SMOOTHING,
+) -> Image.Image:
+    if Image is None:
+        raise RuntimeError("Pillow is not installed.")
+
+    audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+    mono = audio.mean(axis=1)
+    if mono.size < fft_size:
+        raise ValueError("The file is too short to render a chromagram.")
+
+    window = np.hanning(fft_size)
+    freqs = np.fft.rfftfreq(fft_size, 1 / sample_rate)
+    valid = (freqs >= min_freq) & (freqs <= max_freq)
+    valid_freqs = freqs[valid]
+    if valid_freqs.size == 0:
+        raise ValueError("No usable frequency bins were found.")
+
+    positions = freq_to_cyclic_octave_position(valid_freqs)
+    bin_indices = np.round(positions * bins).astype(int) % bins
+    if attenuation_exponent > 0:
+        weights = (min_freq / valid_freqs) ** attenuation_exponent
+    else:
+        weights = np.ones_like(valid_freqs)
+
+    frame_starts = range(0, mono.size - fft_size + 1, hop_size)
+    columns = []
+    for start in frame_starts:
+        frame = mono[start : start + fft_size] * window
+        spectrum = np.abs(np.fft.rfft(frame))[valid]
+        columns.append(np.bincount(bin_indices, weights=spectrum * weights, minlength=bins))
+
+    if not columns:
+        raise ValueError("No chromagram frames were rendered.")
+
+    chromagram = np.stack(columns, axis=1)
+    if smoothing > 0 and bins > 12:
+        sigma = smoothing * (bins / 12.0)
+        x = np.arange(bins)
+        dist = np.minimum(x, bins - x)
+        kernel = np.exp(-0.5 * (dist / sigma) ** 2)
+        kernel /= np.sum(kernel)
+        chromagram = np.fft.ifft(
+            np.fft.fft(chromagram, axis=0) * np.fft.fft(kernel)[:, None],
+            axis=0,
+        ).real
+
+    if chromagram.shape[1] > max_width:
+        factor = math.ceil(chromagram.shape[1] / max_width)
+        padded_width = factor * math.ceil(chromagram.shape[1] / factor)
+        padded = np.pad(chromagram, ((0, 0), (0, padded_width - chromagram.shape[1])), mode="constant")
+        chromagram = padded.reshape(bins, -1, factor).max(axis=2)
+
+    scale = float(np.percentile(chromagram, 99.5))
+    if scale <= 0:
+        scale = float(np.max(chromagram))
+    if scale > 0:
+        chromagram = np.clip(chromagram / scale, 0.0, 1.0)
+
+    pixels = np.flipud(chromagram)
+    image = Image.fromarray((pixels * 255).astype(np.uint8), mode="L")
+    if image.height < 360:
+        image = image.resize((image.width, 360), Image.Resampling.BILINEAR)
+    return image.convert("RGB")
+
+
 def merge_to_12_notes(histogram: np.ndarray) -> np.ndarray:
     bins = len(histogram)
     note_values = []
@@ -513,6 +594,21 @@ def cosine_similarity(first: np.ndarray, second: np.ndarray) -> float | None:
     return float(np.dot(first, second) / denominator)
 
 
+def chroma_similarity_score(first: np.ndarray, second: np.ndarray) -> float | None:
+    first = np.asarray(first, dtype=float)
+    second = np.asarray(second, dtype=float)
+    if first.shape != second.shape:
+        return None
+
+    first = first - np.mean(first)
+    second = second - np.mean(second)
+    denominator = float(np.linalg.norm(first) * np.linalg.norm(second))
+    if denominator <= 1e-12:
+        return 0.0
+
+    return max(0.0, float(np.dot(first, second) / denominator))
+
+
 def circular_shift(values: np.ndarray, shift_bins: float) -> np.ndarray:
     size = len(values)
     positions = (np.arange(size) - shift_bins) % size
@@ -537,11 +633,18 @@ def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
     if mono.size == 0:
         return np.zeros(width, dtype=np.float32), duration
 
-    chunk_size = max(1, math.ceil(len(mono) / width))
-    padded_size = chunk_size * width
-    padded = np.pad(mono, (0, max(0, padded_size - len(mono))))
-    chunks = padded.reshape(width, chunk_size)
-    peaks = np.max(np.abs(chunks), axis=1)
+    if mono.size <= width:
+        positions = np.linspace(0, mono.size - 1, width)
+        peaks = np.abs(np.interp(positions, np.arange(mono.size), mono))
+    else:
+        edges = np.linspace(0, mono.size, width + 1).astype(int)
+        peaks = np.empty(width, dtype=np.float32)
+        absolute = np.abs(mono)
+        for index in range(width):
+            start = edges[index]
+            end = max(start + 1, edges[index + 1])
+            peaks[index] = np.max(absolute[start:end])
+
     peak = np.max(peaks)
     if peak > 0:
         peaks = peaks / peak
@@ -813,6 +916,14 @@ class TempoWindow:
             state="disabled",
         )
         self.pairs_button.pack(side="right", padx=(8, 0))
+
+        self.chromagram_button = ttk.Button(
+            actions,
+            text="Export chromagram",
+            command=self.export_selected_chromagram,
+            state="disabled",
+        )
+        self.chromagram_button.pack(side="right", padx=(8, 0))
 
         tap_frame = ttk.Frame(main)
         tap_frame.pack(fill="x", pady=(10, 0))
@@ -1283,7 +1394,7 @@ class TempoWindow:
         if row.chroma is None:
             return None
 
-        similarity = cosine_similarity(row.chroma.histogram, target_histogram)
+        similarity = chroma_similarity_score(row.chroma.histogram, target_histogram)
         if similarity is None:
             return None
 
@@ -1360,7 +1471,7 @@ class TempoWindow:
 
             pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
             shifted_histogram = circular_shift(row.chroma.histogram, pitch_shift_bins)
-            similarity = cosine_similarity(shifted_histogram, target.chroma.histogram)
+            similarity = chroma_similarity_score(shifted_histogram, target.chroma.histogram)
             if similarity is not None:
                 similarities.append(similarity)
 
@@ -1384,7 +1495,7 @@ class TempoWindow:
 
         pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
         shifted_histogram = circular_shift(first.chroma.histogram, pitch_shift_bins)
-        similarity = cosine_similarity(shifted_histogram, second.chroma.histogram)
+        similarity = chroma_similarity_score(shifted_histogram, second.chroma.histogram)
         if similarity is None:
             return None
 
@@ -1488,6 +1599,7 @@ class TempoWindow:
     def handle_table_selection(self, _event=None) -> None:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
+        self.chromagram_button.configure(state="normal" if self.table.selection() else "disabled")
         self.update_selected_detected_tempo()
         self.update_waveform_selection()
 
@@ -1643,6 +1755,13 @@ class TempoWindow:
                 text="Keep",
                 variable=slot.keep_var,
                 command=lambda slot=slot: self.set_waveform_keep(slot),
+            ).pack(side="left", padx=(4, 0))
+            slot.loop_var = tk.BooleanVar(value=slot.loop)
+            ttk.Checkbutton(
+                controls,
+                text="Loop",
+                variable=slot.loop_var,
+                command=lambda slot=slot: self.set_waveform_loop(slot),
             ).pack(side="left", padx=(4, 0))
             ttk.Button(
                 controls,
@@ -1955,6 +2074,9 @@ class TempoWindow:
         slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
         self.update_waveform_selection()
 
+    def set_waveform_loop(self, slot: WaveformSlot) -> None:
+        slot.loop = bool(slot.loop_var.get()) if slot.loop_var is not None else not slot.loop
+
     def remove_waveform(self, slot: WaveformSlot) -> None:
         self.stop_waveform(slot)
         with self.mixer_lock:
@@ -2072,19 +2194,28 @@ class TempoWindow:
                 rate = self.playback_rate_for_slot(slot)
                 positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
                 max_index = len(slot.audio) - 1
-                valid = positions < max_index
+                if slot.loop and max_index > 0:
+                    sample_positions = np.mod(positions, max_index)
+                    valid = np.ones(frames, dtype=bool)
+                else:
+                    sample_positions = positions
+                    valid = positions < max_index
                 if np.any(valid):
-                    lower = np.floor(positions[valid]).astype(int)
+                    lower = np.floor(sample_positions[valid]).astype(int)
                     upper = np.minimum(lower + 1, max_index)
-                    fraction = positions[valid] - lower
+                    fraction = sample_positions[valid] - lower
                     mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
                     if mixed.shape[1] == 1:
                         mixed = np.repeat(mixed, 2, axis=1)
                     output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN * slot.volume
 
-                slot.position_samples = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
+                next_position = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
+                if slot.loop and max_index > 0:
+                    slot.position_samples = next_position % max_index
+                else:
+                    slot.position_samples = next_position
                 slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
-                if slot.position_samples >= max_index:
+                if not slot.loop and slot.position_samples >= max_index:
                     slot.is_playing = False
 
         outdata[:] = np.clip(output, -1.0, 1.0)
@@ -2397,6 +2528,33 @@ class TempoWindow:
                         row.error,
                     ]
                 )
+
+    def export_selected_chromagram(self) -> None:
+        selected = self.table.selection()
+        if not selected:
+            messagebox.showinfo("Chromatch", "Select one track first.")
+            return
+
+        row = self.row_by_id(selected[-1])
+        if row is None:
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".png",
+            filetypes=(("PNG images", "*.png"), ("All files", "*.*")),
+            initialfile=f"{row.path.stem}-chromagram.png",
+        )
+        if not filename:
+            return
+
+        try:
+            image = render_evolving_chromagram(row.path)
+            image.save(filename)
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not export chromagram:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported chromagram: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
         candidates = [

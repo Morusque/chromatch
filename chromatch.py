@@ -58,6 +58,7 @@ CHROMA_MIN_FREQ = 20
 CHROMA_MAX_FREQ = 10_000
 CHROMA_ATTENUATION_EXPONENT = 0.5
 CHROMA_SMOOTHING = 0.2
+PLAYBACK_TRACK_GAIN = 0.45
 
 
 @dataclass(frozen=True)
@@ -105,8 +106,11 @@ class WaveformSlot:
     is_playing: bool = False
     frame: ttk.Frame | None = None
     canvas: tk.Canvas | None = None
+    chroma_canvas: tk.Canvas | None = None
     button: ttk.Button | None = None
     keep_var: tk.BooleanVar | None = None
+    tempo_multiplier_var: tk.DoubleVar | None = None
+    tempo_multiplier_label: ttk.Label | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
     sample_rate: int = 0
@@ -489,6 +493,21 @@ def circular_shift(values: np.ndarray, shift_bins: float) -> np.ndarray:
     return values[lower] * (1.0 - fraction) + values[upper] * fraction
 
 
+def simple_chroma_peaks(chroma: ChromaEstimate | None) -> str:
+    if chroma is None:
+        return ""
+
+    strongest = np.argsort(chroma.histogram)[-3:][::-1]
+    names = []
+    for index in strongest:
+        note_index = int((index / len(chroma.histogram)) * len(NOTE_NAMES)) % len(NOTE_NAMES)
+        name = NOTE_NAMES[note_index]
+        if name not in names:
+            names.append(name)
+
+    return " ".join(names)
+
+
 def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
     audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
     mono = audio.mean(axis=1)
@@ -852,9 +871,7 @@ class TempoWindow:
         columns = (
             "filename",
             "tempo",
-            "tapped",
             "uncertainty",
-            "confidence",
             "chroma_similarity",
             "chroma_tempo_similarity",
             "chroma",
@@ -865,10 +882,8 @@ class TempoWindow:
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
         headings = {
             "filename": "Filename",
-            "tempo": "Detected tempo",
-            "tapped": "Tapped tempo",
+            "tempo": "Tempo",
             "uncertainty": "Uncertainty",
-            "confidence": "Confidence 0-100",
             "chroma_similarity": "Chroma sim",
             "chroma_tempo_similarity": "Chroma/tempo sim",
             "chroma": "Chroma peaks",
@@ -884,13 +899,11 @@ class TempoWindow:
             )
 
         self.table.column("filename", width=260, anchor="w")
-        self.table.column("tempo", width=120, anchor="center")
-        self.table.column("tapped", width=100, anchor="center")
+        self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
-        self.table.column("confidence", width=110, anchor="center")
         self.table.column("chroma_similarity", width=90, anchor="center")
         self.table.column("chroma_tempo_similarity", width=115, anchor="center")
-        self.table.column("chroma", width=170, anchor="center")
+        self.table.column("chroma", width=95, anchor="center")
         self.table.column("artist", width=150, anchor="w")
         self.table.column("title", width=180, anchor="w")
         self.table.column("album", width=150, anchor="w")
@@ -1086,8 +1099,6 @@ class TempoWindow:
             self.sort_column = column
             self.sort_descending = column in {
                 "tempo",
-                "confidence",
-                "tapped",
                 "chroma_similarity",
                 "chroma_tempo_similarity",
             }
@@ -1228,23 +1239,15 @@ class TempoWindow:
             if target_tempo is None:
                 continue
 
-            best_similarity: float | None = None
-            for octave_multiple in range(-3, 4):
-                playback_rate = (target_tempo / row_tempo) * (2.0 ** octave_multiple)
-                if playback_rate <= 0:
-                    continue
+            playback_rate = target_tempo / row_tempo
+            if playback_rate <= 0:
+                continue
 
-                pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
-                shifted_histogram = circular_shift(row.chroma.histogram, pitch_shift_bins)
-                similarity = cosine_similarity(shifted_histogram, target.chroma.histogram)
-                if similarity is None:
-                    continue
-
-                if best_similarity is None or similarity > best_similarity:
-                    best_similarity = similarity
-
-            if best_similarity is not None:
-                similarities.append(best_similarity)
+            pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
+            shifted_histogram = circular_shift(row.chroma.histogram, pitch_shift_bins)
+            similarity = cosine_similarity(shifted_histogram, target.chroma.histogram)
+            if similarity is not None:
+                similarities.append(similarity)
 
         if not similarities:
             return None
@@ -1260,25 +1263,17 @@ class TempoWindow:
         if first_tempo is None or second_tempo is None:
             return None
 
-        best_similarity: float | None = None
-        for octave_multiple in range(-3, 4):
-            playback_rate = (second_tempo / first_tempo) * (2.0 ** octave_multiple)
-            if playback_rate <= 0:
-                continue
-
-            pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
-            shifted_histogram = circular_shift(first.chroma.histogram, pitch_shift_bins)
-            similarity = cosine_similarity(shifted_histogram, second.chroma.histogram)
-            if similarity is None:
-                continue
-
-            if best_similarity is None or similarity > best_similarity:
-                best_similarity = similarity
-
-        if best_similarity is None:
+        playback_rate = second_tempo / first_tempo
+        if playback_rate <= 0:
             return None
 
-        return max(0.0, min(100.0, best_similarity * 100.0))
+        pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
+        shifted_histogram = circular_shift(first.chroma.histogram, pitch_shift_bins)
+        similarity = cosine_similarity(shifted_histogram, second.chroma.histogram)
+        if similarity is None:
+            return None
+
+        return max(0.0, min(100.0, similarity * 100.0))
 
     def sort_key(self, row: AnalysisRow):
         missing_number = float("-inf") if self.sort_descending else float("inf")
@@ -1286,19 +1281,16 @@ class TempoWindow:
         if self.sort_column == "filename":
             return row.path.name.lower()
         if self.sort_column == "tempo":
-            return row.bpm if row.bpm is not None else missing_number
+            tempo = self.row_tempo_for_matching(row)
+            return tempo if tempo is not None else missing_number
         if self.sort_column == "uncertainty":
             return row.uncertainty_bpm if row.uncertainty_bpm is not None else missing_number
-        if self.sort_column == "confidence":
-            return row.confidence if row.confidence is not None else missing_number
-        if self.sort_column == "tapped":
-            return row.tapped_bpm if row.tapped_bpm is not None else missing_number
         if self.sort_column == "chroma_similarity":
             return row.chroma_similarity if row.chroma_similarity is not None else missing_number
         if self.sort_column == "chroma_tempo_similarity":
             return row.chroma_tempo_similarity if row.chroma_tempo_similarity is not None else missing_number
         if self.sort_column == "chroma":
-            return "" if row.chroma is None else row.chroma.top_peaks.lower()
+            return simple_chroma_peaks(row.chroma).lower()
         if self.sort_column == "artist":
             return row.artist.lower()
         if self.sort_column == "title":
@@ -1334,25 +1326,28 @@ class TempoWindow:
                 table.delete(item)
 
     def row_values(self, row: AnalysisRow) -> tuple[str, ...]:
-        tempo_text = "" if row.bpm is None else f"{row.bpm:.1f} BPM"
+        effective_tempo = self.row_tempo_for_matching(row)
+        if effective_tempo is None:
+            tempo_text = ""
+        elif row.tapped_bpm is None:
+            tempo_text = f"{effective_tempo:.2f} (A)"
+        else:
+            tempo_text = f"{effective_tempo:.2f}"
+
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
-        confidence_text = "" if row.confidence is None else f"{row.confidence:.0f}"
-        tapped_text = "" if row.tapped_bpm is None else f"{row.tapped_bpm:.1f} BPM"
         chroma_similarity_text = "" if row.chroma_similarity is None else f"{row.chroma_similarity:.1f}"
         chroma_tempo_similarity_text = (
             "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.1f}"
         )
-        chroma_text = "" if row.chroma is None else row.chroma.top_peaks
+        chroma_text = simple_chroma_peaks(row.chroma)
 
         if row.error and row.bpm is None and row.chroma is None:
-            confidence_text = f"failed: {row.error}"
+            uncertainty_text = f"failed: {row.error}"
 
         return (
             row.path.name,
             tempo_text,
-            tapped_text,
             uncertainty_text,
-            confidence_text,
             chroma_similarity_text,
             chroma_tempo_similarity_text,
             chroma_text,
@@ -1461,6 +1456,7 @@ class TempoWindow:
     def draw_all_waveforms(self) -> None:
         for slot in self.waveform_slots:
             self.draw_waveform(slot)
+            self.draw_chroma_histogram(slot)
 
     def render_waveforms(self) -> None:
         for child in self.waveform_container.winfo_children():
@@ -1492,8 +1488,20 @@ class TempoWindow:
             slot.button.pack(side="left")
             ttk.Button(controls, text="< Beat", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, -1)).pack(side="left", padx=(4, 0))
             ttk.Button(controls, text="Beat >", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, 1)).pack(side="left", padx=(4, 0))
-            ttk.Button(controls, text="/2", width=4, command=lambda slot=slot: self.scale_slot_speed(slot, 0.5)).pack(side="left", padx=(4, 0))
-            ttk.Button(controls, text="x2", width=4, command=lambda slot=slot: self.scale_slot_speed(slot, 2.0)).pack(side="left", padx=(4, 0))
+            slot.tempo_multiplier_var = tk.DoubleVar(value=slot.tempo_multiplier)
+            speed_frame = ttk.Frame(controls)
+            speed_frame.pack(side="left", padx=(4, 0))
+            slot.tempo_multiplier_label = ttk.Label(speed_frame, text=f"x{slot.tempo_multiplier:.2f}", width=5)
+            slot.tempo_multiplier_label.pack(side="left")
+            ttk.Scale(
+                speed_frame,
+                from_=0.5,
+                to=2.0,
+                orient="horizontal",
+                length=120,
+                variable=slot.tempo_multiplier_var,
+                command=lambda value, slot=slot: self.set_slot_tempo_multiplier(slot, value),
+            ).pack(side="left")
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
                 controls,
@@ -1507,7 +1515,13 @@ class TempoWindow:
             slot.canvas = canvas
             canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
             canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
+
+            chroma_canvas = tk.Canvas(frame, width=240, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            chroma_canvas.pack(side="left", padx=(8, 0))
+            slot.chroma_canvas = chroma_canvas
+            chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
             self.draw_waveform(slot)
+            self.draw_chroma_histogram(slot)
 
     def draw_waveform(self, slot: WaveformSlot) -> None:
         if slot.canvas is None:
@@ -1543,6 +1557,44 @@ class TempoWindow:
             font=("Segoe UI", 10, "bold"),
         )
 
+    def draw_chroma_histogram(self, slot: WaveformSlot) -> None:
+        if slot.chroma_canvas is None:
+            return
+
+        canvas = slot.chroma_canvas
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        canvas.delete("all")
+
+        if slot.row.chroma is None:
+            canvas.create_text(width // 2, height // 2, text="no chroma", fill="#777777")
+            return
+
+        with self.mixer_lock:
+            playback_rate = self.playback_rate_for_slot(slot)
+
+        histogram = slot.row.chroma.histogram
+        if playback_rate > 0:
+            histogram = circular_shift(histogram, CHROMA_BINS * math.log2(playback_rate))
+
+        peak = float(np.max(histogram))
+        if peak <= 0:
+            return
+
+        bar_width = max(1, width / len(histogram))
+        for index, value in enumerate(histogram):
+            x0 = index * bar_width
+            x1 = min(width, x0 + bar_width)
+            bar_height = (float(value) / peak) * (height - 12)
+            y0 = height - bar_height
+            canvas.create_rectangle(x0, y0, x1, height, outline="", fill="#6b8f71")
+
+        for note_index, note in enumerate(NOTE_NAMES):
+            x = (note_index / len(NOTE_NAMES)) * width
+            canvas.create_line(x, 0, x, height, fill="#e3ddd5")
+            if note_index in (0, 3, 6, 9):
+                canvas.create_text(x + 2, 2, anchor="nw", text=note, fill="#555555", font=("Segoe UI", 7))
+
     def seek_waveform(self, slot: WaveformSlot, x: int) -> None:
         if slot.canvas is None:
             return
@@ -1553,6 +1605,7 @@ class TempoWindow:
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
+        self.draw_chroma_histogram(slot)
 
     def seek_waveform_by_beats(self, slot: WaveformSlot, beat_count: int) -> None:
         tempo = self.row_tempo_for_matching(slot.row)
@@ -1567,11 +1620,16 @@ class TempoWindow:
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
+        self.draw_chroma_histogram(slot)
 
-    def scale_slot_speed(self, slot: WaveformSlot, factor: float) -> None:
+    def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
+        multiplier = max(0.5, min(2.0, float(value)))
         with self.mixer_lock:
-            slot.tempo_multiplier *= factor
+            slot.tempo_multiplier = multiplier
+        if slot.tempo_multiplier_label is not None:
+            slot.tempo_multiplier_label.configure(text=f"x{multiplier:.2f}")
         self.draw_waveform(slot)
+        self.draw_chroma_histogram(slot)
 
     def set_waveform_keep(self, slot: WaveformSlot) -> None:
         slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
@@ -1673,7 +1731,6 @@ class TempoWindow:
 
     def mixer_callback(self, outdata, frames, _time_info, _status) -> None:
         output = np.zeros((frames, 2), dtype=np.float32)
-        active_count = 0
 
         with self.mixer_lock:
             slots = list(self.waveform_slots)
@@ -1681,7 +1738,6 @@ class TempoWindow:
                 if not slot.is_playing or slot.audio is None:
                     continue
 
-                active_count += 1
                 rate = self.playback_rate_for_slot(slot)
                 positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
                 max_index = len(slot.audio) - 1
@@ -1693,15 +1749,12 @@ class TempoWindow:
                     mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
                     if mixed.shape[1] == 1:
                         mixed = np.repeat(mixed, 2, axis=1)
-                    output[valid] += mixed[:, :2]
+                    output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN
 
                 slot.position_samples = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
                 slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
                 if slot.position_samples >= max_index:
                     slot.is_playing = False
-
-        if active_count > 1:
-            output /= active_count
 
         outdata[:] = np.clip(output, -1.0, 1.0)
 
@@ -1721,6 +1774,7 @@ class TempoWindow:
             if slot.is_playing:
                 any_playing = True
                 self.draw_waveform(slot)
+                self.draw_chroma_histogram(slot)
                 if slot.playhead >= 1.0:
                     self.stop_waveform(slot)
             elif slot.button is not None:

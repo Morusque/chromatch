@@ -101,16 +101,23 @@ class WaveformSlot:
     row_id: str
     row: AnalysisRow
     tempo_multiplier: float = 1.0
+    volume: float = 1.0
     kept: bool = False
     playhead: float = 0.0
+    zoom_seconds: float = 8.0
+    zoom_drag_last_x: int | None = None
+    downbeat_seconds: float | None = None
     is_playing: bool = False
     frame: ttk.Frame | None = None
     canvas: tk.Canvas | None = None
+    zoom_canvas: tk.Canvas | None = None
     chroma_canvas: tk.Canvas | None = None
     button: ttk.Button | None = None
     keep_var: tk.BooleanVar | None = None
     tempo_multiplier_var: tk.DoubleVar | None = None
     tempo_multiplier_label: ttk.Label | None = None
+    volume_var: tk.DoubleVar | None = None
+    volume_label: ttk.Label | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
     sample_rate: int = 0
@@ -686,8 +693,8 @@ class TempoWindow:
     def __init__(self) -> None:
         self.root = TkinterDnD.Tk()
         self.root.title("Chromatch")
-        self.root.geometry("1100x700")
-        self.root.minsize(900, 560)
+        self.root.geometry("1500x800")
+        self.root.minsize(1200, 620)
 
         self.rows: list[AnalysisRow] = []
         self.is_analyzing = False
@@ -713,6 +720,7 @@ class TempoWindow:
         self.playback_target_tempo: float | None = None
         self.playback_ignore_target_tempo = False
         self.suppress_target_slider_callback = False
+        self.zoom_seconds = 8.0
         self.status_text = "Drop audio files or folders"
         self.result = ttk.Label(
             self.root,
@@ -1456,6 +1464,7 @@ class TempoWindow:
     def draw_all_waveforms(self) -> None:
         for slot in self.waveform_slots:
             self.draw_waveform(slot)
+            self.draw_zoomed_waveform(slot)
             self.draw_chroma_histogram(slot)
 
     def render_waveforms(self) -> None:
@@ -1498,9 +1507,23 @@ class TempoWindow:
                 from_=0.5,
                 to=2.0,
                 orient="horizontal",
-                length=120,
+                length=105,
                 variable=slot.tempo_multiplier_var,
                 command=lambda value, slot=slot: self.set_slot_tempo_multiplier(slot, value),
+            ).pack(side="left")
+            slot.volume_var = tk.DoubleVar(value=slot.volume)
+            volume_frame = ttk.Frame(controls)
+            volume_frame.pack(side="left", padx=(4, 0))
+            slot.volume_label = ttk.Label(volume_frame, text=f"{slot.volume:.0%}", width=5)
+            slot.volume_label.pack(side="left")
+            ttk.Scale(
+                volume_frame,
+                from_=0.0,
+                to=1.0,
+                orient="horizontal",
+                length=90,
+                variable=slot.volume_var,
+                command=lambda value, slot=slot: self.set_slot_volume(slot, value),
             ).pack(side="left")
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
@@ -1509,18 +1532,36 @@ class TempoWindow:
                 variable=slot.keep_var,
                 command=lambda slot=slot: self.set_waveform_keep(slot),
             ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                controls,
+                text="Beat",
+                width=6,
+                command=lambda slot=slot: self.set_slot_downbeat(slot),
+            ).pack(side="left", padx=(4, 0))
 
-            canvas = tk.Canvas(frame, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            canvas = tk.Canvas(frame, width=360, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
             canvas.pack(side="left", fill="x", expand=True)
             slot.canvas = canvas
             canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
             canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
+
+            zoom_canvas = tk.Canvas(frame, width=260, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            zoom_canvas.pack(side="left", padx=(8, 0))
+            slot.zoom_canvas = zoom_canvas
+            zoom_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_zoomed_waveform(slot))
+            zoom_canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_zoomed_waveform(slot, event.x))
+            zoom_canvas.bind("<B1-Motion>", lambda event, slot=slot: self.drag_zoomed_waveform(slot, event.x))
+            zoom_canvas.bind("<ButtonRelease-1>", lambda event, slot=slot: self.end_zoom_drag(slot))
+            zoom_canvas.bind("<MouseWheel>", lambda event, slot=slot: self.zoom_waveform_view(slot, event.delta))
+            zoom_canvas.bind("<Button-4>", lambda event, slot=slot: self.zoom_waveform_view(slot, 120))
+            zoom_canvas.bind("<Button-5>", lambda event, slot=slot: self.zoom_waveform_view(slot, -120))
 
             chroma_canvas = tk.Canvas(frame, width=240, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
             chroma_canvas.pack(side="left", padx=(8, 0))
             slot.chroma_canvas = chroma_canvas
             chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
             self.draw_waveform(slot)
+            self.draw_zoomed_waveform(slot)
             self.draw_chroma_histogram(slot)
 
     def draw_waveform(self, slot: WaveformSlot) -> None:
@@ -1555,6 +1596,87 @@ class TempoWindow:
             text=f"{slot.row.path.name}  {playback_rate:.3f}x",
             fill="#111111",
             font=("Segoe UI", 10, "bold"),
+        )
+
+    def zoom_window_seconds(self, slot: WaveformSlot) -> tuple[float, float]:
+        if slot.duration <= 0:
+            return 0.0, 0.0
+
+        center = slot.playhead * slot.duration
+        zoom_seconds = self.zoom_seconds_for_slot(slot)
+        half_width = min(slot.duration, max(0.25, zoom_seconds)) / 2
+        start = max(0.0, center - half_width)
+        end = min(slot.duration, center + half_width)
+        if end - start < zoom_seconds and slot.duration > zoom_seconds:
+            if start <= 0:
+                end = min(slot.duration, zoom_seconds)
+            elif end >= slot.duration:
+                start = max(0.0, slot.duration - zoom_seconds)
+        return start, end
+
+    def zoom_seconds_for_slot(self, slot: WaveformSlot) -> float:
+        with self.mixer_lock:
+            playback_rate = self.playback_rate_for_slot(slot)
+
+        if playback_rate <= 0:
+            playback_rate = 1.0
+        return max(0.25, min(60.0, self.zoom_seconds * playback_rate))
+
+    def draw_zoomed_waveform(self, slot: WaveformSlot) -> None:
+        if slot.zoom_canvas is None:
+            return
+
+        canvas = slot.zoom_canvas
+        width = max(1, canvas.winfo_width())
+        height = max(1, canvas.winfo_height())
+        mid = height // 2
+        canvas.delete("all")
+
+        if slot.waveform.size == 0 or slot.duration <= 0:
+            canvas.create_text(width // 2, height // 2, text="no zoom", fill="#777777")
+            return
+
+        start_seconds, end_seconds = self.zoom_window_seconds(slot)
+        window_duration = max(1e-6, end_seconds - start_seconds)
+        start_index = max(0, int((start_seconds / slot.duration) * (slot.waveform.size - 1)))
+        end_index = min(slot.waveform.size - 1, int((end_seconds / slot.duration) * (slot.waveform.size - 1)))
+        if end_index <= start_index:
+            end_index = min(slot.waveform.size - 1, start_index + 1)
+
+        indices = np.linspace(start_index, end_index, width).astype(int)
+        shown = slot.waveform[indices]
+        for x, value in enumerate(shown):
+            y = int(value * (height * 0.42))
+            canvas.create_line(x, mid - y, x, mid + y, fill="#2f5568")
+
+        tempo = self.row_tempo_for_matching(slot.row)
+        if tempo is not None and tempo > 0:
+            beat_seconds = 60.0 / tempo
+            anchor = slot.downbeat_seconds if slot.downbeat_seconds is not None else 0.0
+            first_beat = math.floor((start_seconds - anchor) / beat_seconds)
+            last_beat = math.ceil((end_seconds - anchor) / beat_seconds)
+            for beat_index in range(first_beat, last_beat + 1):
+                beat_time = anchor + beat_index * beat_seconds
+                if start_seconds <= beat_time <= end_seconds:
+                    x = int(((beat_time - start_seconds) / window_duration) * width)
+                    color = "#8f6a00" if slot.downbeat_seconds is not None and beat_index % 4 == 0 else "#d6b869"
+                    canvas.create_line(x, 0, x, height, fill=color)
+
+        playhead_seconds = slot.playhead * slot.duration
+        playhead_x = int(((playhead_seconds - start_seconds) / window_duration) * width)
+        canvas.create_line(playhead_x, 0, playhead_x, height, fill="#b57900", width=2)
+
+        if slot.downbeat_seconds is not None and start_seconds <= slot.downbeat_seconds <= end_seconds:
+            downbeat_x = int(((slot.downbeat_seconds - start_seconds) / window_duration) * width)
+            canvas.create_line(downbeat_x, 0, downbeat_x, height, fill="#b00020", width=2)
+
+        canvas.create_text(
+            4,
+            3,
+            anchor="nw",
+            text=f"{window_duration:.1f}s",
+            fill="#111111",
+            font=("Segoe UI", 8),
         )
 
     def draw_chroma_histogram(self, slot: WaveformSlot) -> None:
@@ -1605,7 +1727,68 @@ class TempoWindow:
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
+
+    def seek_zoomed_waveform(self, slot: WaveformSlot, x: int) -> None:
+        if slot.zoom_canvas is None or slot.duration <= 0:
+            return
+
+        slot.zoom_drag_last_x = x
+        width = max(1, slot.zoom_canvas.winfo_width())
+        start_seconds, end_seconds = self.zoom_window_seconds(slot)
+        seek_seconds = start_seconds + (max(0.0, min(1.0, x / width)) * (end_seconds - start_seconds))
+        with self.mixer_lock:
+            slot.playhead = max(0.0, min(1.0, seek_seconds / slot.duration))
+            if slot.audio is not None:
+                slot.position_samples = slot.playhead * len(slot.audio)
+        self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
+        self.draw_chroma_histogram(slot)
+
+    def drag_zoomed_waveform(self, slot: WaveformSlot, x: int) -> None:
+        if slot.zoom_canvas is None or slot.duration <= 0:
+            return
+
+        if slot.zoom_drag_last_x is None:
+            slot.zoom_drag_last_x = x
+            return
+
+        width = max(1, slot.zoom_canvas.winfo_width())
+        start_seconds, end_seconds = self.zoom_window_seconds(slot)
+        seconds_per_pixel = (end_seconds - start_seconds) / width
+        delta_seconds = (slot.zoom_drag_last_x - x) * seconds_per_pixel
+        current_seconds = slot.playhead * slot.duration
+        next_seconds = max(0.0, min(slot.duration, current_seconds + delta_seconds))
+        with self.mixer_lock:
+            slot.playhead = next_seconds / slot.duration
+            if slot.audio is not None:
+                slot.position_samples = slot.playhead * len(slot.audio)
+        slot.zoom_drag_last_x = x
+        self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
+        self.draw_chroma_histogram(slot)
+
+    def end_zoom_drag(self, slot: WaveformSlot) -> None:
+        slot.zoom_drag_last_x = None
+
+    def zoom_waveform_view(self, slot: WaveformSlot, delta: int) -> None:
+        factor = 0.8 if delta > 0 else 1.25
+        self.zoom_seconds = max(0.5, min(60.0, self.zoom_seconds * factor))
+        for candidate in self.waveform_slots:
+            candidate.zoom_seconds = self.zoom_seconds
+        self.draw_all_zoomed_waveforms()
+
+    def draw_all_zoomed_waveforms(self) -> None:
+        for slot in self.waveform_slots:
+            self.draw_zoomed_waveform(slot)
+
+    def set_slot_downbeat(self, slot: WaveformSlot) -> None:
+        if slot.duration <= 0:
+            return
+
+        slot.downbeat_seconds = slot.playhead * slot.duration
+        self.draw_zoomed_waveform(slot)
 
     def seek_waveform_by_beats(self, slot: WaveformSlot, beat_count: int) -> None:
         tempo = self.row_tempo_for_matching(slot.row)
@@ -1620,6 +1803,7 @@ class TempoWindow:
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
 
     def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
@@ -1629,7 +1813,15 @@ class TempoWindow:
         if slot.tempo_multiplier_label is not None:
             slot.tempo_multiplier_label.configure(text=f"x{multiplier:.2f}")
         self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
+
+    def set_slot_volume(self, slot: WaveformSlot, value: str) -> None:
+        volume = max(0.0, min(1.0, float(value)))
+        with self.mixer_lock:
+            slot.volume = volume
+        if slot.volume_label is not None:
+            slot.volume_label.configure(text=f"{volume:.0%}")
 
     def set_waveform_keep(self, slot: WaveformSlot) -> None:
         slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
@@ -1749,7 +1941,7 @@ class TempoWindow:
                     mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
                     if mixed.shape[1] == 1:
                         mixed = np.repeat(mixed, 2, axis=1)
-                    output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN
+                    output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN * slot.volume
 
                 slot.position_samples = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
                 slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
@@ -1774,6 +1966,7 @@ class TempoWindow:
             if slot.is_playing:
                 any_playing = True
                 self.draw_waveform(slot)
+                self.draw_zoomed_waveform(slot)
                 self.draw_chroma_histogram(slot)
                 if slot.playhead >= 1.0:
                     self.stop_waveform(slot)

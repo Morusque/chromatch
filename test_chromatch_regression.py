@@ -124,6 +124,26 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN * 2.0))
 
+    def test_per_track_volume_controls_mixer_gain(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+        row = self.make_row()
+        audio = np.ones((128, 2), dtype=np.float32)
+        DummyApp.waveform_slots = [
+            chromatch.WaveformSlot(row_id="a", row=row, is_playing=True, audio=audio, sample_rate=44_100, volume=0.25),
+        ]
+        outdata = np.zeros((16, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 16, None, None)
+
+        self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN * 0.25))
+
     def test_chroma_histogram_draws_shifted_bins(self):
         row = self.make_chroma_row("track.wav", 120, 0)
         slot = chromatch.WaveformSlot(row_id="track", row=row)
@@ -145,6 +165,88 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.75, slot.tempo_multiplier)
         self.assertAlmostEqual(1.125, self.app.playback_rate_for_slot(slot))
+
+    def test_per_track_volume_slider_value_updates_slot_volume(self):
+        row = self.make_row()
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+
+        self.app.set_slot_volume(slot, "0.35")
+
+        self.assertAlmostEqual(0.35, slot.volume)
+
+    def test_zoomed_waveform_click_positions_playhead(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5,
+            duration=100.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        self.app.zoom_seconds = 10.0
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+
+        self.app.seek_zoomed_waveform(slot, 200)
+
+        self.assertAlmostEqual(0.55, slot.playhead, places=2)
+
+    def test_zoomed_waveform_mousewheel_changes_all_windows(self):
+        row = self.make_row()
+        first = chromatch.WaveformSlot(row_id="first", row=row, duration=100.0)
+        second = chromatch.WaveformSlot(row_id="second", row=row, duration=100.0)
+        first.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        second.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.waveform_slots = [first, second]
+
+        self.app.zoom_waveform_view(first, 120)
+
+        self.assertLess(self.app.zoom_seconds, 8.0)
+        self.assertEqual(self.app.zoom_seconds, first.zoom_seconds)
+        self.assertEqual(self.app.zoom_seconds, second.zoom_seconds)
+
+    def test_set_downbeat_uses_current_playhead_and_draws_beats(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.25,
+            duration=40.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=240, height=54)
+
+        self.app.set_slot_downbeat(slot)
+
+        self.assertAlmostEqual(10.0, slot.downbeat_seconds)
+        self.assertGreater(len(slot.zoom_canvas.find_all()), 0)
+
+    def test_zoom_seconds_scales_with_playback_rate(self):
+        row = self.make_row(bpm=100)
+        slot = chromatch.WaveformSlot(row_id="track", row=row, duration=100.0)
+        self.app.zoom_seconds = 8.0
+        self.app.target_tempo_var.set("150")
+        self.app.update_playback_target_tempo()
+
+        self.assertAlmostEqual(12.0, self.app.zoom_seconds_for_slot(slot))
+
+    def test_drag_zoomed_waveform_moves_playhead(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5,
+            duration=100.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        self.app.zoom_seconds = 10.0
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        slot.zoom_drag_last_x = 100
+
+        self.app.drag_zoomed_waveform(slot, 80)
+
+        self.assertGreater(slot.playhead, 0.5)
+        self.app.end_zoom_drag(slot)
+        self.assertIsNone(slot.zoom_drag_last_x)
 
 
 if __name__ == "__main__":

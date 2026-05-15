@@ -1,25 +1,17 @@
 
 done, to review :
-- replace per-track /2 and x2 buttons with independent x0.5 to x2 tempo multiplier sliders
 
 todo soon :
 
 zoomed :
-- "zoomed view" is another rectangle between waveform and chroma ones
-- has a zoomed in (mousewheelable ideally) display of the waveform around the playhead
-- can position playhead on it
-- can define downbeat at current playhead position on it
-- shows beats as vertical bars
+- the zoomed in view could have a better resolution (maybe threaded or cached or something if that's too much to compute)
+- in zoomed view beat bars and waveform could move more in sync with each other when shifted, zoomed etc
 
 sync :
 - have a master metronome (with a checkbox to hear it), sync beats to it
-- we could start by manual position of downbeat in the "zoomed view" (with automatic detection and confirmation, same way than tempo)
 - option (checkbox) beat sync to metronome when pressin play on a track
 
 UI :
-- zoomed in display for fine-tuning cues and playhead position
-- per-track volume slider
-- beat display on waveform "zoomed view" (probably better done after beat detection)
 - indicate current target(s) in list somehow, in a different way than selection
 
 detection :

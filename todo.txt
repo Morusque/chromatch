@@ -1,26 +1,27 @@
+
 done, to review :
 
 todo soon :
 
 todo at some point :
-- option to report closest chroma/tempo matching couples from all combinations
-- actual checkbox for "keep", not [-] one
+- why sorting by chroma/tempo often leads to similar tempi first? that sounds wrong
 - beat sync at downbeat
-- beat seeker
-- tempo slider
+- better chroma graphical display
+- handle variations in tempo and chroma
+- handle time signatures
+- playback is better now, still has some occasional glitch when a second track starts while one already plays
+- define cues for structure parts and loops
+- clean unused columns
+- zoomed in display for fine-tuning cues and playhead position
+
+need the other tool inspection first :
 - integrate track infos from the former tool
 - add the "match/supermatch" marking logic
 - export Graphviz graphs
-- idea : export as traktor/mixxx file
-- idea : inverse match with eq profile
-- idea : automix
-- clean unused columns
-- better chroma graphical display
-- why sorting by chroma/tempo often leads to similar tempi first? that sounds wrong
-- handle variations in tempo and chroma
-- handle time signatures
-- display tags (artist etc)
-- play/pause button label isn't always consistent with current playing state
-- playback is better now, still has some occasional glitch when a second track starts while one already plays
 
+even later :
+- export as traktor/mixxx file
+- inverse match with eq profile
+- automix
+- mixing tools (eg filters)
 

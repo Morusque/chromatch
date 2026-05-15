@@ -37,6 +37,11 @@ try:
 except ImportError:
     librosa = None
 
+try:
+    from mutagen import File as mutagen_file
+except ImportError:
+    mutagen_file = None
+
 
 SUPPORTED_AUDIO_TYPES = (
     ("Audio files", "*.wav *.flac *.ogg *.aiff *.aif *.mp3"),
@@ -75,6 +80,9 @@ class ChromaEstimate:
 @dataclass(frozen=True)
 class AnalysisRow:
     path: Path
+    artist: str
+    title: str
+    album: str
     bpm: float | None
     uncertainty_bpm: float | None
     confidence: float | None
@@ -98,6 +106,7 @@ class WaveformSlot:
     frame: ttk.Frame | None = None
     canvas: tk.Canvas | None = None
     button: ttk.Button | None = None
+    keep_var: tk.BooleanVar | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
     sample_rate: int = 0
@@ -151,6 +160,140 @@ def decode_array(value: str | None) -> np.ndarray | None:
         return np.load(BytesIO(raw), allow_pickle=False)
     except Exception:
         return None
+
+
+def first_tag_value(tags, names: tuple[str, ...]) -> str:
+    if not tags:
+        return ""
+
+    for name in names:
+        value = tags.get(name)
+        if value is None:
+            continue
+
+        if isinstance(value, list):
+            value = value[0] if value else ""
+        elif hasattr(value, "text"):
+            value = value.text[0] if value.text else ""
+
+        text = str(value).strip()
+        if text:
+            return text
+
+    return ""
+
+
+def synchsafe_to_int(data: bytes) -> int:
+    value = 0
+    for byte in data:
+        value = (value << 7) | (byte & 0x7F)
+    return value
+
+
+def decode_id3_text(data: bytes) -> str:
+    if not data:
+        return ""
+
+    encoding = data[0]
+    payload = data[1:]
+    if encoding == 0:
+        codec = "latin-1"
+    elif encoding == 1:
+        codec = "utf-16"
+    elif encoding == 2:
+        codec = "utf-16-be"
+    else:
+        codec = "utf-8"
+
+    try:
+        return payload.decode(codec, errors="replace").strip("\x00 \r\n\t")
+    except Exception:
+        return ""
+
+
+def read_id3v2_tags(path: Path) -> tuple[str, str, str]:
+    if path.suffix.lower() != ".mp3":
+        return "", "", ""
+
+    try:
+        with open(path, "rb") as audio_file:
+            header = audio_file.read(10)
+            if len(header) != 10 or header[:3] != b"ID3":
+                return "", "", ""
+
+            major_version = header[3]
+            tag_size = synchsafe_to_int(header[6:10])
+            tag_data = audio_file.read(tag_size)
+    except OSError:
+        return "", "", ""
+
+    wanted = {
+        "TPE1": "artist",
+        "TIT2": "title",
+        "TALB": "album",
+        "TP1": "artist",
+        "TT2": "title",
+        "TAL": "album",
+    }
+    found = {"artist": "", "title": "", "album": ""}
+    offset = 0
+
+    while offset < len(tag_data):
+        if major_version == 2:
+            if offset + 6 > len(tag_data):
+                break
+            frame_id = tag_data[offset:offset + 3].decode("latin-1", errors="ignore")
+            frame_size = int.from_bytes(tag_data[offset + 3:offset + 6], "big")
+            frame_start = offset + 6
+        else:
+            if offset + 10 > len(tag_data):
+                break
+            frame_id = tag_data[offset:offset + 4].decode("latin-1", errors="ignore")
+            if not frame_id.strip("\x00"):
+                break
+            size_bytes = tag_data[offset + 4:offset + 8]
+            frame_size = synchsafe_to_int(size_bytes) if major_version == 4 else int.from_bytes(size_bytes, "big")
+            frame_start = offset + 10
+
+        if frame_size <= 0:
+            break
+
+        frame_end = frame_start + frame_size
+        if frame_end > len(tag_data):
+            break
+
+        field_name = wanted.get(frame_id)
+        if field_name and not found[field_name]:
+            found[field_name] = decode_id3_text(tag_data[frame_start:frame_end])
+
+        if all(found.values()):
+            break
+
+        offset = frame_end
+
+    return found["artist"], found["title"], found["album"]
+
+
+def read_audio_tags(path: Path) -> tuple[str, str, str]:
+    fallback_artist, fallback_title, fallback_album = read_id3v2_tags(path)
+
+    if mutagen_file is None:
+        return fallback_artist, fallback_title, fallback_album
+
+    try:
+        audio = mutagen_file(path, easy=True)
+    except Exception:
+        return fallback_artist, fallback_title, fallback_album
+
+    if audio is None:
+        return fallback_artist, fallback_title, fallback_album
+
+    tags = audio.tags or {}
+    return (
+        first_tag_value(tags, ("artist", "albumartist", "TPE1", "TPE2")) or fallback_artist,
+        first_tag_value(tags, ("title", "TIT2")) or fallback_title,
+        first_tag_value(tags, ("album", "TALB")) or fallback_album,
+    )
 
 
 def load_audio_mono(path: Path, target_sample_rate: int = 22_050) -> tuple[np.ndarray, int]:
@@ -540,13 +683,17 @@ class TempoWindow:
         self.tapped_tempo_var = tk.StringVar(value="")
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
+        self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
+        self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.detected_selected_tempo_var = tk.StringVar(value="Selected detected: -- BPM")
         self.mixer_stream: object | None = None
         self.mixer_lock = threading.RLock()
         self.waveform_update_active = False
         self.mixer_sample_rate = 44_100
         self.playback_target_tempo: float | None = None
+        self.playback_ignore_target_tempo = False
+        self.suppress_target_slider_callback = False
         self.status_text = "Drop audio files or folders"
         self.result = ttk.Label(
             self.root,
@@ -605,6 +752,14 @@ class TempoWindow:
         )
         self.export_button.pack(side="right")
 
+        self.pairs_button = ttk.Button(
+            actions,
+            text="Export closest pairs",
+            command=self.export_closest_pairs,
+            state="disabled",
+        )
+        self.pairs_button.pack(side="right", padx=(8, 0))
+
         tap_frame = ttk.Frame(main)
         tap_frame.pack(fill="x", pady=(10, 0))
 
@@ -644,15 +799,31 @@ class TempoWindow:
 
         ttk.Label(controls, text="Target tempo").pack(side="left")
         self.target_tempo_entry = ttk.Entry(controls, textvariable=self.target_tempo_var, width=10)
-        self.target_tempo_entry.pack(side="left", padx=(8, 16))
+        self.target_tempo_entry.pack(side="left", padx=(8, 8))
         self.target_tempo_entry.bind("<KeyRelease>", self.update_playback_target_tempo)
         self.target_tempo_entry.bind("<FocusOut>", self.update_playback_target_tempo)
+        self.target_tempo_slider = ttk.Scale(
+            controls,
+            from_=60,
+            to=200,
+            orient="horizontal",
+            length=180,
+            variable=self.target_tempo_slider_var,
+            command=self.set_target_tempo_from_slider,
+        )
+        self.target_tempo_slider.pack(side="left", padx=(0, 16))
         ttk.Checkbutton(
             controls,
             text="Auto",
             variable=self.auto_target_tempo_var,
             command=self.update_target_tempo_from_waveforms,
         ).pack(side="left")
+        ttk.Checkbutton(
+            controls,
+            text="Original tempo",
+            variable=self.ignore_target_tempo_var,
+            command=self.update_playback_settings_from_ui,
+        ).pack(side="left", padx=(8, 0))
 
         self.waveform_container = ttk.Frame(panel)
         self.waveform_container.pack(fill="x", pady=(8, 0))
@@ -687,6 +858,9 @@ class TempoWindow:
             "chroma_similarity",
             "chroma_tempo_similarity",
             "chroma",
+            "artist",
+            "title",
+            "album",
         )
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
         headings = {
@@ -698,6 +872,9 @@ class TempoWindow:
             "chroma_similarity": "Chroma sim",
             "chroma_tempo_similarity": "Chroma/tempo sim",
             "chroma": "Chroma peaks",
+            "artist": "Artist",
+            "title": "Title",
+            "album": "Album",
         }
         for column, text in headings.items():
             self.table.heading(
@@ -714,6 +891,9 @@ class TempoWindow:
         self.table.column("chroma_similarity", width=90, anchor="center")
         self.table.column("chroma_tempo_similarity", width=115, anchor="center")
         self.table.column("chroma", width=170, anchor="center")
+        self.table.column("artist", width=150, anchor="w")
+        self.table.column("title", width=180, anchor="w")
+        self.table.column("album", width=150, anchor="w")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.scroll_tables)
         horizontal_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
@@ -774,6 +954,7 @@ class TempoWindow:
         self.sort_column = None
         self.sort_descending = False
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
@@ -804,8 +985,20 @@ class TempoWindow:
                 parsed_note_values,
             )
 
+        artist = record.get("artist", "")
+        title = record.get("title", "")
+        album = record.get("album", "")
+        if path.exists() and not (artist and title and album):
+            file_artist, file_title, file_album = read_audio_tags(path)
+            artist = artist or file_artist
+            title = title or file_title
+            album = album or file_album
+
         return AnalysisRow(
             path=path,
+            artist=artist,
+            title=title,
+            album=album,
             bpm=parse_optional_float(record.get("detected_tempo_bpm")),
             uncertainty_bpm=parse_optional_float(record.get("uncertainty_bpm")),
             confidence=parse_optional_float(record.get("confidence_0_100")),
@@ -855,6 +1048,7 @@ class TempoWindow:
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.result.configure(text=f"Removed {len(selected_ids)} tracks")
 
     def start_analysis(self, paths: list[Path]) -> None:
@@ -875,6 +1069,7 @@ class TempoWindow:
             return
 
         self.export_button.configure(state="disabled")
+        self.pairs_button.configure(state="disabled")
         queued = len(self.analysis_queue)
         self.result.configure(text=f"Queued {len(new_files)} new files ({queued} waiting)")
 
@@ -989,8 +1184,32 @@ class TempoWindow:
         return parse_optional_float(self.target_tempo_var.get())
 
     def update_playback_target_tempo(self, _event=None) -> None:
+        tempo = self.target_tempo()
+        if tempo is not None:
+            self.suppress_target_slider_callback = True
+            self.target_tempo_slider_var.set(max(60.0, min(200.0, tempo)))
+            self.suppress_target_slider_callback = False
+        with self.mixer_lock:
+            self.playback_target_tempo = tempo
+            self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+
+    def set_target_tempo_from_slider(self, value: str) -> None:
+        if self.suppress_target_slider_callback:
+            return
+
+        tempo = float(value)
+        self.auto_target_tempo_var.set(False)
+        self.target_tempo_var.set(f"{tempo:.1f}")
+        with self.mixer_lock:
+            self.playback_target_tempo = tempo
+            self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+        self.draw_all_waveforms()
+
+    def update_playback_settings_from_ui(self) -> None:
         with self.mixer_lock:
             self.playback_target_tempo = self.target_tempo()
+            self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+        self.draw_all_waveforms()
 
     def calculate_chroma_tempo_similarity(self, row: AnalysisRow, targets: list[AnalysisRow]) -> float | None:
         if row.chroma is None:
@@ -1032,6 +1251,35 @@ class TempoWindow:
 
         return max(0.0, min(100.0, float(np.mean(similarities)) * 100.0))
 
+    def calculate_pair_chroma_tempo_similarity(self, first: AnalysisRow, second: AnalysisRow) -> float | None:
+        if first.chroma is None or second.chroma is None:
+            return None
+
+        first_tempo = self.row_tempo_for_matching(first)
+        second_tempo = self.row_tempo_for_matching(second)
+        if first_tempo is None or second_tempo is None:
+            return None
+
+        best_similarity: float | None = None
+        for octave_multiple in range(-3, 4):
+            playback_rate = (second_tempo / first_tempo) * (2.0 ** octave_multiple)
+            if playback_rate <= 0:
+                continue
+
+            pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
+            shifted_histogram = circular_shift(first.chroma.histogram, pitch_shift_bins)
+            similarity = cosine_similarity(shifted_histogram, second.chroma.histogram)
+            if similarity is None:
+                continue
+
+            if best_similarity is None or similarity > best_similarity:
+                best_similarity = similarity
+
+        if best_similarity is None:
+            return None
+
+        return max(0.0, min(100.0, best_similarity * 100.0))
+
     def sort_key(self, row: AnalysisRow):
         missing_number = float("-inf") if self.sort_descending else float("inf")
 
@@ -1051,6 +1299,12 @@ class TempoWindow:
             return row.chroma_tempo_similarity if row.chroma_tempo_similarity is not None else missing_number
         if self.sort_column == "chroma":
             return "" if row.chroma is None else row.chroma.top_peaks.lower()
+        if self.sort_column == "artist":
+            return row.artist.lower()
+        if self.sort_column == "title":
+            return row.title.lower()
+        if self.sort_column == "album":
+            return row.album.lower()
 
         return len(self.rows)
 
@@ -1079,7 +1333,7 @@ class TempoWindow:
             for item in table.get_children():
                 table.delete(item)
 
-    def row_values(self, row: AnalysisRow) -> tuple[str, str, str, str, str, str, str, str]:
+    def row_values(self, row: AnalysisRow) -> tuple[str, ...]:
         tempo_text = "" if row.bpm is None else f"{row.bpm:.1f} BPM"
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
         confidence_text = "" if row.confidence is None else f"{row.confidence:.0f}"
@@ -1102,6 +1356,9 @@ class TempoWindow:
             chroma_similarity_text,
             chroma_tempo_similarity_text,
             chroma_text,
+            row.artist,
+            row.title,
+            row.album,
         )
 
     def handle_play_click(self, event) -> None:
@@ -1149,9 +1406,16 @@ class TempoWindow:
         selected_ids = list(self.table.selection())
         selected_id = selected_ids[-1] if selected_ids else None
 
-        self.waveform_slots = [
-            slot for slot in self.waveform_slots if slot.kept or slot.row_id == selected_id
-        ]
+        with self.mixer_lock:
+            for slot in self.waveform_slots:
+                if slot.is_playing and not slot.kept and slot.row_id != selected_id:
+                    slot.kept = True
+                    if slot.keep_var is not None:
+                        slot.keep_var.set(True)
+
+            self.waveform_slots = [
+                slot for slot in self.waveform_slots if slot.kept or slot.row_id == selected_id
+            ]
 
         if selected_id and not any(slot.row_id == selected_id for slot in self.waveform_slots):
             row = self.row_by_id(selected_id)
@@ -1189,6 +1453,15 @@ class TempoWindow:
         self.target_tempo_var.set(f"{float(np.mean(tempos)):.2f}")
         self.update_playback_target_tempo()
 
+    def update_waveform_buttons(self) -> None:
+        for slot in self.waveform_slots:
+            if slot.button is not None:
+                slot.button.configure(text="Pause" if slot.is_playing else "Play")
+
+    def draw_all_waveforms(self) -> None:
+        for slot in self.waveform_slots:
+            self.draw_waveform(slot)
+
     def render_waveforms(self) -> None:
         for child in self.waveform_container.winfo_children():
             child.destroy()
@@ -1210,11 +1483,24 @@ class TempoWindow:
             controls = ttk.Frame(frame)
             controls.pack(side="left", padx=(0, 8))
 
-            slot.button = ttk.Button(controls, text="Play", width=7, command=lambda slot=slot: self.toggle_waveform_playback(slot))
+            slot.button = ttk.Button(
+                controls,
+                text="Pause" if slot.is_playing else "Play",
+                width=7,
+                command=lambda slot=slot: self.toggle_waveform_playback(slot),
+            )
             slot.button.pack(side="left")
+            ttk.Button(controls, text="< Beat", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, -1)).pack(side="left", padx=(4, 0))
+            ttk.Button(controls, text="Beat >", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, 1)).pack(side="left", padx=(4, 0))
             ttk.Button(controls, text="/2", width=4, command=lambda slot=slot: self.scale_slot_speed(slot, 0.5)).pack(side="left", padx=(4, 0))
             ttk.Button(controls, text="x2", width=4, command=lambda slot=slot: self.scale_slot_speed(slot, 2.0)).pack(side="left", padx=(4, 0))
-            ttk.Checkbutton(controls, text="Keep", command=lambda slot=slot: self.toggle_waveform_keep(slot)).pack(side="left", padx=(4, 0))
+            slot.keep_var = tk.BooleanVar(value=slot.kept)
+            ttk.Checkbutton(
+                controls,
+                text="Keep",
+                variable=slot.keep_var,
+                command=lambda slot=slot: self.set_waveform_keep(slot),
+            ).pack(side="left", padx=(4, 0))
 
             canvas = tk.Canvas(frame, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
             canvas.pack(side="left", fill="x", expand=True)
@@ -1245,11 +1531,14 @@ class TempoWindow:
 
         playhead_x = int(slot.playhead * width)
         canvas.create_line(playhead_x, 0, playhead_x, height, fill="#b57900", width=2)
+        with self.mixer_lock:
+            playback_rate = self.playback_rate_for_slot(slot)
+
         canvas.create_text(
             8,
             8,
             anchor="nw",
-            text=f"{slot.row.path.name}  {self.playback_rate_for_slot(slot):.3f}x",
+            text=f"{slot.row.path.name}  {playback_rate:.3f}x",
             fill="#111111",
             font=("Segoe UI", 10, "bold"),
         )
@@ -1265,13 +1554,27 @@ class TempoWindow:
                 slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
 
+    def seek_waveform_by_beats(self, slot: WaveformSlot, beat_count: int) -> None:
+        tempo = self.row_tempo_for_matching(slot.row)
+        if tempo is None or tempo <= 0 or slot.duration <= 0:
+            return
+
+        beat_seconds = 60.0 / tempo
+        with self.mixer_lock:
+            current_seconds = slot.playhead * slot.duration
+            next_seconds = max(0.0, min(slot.duration, current_seconds + beat_seconds * beat_count))
+            slot.playhead = next_seconds / slot.duration
+            if slot.audio is not None:
+                slot.position_samples = slot.playhead * len(slot.audio)
+        self.draw_waveform(slot)
+
     def scale_slot_speed(self, slot: WaveformSlot, factor: float) -> None:
         with self.mixer_lock:
             slot.tempo_multiplier *= factor
         self.draw_waveform(slot)
 
-    def toggle_waveform_keep(self, slot: WaveformSlot) -> None:
-        slot.kept = not slot.kept
+    def set_waveform_keep(self, slot: WaveformSlot) -> None:
+        slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
         self.update_waveform_selection()
 
     def remove_waveform(self, slot: WaveformSlot) -> None:
@@ -1282,6 +1585,9 @@ class TempoWindow:
         self.update_target_tempo_from_waveforms()
 
     def playback_rate_for_slot(self, slot: WaveformSlot) -> float:
+        if self.playback_ignore_target_tempo:
+            return slot.tempo_multiplier
+
         target_tempo = self.playback_target_tempo
         row_tempo = self.row_tempo_for_matching(slot.row)
         if target_tempo is None or row_tempo is None:
@@ -1419,6 +1725,7 @@ class TempoWindow:
                     self.stop_waveform(slot)
             elif slot.button is not None:
                 slot.button.configure(text="Play")
+        self.update_waveform_buttons()
         if any_playing:
             self.root.after(50, self.update_waveform_playheads)
         else:
@@ -1513,6 +1820,7 @@ class TempoWindow:
                 self.result_queue.put(("started", path.name, remaining))
                 estimate = None
                 chroma = None
+                artist, title, album = read_audio_tags(path)
                 errors = []
 
                 try:
@@ -1527,6 +1835,9 @@ class TempoWindow:
 
                 row = AnalysisRow(
                     path=path,
+                    artist=artist,
+                    title=title,
+                    album=album,
                     bpm=None if estimate is None else estimate.bpm,
                     uncertainty_bpm=None if estimate is None else estimate.uncertainty_bpm,
                     confidence=None if estimate is None else estimate.confidence,
@@ -1591,6 +1902,7 @@ class TempoWindow:
         analyzed_count = len(self.rows)
         issue_count = sum(1 for row in self.rows if row.error)
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.result.configure(text=f"Finished {analyzed_count} files ({issue_count} with issues)")
@@ -1613,6 +1925,9 @@ class TempoWindow:
                 [
                     "filepath",
                     "filename",
+                    "artist",
+                    "title",
+                    "album",
                     "detected_tempo_bpm",
                     "uncertainty_bpm",
                     "confidence_0_100",
@@ -1633,6 +1948,9 @@ class TempoWindow:
                     [
                         str(row.path),
                         row.path.name,
+                        row.artist,
+                        row.title,
+                        row.album,
                         "" if row.bpm is None else f"{row.bpm:.2f}",
                         "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
                         "" if row.confidence is None else f"{row.confidence:.0f}",
@@ -1648,6 +1966,74 @@ class TempoWindow:
                         row.error,
                     ]
                 )
+
+    def export_closest_pairs(self) -> None:
+        candidates = [
+            row
+            for row in self.rows
+            if row.chroma is not None and self.row_tempo_for_matching(row) is not None
+        ]
+        if len(candidates) < 2:
+            messagebox.showinfo("Chromatch", "At least two rows with chroma and tempo are needed.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            initialfile="chromatch-pairs.csv",
+        )
+        if not filename:
+            return
+
+        pairs = []
+        for first_index, first in enumerate(candidates):
+            for second in candidates[first_index + 1:]:
+                similarity = self.calculate_pair_chroma_tempo_similarity(first, second)
+                if similarity is None:
+                    continue
+
+                first_tempo = self.row_tempo_for_matching(first)
+                second_tempo = self.row_tempo_for_matching(second)
+                tempo_ratio = second_tempo / first_tempo if first_tempo and second_tempo else None
+                pairs.append((similarity, first, second, first_tempo, second_tempo, tempo_ratio))
+
+        pairs.sort(key=lambda item: item[0], reverse=True)
+
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.writer(csv_file)
+                writer.writerow(
+                    [
+                        "rank",
+                        "chroma_tempo_similarity_0_100",
+                        "tempo_ratio_b_over_a",
+                        "tempo_a_bpm",
+                        "tempo_b_bpm",
+                        "filename_a",
+                        "filename_b",
+                        "filepath_a",
+                        "filepath_b",
+                    ]
+                )
+                for rank, (similarity, first, second, first_tempo, second_tempo, tempo_ratio) in enumerate(pairs, 1):
+                    writer.writerow(
+                        [
+                            rank,
+                            f"{similarity:.2f}",
+                            "" if tempo_ratio is None else f"{tempo_ratio:.6f}",
+                            "" if first_tempo is None else f"{first_tempo:.2f}",
+                            "" if second_tempo is None else f"{second_tempo:.2f}",
+                            first.path.name,
+                            second.path.name,
+                            str(first.path),
+                            str(second.path),
+                        ]
+                    )
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export closest pairs:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported {len(pairs)} closest-pair rows")
 
     def run(self) -> None:
         self.root.mainloop()

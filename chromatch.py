@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import base64
 import math
 import os
 import queue
@@ -10,6 +11,7 @@ import time
 import tkinter as tk
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from io import BytesIO
 from tkinter import filedialog, messagebox, ttk
 
 compiler_runtime_path = Path(sys.prefix) / "Library" / "bin"
@@ -128,6 +130,26 @@ def parse_optional_float(value: str | None) -> float | None:
     try:
         return float(value)
     except ValueError:
+        return None
+
+
+def encode_array(values: np.ndarray) -> str:
+    raw = np.asarray(values, dtype=np.float32).tobytes()
+    return "f32:" + base64.b64encode(raw).decode("ascii")
+
+
+def decode_array(value: str | None) -> np.ndarray | None:
+    if value is None or not value.strip():
+        return None
+
+    try:
+        if value.startswith("f32:"):
+            raw = base64.b64decode(value[4:].encode("ascii"))
+            return np.frombuffer(raw, dtype=np.float32).copy()
+
+        raw = base64.b64decode(value.encode("ascii"))
+        return np.load(BytesIO(raw), allow_pickle=False)
+    except Exception:
         return None
 
 
@@ -521,7 +543,10 @@ class TempoWindow:
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.detected_selected_tempo_var = tk.StringVar(value="Selected detected: -- BPM")
         self.mixer_stream: object | None = None
+        self.mixer_lock = threading.RLock()
+        self.waveform_update_active = False
         self.mixer_sample_rate = 44_100
+        self.playback_target_tempo: float | None = None
         self.status_text = "Drop audio files or folders"
         self.result = ttk.Label(
             self.root,
@@ -561,21 +586,16 @@ class TempoWindow:
         load_csv = ttk.Button(actions, text="Load CSV", command=self.load_csv)
         load_csv.pack(side="left", padx=(8, 0))
 
+        remove_selected = ttk.Button(actions, text="Remove selected", command=self.remove_selected_rows)
+        remove_selected.pack(side="left", padx=(8, 0))
+
         self.similarity_button = ttk.Button(
             actions,
-            text="Sort by chroma similarity",
-            command=self.sort_by_chroma_similarity,
+            text="Set target from selection",
+            command=self.set_similarity_target,
             state="disabled",
         )
         self.similarity_button.pack(side="left", padx=(8, 0))
-
-        self.tempo_similarity_button = ttk.Button(
-            actions,
-            text="Sort by chroma/tempo similarity",
-            command=self.sort_by_chroma_tempo_similarity,
-            state="disabled",
-        )
-        self.tempo_similarity_button.pack(side="left", padx=(8, 0))
 
         self.export_button = ttk.Button(
             actions,
@@ -625,6 +645,8 @@ class TempoWindow:
         ttk.Label(controls, text="Target tempo").pack(side="left")
         self.target_tempo_entry = ttk.Entry(controls, textvariable=self.target_tempo_var, width=10)
         self.target_tempo_entry.pack(side="left", padx=(8, 16))
+        self.target_tempo_entry.bind("<KeyRelease>", self.update_playback_target_tempo)
+        self.target_tempo_entry.bind("<FocusOut>", self.update_playback_target_tempo)
         ttk.Checkbutton(
             controls,
             text="Auto",
@@ -646,12 +668,14 @@ class TempoWindow:
     def _build_table(self, parent: ttk.Frame) -> None:
         table_frame = ttk.Frame(parent)
         table_frame.pack(fill="both", expand=True)
+        table_frame.columnconfigure(1, weight=1)
+        table_frame.rowconfigure(0, weight=1)
 
         play_columns = ("play",)
         self.play_table = ttk.Treeview(table_frame, columns=play_columns, show="headings", height=10, selectmode="none")
         self.play_table.heading("play", text="Play")
         self.play_table.column("play", width=55, anchor="center", stretch=False)
-        self.play_table.pack(side="left", fill="y")
+        self.play_table.grid(row=0, column=0, sticky="ns")
         self.play_table.bind("<ButtonRelease-1>", self.handle_play_click)
 
         columns = (
@@ -692,9 +716,14 @@ class TempoWindow:
         self.table.column("chroma", width=170, anchor="center")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.scroll_tables)
-        self.table.configure(yscrollcommand=lambda first, last: self.sync_table_scroll(scrollbar, first, last))
-        self.table.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
+        horizontal_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
+        self.table.configure(
+            yscrollcommand=lambda first, last: self.sync_table_scroll(scrollbar, first, last),
+            xscrollcommand=horizontal_scrollbar.set,
+        )
+        self.table.grid(row=0, column=1, sticky="nsew")
+        scrollbar.grid(row=0, column=2, sticky="ns")
+        horizontal_scrollbar.grid(row=1, column=1, sticky="ew")
         self.table.bind("<<TreeviewSelect>>", self.handle_table_selection)
 
     def scroll_tables(self, *args) -> None:
@@ -746,7 +775,6 @@ class TempoWindow:
         self.sort_descending = False
         self.export_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
-        self.tempo_similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
 
@@ -756,14 +784,21 @@ class TempoWindow:
         if not path.is_absolute():
             path = csv_folder / path
 
+        compact_note_values = decode_array(record.get("chroma_note_values"))
+        compact_bin_values = decode_array(record.get("chroma_histogram"))
+
         note_values = [parse_optional_float(record.get(f"chroma_{name}")) for name in NOTE_NAMES]
         parsed_note_values = None
-        if all(value is not None for value in note_values):
+        if compact_note_values is not None and compact_note_values.size == len(NOTE_NAMES):
+            parsed_note_values = compact_note_values
+        elif all(value is not None for value in note_values):
             parsed_note_values = np.array([value for value in note_values if value is not None])
 
         bin_values = [parse_optional_float(record.get(f"chroma_bin_{index:03d}")) for index in range(CHROMA_BINS)]
         chroma = None
-        if all(value is not None for value in bin_values):
+        if compact_bin_values is not None and compact_bin_values.size == CHROMA_BINS:
+            chroma = chroma_from_values(compact_bin_values, parsed_note_values)
+        elif all(value is not None for value in bin_values):
             chroma = chroma_from_values(
                 np.array([value for value in bin_values if value is not None]),
                 parsed_note_values,
@@ -794,6 +829,33 @@ class TempoWindow:
             return
 
         self.start_analysis(paths)
+
+    def remove_selected_rows(self) -> None:
+        selected_ids = set(self.table.selection())
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        for slot in list(self.waveform_slots):
+            if slot.row_id in selected_ids:
+                self.stop_waveform(slot)
+
+        with self.mixer_lock:
+            self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id not in selected_ids]
+        self.rows = [row for row in self.rows if self.row_id(row) not in selected_ids]
+
+        with self.queue_lock:
+            self.analysis_queue = [path for path in self.analysis_queue if str(path.resolve()) not in selected_ids]
+            self.analysis_paths = {
+                path for path in self.analysis_paths if str(path) not in selected_ids
+            }
+
+        self.update_similarity_scores()
+        self.refresh_table()
+        self.render_waveforms()
+        self.update_target_tempo_from_waveforms()
+        self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.result.configure(text=f"Removed {len(selected_ids)} tracks")
 
     def start_analysis(self, paths: list[Path]) -> None:
         audio_files = collect_audio_files(paths)
@@ -837,31 +899,23 @@ class TempoWindow:
 
         self.refresh_table()
 
-    def sort_by_chroma_similarity(self) -> None:
+    def set_similarity_target(self) -> None:
         targets = self.selected_target_rows()
         if not targets:
             messagebox.showinfo("Chromatch", "Select one or more target rows first.")
             return
 
-        self.sort_column = "chroma_similarity"
-        self.sort_descending = True
         self.update_similarity_scores(targets)
         self.refresh_table()
+        self.result.configure(text=f"Similarity target set from {len(targets)} selected tracks")
+
+    def sort_by_chroma_similarity(self) -> None:
+        self.set_similarity_target()
+        self.sort_by_column("chroma_similarity")
 
     def sort_by_chroma_tempo_similarity(self) -> None:
-        targets = self.selected_target_rows()
-        if not targets:
-            messagebox.showinfo("Chromatch", "Select one or more target rows first.")
-            return
-
-        if not any(self.row_tempo_for_matching(target) is not None for target in targets):
-            messagebox.showinfo("Chromatch", "The selected target rows have no tempo value.")
-            return
-
-        self.sort_column = "chroma_tempo_similarity"
-        self.sort_descending = True
-        self.update_similarity_scores(targets)
-        self.refresh_table()
+        self.set_similarity_target()
+        self.sort_by_column("chroma_tempo_similarity")
 
     def selected_target_rows(self) -> list[AnalysisRow]:
         rows = []
@@ -933,6 +987,10 @@ class TempoWindow:
 
     def target_tempo(self) -> float | None:
         return parse_optional_float(self.target_tempo_var.get())
+
+    def update_playback_target_tempo(self, _event=None) -> None:
+        with self.mixer_lock:
+            self.playback_target_tempo = self.target_tempo()
 
     def calculate_chroma_tempo_similarity(self, row: AnalysisRow, targets: list[AnalysisRow]) -> float | None:
         if row.chroma is None:
@@ -1062,7 +1120,6 @@ class TempoWindow:
     def handle_table_selection(self, _event=None) -> None:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
-        self.tempo_similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.update_selected_detected_tempo()
         self.update_waveform_selection()
 
@@ -1126,9 +1183,11 @@ class TempoWindow:
         tempos = [tempo for tempo in tempos if tempo is not None]
         if not tempos:
             self.target_tempo_var.set("")
+            self.update_playback_target_tempo()
             return
 
         self.target_tempo_var.set(f"{float(np.mean(tempos)):.2f}")
+        self.update_playback_target_tempo()
 
     def render_waveforms(self) -> None:
         for child in self.waveform_container.winfo_children():
@@ -1200,13 +1259,15 @@ class TempoWindow:
             return
 
         width = max(1, slot.canvas.winfo_width())
-        slot.playhead = max(0.0, min(1.0, x / width))
-        if slot.audio is not None:
-            slot.position_samples = slot.playhead * len(slot.audio)
+        with self.mixer_lock:
+            slot.playhead = max(0.0, min(1.0, x / width))
+            if slot.audio is not None:
+                slot.position_samples = slot.playhead * len(slot.audio)
         self.draw_waveform(slot)
 
     def scale_slot_speed(self, slot: WaveformSlot, factor: float) -> None:
-        slot.tempo_multiplier *= factor
+        with self.mixer_lock:
+            slot.tempo_multiplier *= factor
         self.draw_waveform(slot)
 
     def toggle_waveform_keep(self, slot: WaveformSlot) -> None:
@@ -1215,12 +1276,13 @@ class TempoWindow:
 
     def remove_waveform(self, slot: WaveformSlot) -> None:
         self.stop_waveform(slot)
-        self.waveform_slots = [candidate for candidate in self.waveform_slots if candidate is not slot]
+        with self.mixer_lock:
+            self.waveform_slots = [candidate for candidate in self.waveform_slots if candidate is not slot]
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
 
     def playback_rate_for_slot(self, slot: WaveformSlot) -> float:
-        target_tempo = self.target_tempo()
+        target_tempo = self.playback_target_tempo
         row_tempo = self.row_tempo_for_matching(slot.row)
         if target_tempo is None or row_tempo is None:
             return slot.tempo_multiplier
@@ -1249,29 +1311,34 @@ class TempoWindow:
             sd = imported_sounddevice
 
         try:
-            if slot.audio is None:
-                audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
-                slot.audio = audio
-                slot.sample_rate = sample_rate
-                slot.position_samples = slot.playhead * len(audio)
+            self.update_playback_target_tempo()
+            with self.mixer_lock:
+                if slot.audio is None:
+                    audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
+                    slot.audio = audio
+                    slot.sample_rate = sample_rate
+                    slot.position_samples = slot.playhead * len(audio)
 
-            slot.is_playing = True
+                slot.is_playing = True
             if slot.button is not None:
                 slot.button.configure(text="Pause")
 
             self.ensure_mixer_stream()
-            self.update_waveform_playheads()
+            self.ensure_waveform_update_loop()
         except Exception as exc:
-            slot.is_playing = False
+            with self.mixer_lock:
+                slot.is_playing = False
             if slot.button is not None:
                 slot.button.configure(text="Play")
             messagebox.showerror("Chromatch", f"Could not play waveform:\n{exc}")
 
     def stop_waveform(self, slot: WaveformSlot) -> None:
-        slot.is_playing = False
+        with self.mixer_lock:
+            slot.is_playing = False
+            any_playing = any(candidate.is_playing for candidate in self.waveform_slots)
         if slot.button is not None:
             slot.button.configure(text="Play")
-        if not any(candidate.is_playing for candidate in self.waveform_slots):
+        if not any_playing:
             self.stop_mixer_stream()
 
     def ensure_mixer_stream(self) -> None:
@@ -1281,6 +1348,8 @@ class TempoWindow:
         self.mixer_stream = sd.OutputStream(
             samplerate=self.mixer_sample_rate,
             channels=2,
+            blocksize=2048,
+            latency="high",
             callback=self.mixer_callback,
         )
         self.mixer_stream.start()
@@ -1300,37 +1369,49 @@ class TempoWindow:
         output = np.zeros((frames, 2), dtype=np.float32)
         active_count = 0
 
-        for slot in list(self.waveform_slots):
-            if not slot.is_playing or slot.audio is None:
-                continue
+        with self.mixer_lock:
+            slots = list(self.waveform_slots)
+            for slot in slots:
+                if not slot.is_playing or slot.audio is None:
+                    continue
 
-            active_count += 1
-            rate = self.playback_rate_for_slot(slot)
-            positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
-            max_index = len(slot.audio) - 1
-            valid = positions < max_index
-            if np.any(valid):
-                lower = np.floor(positions[valid]).astype(int)
-                upper = np.minimum(lower + 1, max_index)
-                fraction = positions[valid] - lower
-                mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
-                if mixed.shape[1] == 1:
-                    mixed = np.repeat(mixed, 2, axis=1)
-                output[valid] += mixed[:, :2]
+                active_count += 1
+                rate = self.playback_rate_for_slot(slot)
+                positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
+                max_index = len(slot.audio) - 1
+                valid = positions < max_index
+                if np.any(valid):
+                    lower = np.floor(positions[valid]).astype(int)
+                    upper = np.minimum(lower + 1, max_index)
+                    fraction = positions[valid] - lower
+                    mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
+                    if mixed.shape[1] == 1:
+                        mixed = np.repeat(mixed, 2, axis=1)
+                    output[valid] += mixed[:, :2]
 
-            slot.position_samples = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
-            slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
-            if slot.position_samples >= max_index:
-                slot.is_playing = False
+                slot.position_samples = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
+                slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
+                if slot.position_samples >= max_index:
+                    slot.is_playing = False
 
         if active_count > 1:
             output /= active_count
 
         outdata[:] = np.clip(output, -1.0, 1.0)
 
+    def ensure_waveform_update_loop(self) -> None:
+        if self.waveform_update_active:
+            return
+
+        self.waveform_update_active = True
+        self.root.after(50, self.update_waveform_playheads)
+
     def update_waveform_playheads(self) -> None:
         any_playing = False
-        for slot in self.waveform_slots:
+        with self.mixer_lock:
+            slots = list(self.waveform_slots)
+
+        for slot in slots:
             if slot.is_playing:
                 any_playing = True
                 self.draw_waveform(slot)
@@ -1340,6 +1421,8 @@ class TempoWindow:
                 slot.button.configure(text="Play")
         if any_playing:
             self.root.after(50, self.update_waveform_playheads)
+        else:
+            self.waveform_update_active = False
 
     def tap_tempo(self) -> None:
         now = time.perf_counter()
@@ -1510,7 +1593,6 @@ class TempoWindow:
         self.export_button.configure(state="normal" if self.rows else "disabled")
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
-        self.tempo_similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.result.configure(text=f"Finished {analyzed_count} files ({issue_count} with issues)")
 
     def export_csv(self) -> None:
@@ -1539,8 +1621,8 @@ class TempoWindow:
                     "chroma_tempo_similarity_0_100",
                     "chroma_top_peaks",
                     "chroma_least_to_most",
-                    *[f"chroma_{name}" for name in NOTE_NAMES],
-                    *[f"chroma_bin_{index:03d}" for index in range(CHROMA_BINS)],
+                    "chroma_note_values",
+                    "chroma_histogram",
                     "method",
                     "detail",
                     "error",
@@ -1559,16 +1641,8 @@ class TempoWindow:
                         "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",
                         "" if row.chroma is None else row.chroma.top_peaks,
                         "" if row.chroma is None else row.chroma.least_to_most,
-                        *(
-                            [""] * len(NOTE_NAMES)
-                            if row.chroma is None
-                            else [f"{value:.4f}" for value in row.chroma.note_values]
-                        ),
-                        *(
-                            [""] * CHROMA_BINS
-                            if row.chroma is None
-                            else [f"{value:.4f}" for value in row.chroma.histogram]
-                        ),
+                        "" if row.chroma is None else encode_array(row.chroma.note_values),
+                        "" if row.chroma is None else encode_array(row.chroma.histogram),
                         row.method,
                         row.detail,
                         row.error,

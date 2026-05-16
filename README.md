@@ -1,6 +1,6 @@
 # Chromatch
 
-Chromatch is a Tkinter desktop tool for exploring audio tempo and chroma compatibility between tracks.
+Chromatch is a tool for exploring audio tempo and chroma compatibility between tracks.
 
 It analyzes audio files, estimates tempo, builds chroma profiles, compares tracks, and provides playback tools for checking beat alignment and harmonic relationships.
 
@@ -10,24 +10,14 @@ It analyzes audio files, estimates tempo, builds chroma profiles, compares track
 - Load and update CSV analysis files.
 - Estimate tempo and chroma profile.
 - Apply tapped or confirmed tempo corrections.
-- Persist beat anchors, user-defined beat sync points, and harmony base notes.
+- Allow user-defined beat sync points, and harmony base notes marking.
 - Compare tracks by chroma similarity and chroma/tempo similarity.
-- Display waveform, zoomed waveform, beat markers, chroma histogram, and evolving chromagram exports.
-- Preview harmony base notes by clicking the chromagram.
+- Display waveform, zoomed waveform, beat markers, chroma histogram, and timed chromagram exports.
 - Play multiple displayed tracks with tempo matching, per-track speed/volume, looping, metronome, and beat sync.
 
 ## Interface
 
 ![Chromatch interface](files/interface01.PNG)
-
-The main view combines:
-
-- a track analysis table,
-- play buttons and target selection,
-- tempo/tap controls,
-- displayed waveform slots,
-- zoomed waveform beat views,
-- chroma histograms.
 
 ## Generated Evolving Chromagrams
 
@@ -57,18 +47,6 @@ Project files:
 - `test_chromatch_regression.py`: regression test suite.
 - `todo.txt`: current task list and review queue.
 - `chromatch-analysis.csv`: local analysis data, when present.
-
-Included media:
-
-- `files/interface01.PNG`
-- `files/chromagrams/timeChromagram01.png`
-- `files/chromagrams/timeChromagram02.png`
-- `files/chromagrams/timeChromagram03.png`
-- `files/chromagrams/timeChromagram04.png`
-- `files/chromagrams/timeChromagram05.png`
-- `files/chromagrams/timeChromagram06.png`
-- `files/chromagrams/timeChromagram07.png`
-- `files/chromagrams/timeChromagram08.png`
 
 ## Run
 

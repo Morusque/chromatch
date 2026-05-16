@@ -180,6 +180,10 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(100 / sample_rate, duration)
         self.assertGreater(peaks[-1], 0.9)
 
+    def test_zoom_waveform_width_scales_with_track_duration(self):
+        self.assertEqual(900, chromatch.zoom_waveform_width(1.0))
+        self.assertGreater(chromatch.zoom_waveform_width(20.0), 900)
+
     def test_row_values_use_compact_tempo_and_chroma_display(self):
         row = self.make_chroma_row("track.wav", 123.034, 180)
         values = self.app.row_values(row)
@@ -305,6 +309,51 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.draw_chroma_histogram(slot)
 
         self.assertGreater(len(slot.chroma_canvas.find_all()), 0)
+
+    def test_zoomed_waveform_uses_detail_cache_when_available(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5,
+            duration=10.0,
+            waveform=np.zeros(10, dtype=np.float32),
+            zoom_waveform=np.ones(1000, dtype=np.float32),
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=100, height=54)
+
+        self.app.draw_zoomed_waveform(slot)
+
+        line_items = [
+            item
+            for item in slot.zoom_canvas.find_all()
+            if slot.zoom_canvas.type(item) == "line"
+            and slot.zoom_canvas.itemcget(item, "fill") == "#2f5568"
+        ]
+        self.assertGreater(len(line_items), 0)
+
+    def test_beat_sync_snaps_playing_seek_to_master_phase(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.51,
+            duration=10.0,
+            is_playing=True,
+            audio=np.zeros((441_000, 2), dtype=np.float32),
+            sample_rate=44_100,
+        )
+        self.app.beat_sync_enabled_var.set(True)
+        self.app.target_tempo_var.set("120")
+        self.app.update_playback_settings_from_ui()
+
+        with self.app.mixer_lock:
+            self.app.metronome_position_samples = self.app.mixer_sample_rate * 0.125
+            self.app.sync_slot_to_master_beat(slot)
+
+        beat_seconds = 60.0 / 120.0
+        self.assertAlmostEqual(0.25, (slot.playhead * slot.duration % beat_seconds) / beat_seconds)
+        self.assertAlmostEqual(slot.playhead * len(slot.audio), slot.position_samples)
 
     def test_per_track_tempo_multiplier_slider_value_updates_playback_rate(self):
         row = self.make_row(bpm=100)

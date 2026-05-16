@@ -134,6 +134,7 @@ class WaveformSlot:
     duration: float = 0.0
     position_samples: float = 0.0
     waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    zoom_waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
 
 def fold_bpm(bpm: float) -> float:
@@ -652,6 +653,13 @@ def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
     return peaks.astype(np.float32), duration
 
 
+def zoom_waveform_width(duration: float, pixels_per_second: int = 180, max_width: int = 60_000) -> int:
+    if duration <= 0:
+        return 900
+
+    return max(900, min(max_width, int(math.ceil(duration * pixels_per_second))))
+
+
 def estimate_tempo_with_librosa(path: Path) -> TempoEstimate:
     if librosa is None:
         raise RuntimeError("librosa is not installed.")
@@ -837,6 +845,7 @@ class TempoWindow:
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.metronome_enabled_var = tk.BooleanVar(value=False)
+        self.beat_sync_enabled_var = tk.BooleanVar(value=False)
         self.detected_selected_tempo_var = tk.StringVar(value="Selected detected: -- BPM")
         self.mixer_stream: object | None = None
         self.mixer_lock = threading.RLock()
@@ -845,6 +854,7 @@ class TempoWindow:
         self.playback_target_tempo: float | None = None
         self.playback_ignore_target_tempo = False
         self.metronome_enabled = False
+        self.beat_sync_enabled = False
         self.metronome_position_samples = 0.0
         self.suppress_target_slider_callback = False
         self.zoom_seconds = 8.0
@@ -1000,6 +1010,12 @@ class TempoWindow:
             variable=self.metronome_enabled_var,
             command=self.toggle_metronome,
         ).pack(side="left", padx=(12, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Beat sync",
+            variable=self.beat_sync_enabled_var,
+            command=self.update_playback_settings_from_ui,
+        ).pack(side="left", padx=(8, 0))
         self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
         self.play_all_button.pack(side="left", padx=(16, 0))
 
@@ -1436,6 +1452,7 @@ class TempoWindow:
         with self.mixer_lock:
             self.playback_target_tempo = tempo
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+            self.beat_sync_enabled = self.beat_sync_enabled_var.get()
 
     def set_target_tempo_from_slider(self, value: str) -> None:
         if self.suppress_target_slider_callback:
@@ -1448,6 +1465,7 @@ class TempoWindow:
         with self.mixer_lock:
             self.playback_target_tempo = tempo
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+            self.beat_sync_enabled = self.beat_sync_enabled_var.get()
         self.draw_all_waveforms()
 
     def reset_target_tempo_slider(self, _event=None) -> None:
@@ -1457,12 +1475,14 @@ class TempoWindow:
         with self.mixer_lock:
             self.playback_target_tempo = 120.0
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+            self.beat_sync_enabled = self.beat_sync_enabled_var.get()
         self.draw_all_waveforms()
 
     def update_playback_settings_from_ui(self) -> None:
         with self.mixer_lock:
             self.playback_target_tempo = self.target_tempo()
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
+            self.beat_sync_enabled = self.beat_sync_enabled_var.get()
         self.draw_all_waveforms()
 
     def calculate_chroma_tempo_similarity(self, row: AnalysisRow, targets: list[AnalysisRow]) -> float | None:
@@ -1633,11 +1653,12 @@ class TempoWindow:
 
         try:
             waveform, duration = waveform_overview(row.path)
+            zoom_waveform, _ = waveform_overview(row.path, width=zoom_waveform_width(duration))
         except Exception as exc:
             messagebox.showerror("Chromatch", f"Could not load waveform:\n{exc}")
             return
 
-        slot = WaveformSlot(row_id=row_id, row=row, waveform=waveform, duration=duration)
+        slot = WaveformSlot(row_id=row_id, row=row, waveform=waveform, zoom_waveform=zoom_waveform, duration=duration)
         self.waveform_slots.append(slot)
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
@@ -1870,6 +1891,16 @@ class TempoWindow:
             playback_rate = 1.0
         return max(0.25, min(60.0, self.zoom_seconds * playback_rate))
 
+    def slot_beat_seconds(self, slot: WaveformSlot) -> float | None:
+        tempo = self.row_tempo_for_matching(slot.row)
+        if tempo is None or tempo <= 0:
+            return None
+
+        return 60.0 / tempo
+
+    def slot_beat_anchor_seconds(self, slot: WaveformSlot) -> float:
+        return slot.downbeat_seconds if slot.downbeat_seconds is not None else 0.0
+
     def draw_zoomed_waveform(self, slot: WaveformSlot) -> None:
         if slot.zoom_canvas is None:
             return
@@ -1880,35 +1911,34 @@ class TempoWindow:
         mid = height // 2
         canvas.delete("all")
 
-        if slot.waveform.size == 0 or slot.duration <= 0:
+        display_waveform = slot.zoom_waveform if slot.zoom_waveform.size else slot.waveform
+        if display_waveform.size == 0 or slot.duration <= 0:
             canvas.create_text(width // 2, height // 2, text="no zoom", fill="#777777")
             return
 
         start_seconds, end_seconds = self.zoom_window_seconds(slot)
         window_duration = max(1e-6, end_seconds - start_seconds)
-        start_index = max(0, int((start_seconds / slot.duration) * (slot.waveform.size - 1)))
-        end_index = min(slot.waveform.size - 1, int((end_seconds / slot.duration) * (slot.waveform.size - 1)))
+        start_index = max(0, int((start_seconds / slot.duration) * (display_waveform.size - 1)))
+        end_index = min(display_waveform.size - 1, int((end_seconds / slot.duration) * (display_waveform.size - 1)))
         if end_index <= start_index:
-            end_index = min(slot.waveform.size - 1, start_index + 1)
+            end_index = min(display_waveform.size - 1, start_index + 1)
 
         indices = np.linspace(start_index, end_index, width).astype(int)
-        shown = slot.waveform[indices]
+        shown = display_waveform[indices]
         for x, value in enumerate(shown):
             y = int(value * (height * 0.42))
             canvas.create_line(x, mid - y, x, mid + y, fill="#2f5568")
 
-        tempo = self.row_tempo_for_matching(slot.row)
-        if tempo is not None and tempo > 0:
-            beat_seconds = 60.0 / tempo
-            anchor = slot.downbeat_seconds if slot.downbeat_seconds is not None else 0.0
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is not None:
+            anchor = self.slot_beat_anchor_seconds(slot)
             first_beat = math.floor((start_seconds - anchor) / beat_seconds)
             last_beat = math.ceil((end_seconds - anchor) / beat_seconds)
             for beat_index in range(first_beat, last_beat + 1):
                 beat_time = anchor + beat_index * beat_seconds
                 if start_seconds <= beat_time <= end_seconds:
                     x = int(((beat_time - start_seconds) / window_duration) * width)
-                    color = "#8f6a00" if slot.downbeat_seconds is not None and beat_index == 0 else "#d6b869"
-                    canvas.create_line(x, 0, x, height, fill=color)
+                    canvas.create_line(x, 0, x, height, fill="#d6b869")
 
         playhead_seconds = slot.playhead * slot.duration
         playhead_x = int(((playhead_seconds - start_seconds) / window_duration) * width)
@@ -1974,6 +2004,8 @@ class TempoWindow:
             slot.playhead = max(0.0, min(1.0, x / width))
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
+            if slot.is_playing:
+                self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
@@ -1990,6 +2022,8 @@ class TempoWindow:
             slot.playhead = max(0.0, min(1.0, seek_seconds / slot.duration))
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
+            if slot.is_playing:
+                self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
@@ -2012,6 +2046,8 @@ class TempoWindow:
             slot.playhead = next_seconds / slot.duration
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
+            if slot.is_playing:
+                self.sync_slot_to_master_beat(slot)
         slot.zoom_drag_last_x = x
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
@@ -2050,6 +2086,8 @@ class TempoWindow:
             slot.playhead = next_seconds / slot.duration
             if slot.audio is not None:
                 slot.position_samples = slot.playhead * len(slot.audio)
+            if slot.is_playing:
+                self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
@@ -2111,6 +2149,38 @@ class TempoWindow:
             return slot.tempo_multiplier
         return (target_tempo / row_tempo) * slot.tempo_multiplier
 
+    def metronome_beat_phase(self) -> float:
+        tempo = self.playback_target_tempo
+        if tempo is None or tempo <= 0:
+            return 0.0
+
+        samples_per_beat = self.mixer_sample_rate * 60.0 / tempo
+        if samples_per_beat <= 0:
+            return 0.0
+
+        return float((self.metronome_position_samples % samples_per_beat) / samples_per_beat)
+
+    def synced_source_seconds_for_slot(self, slot: WaveformSlot, current_seconds: float) -> float:
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or slot.duration <= 0:
+            return current_seconds
+
+        target_phase = self.metronome_beat_phase()
+        anchor = self.slot_beat_anchor_seconds(slot)
+        beat_number = round(((current_seconds - anchor) / beat_seconds) - target_phase)
+        synced_seconds = anchor + (beat_number + target_phase) * beat_seconds
+        return max(0.0, min(slot.duration, synced_seconds))
+
+    def sync_slot_to_master_beat(self, slot: WaveformSlot) -> None:
+        if not self.beat_sync_enabled or slot.duration <= 0:
+            return
+
+        current_seconds = slot.playhead * slot.duration
+        synced_seconds = self.synced_source_seconds_for_slot(slot, current_seconds)
+        slot.playhead = synced_seconds / slot.duration
+        if slot.audio is not None:
+            slot.position_samples = slot.playhead * len(slot.audio)
+
     def toggle_waveform_playback(self, slot: WaveformSlot) -> None:
         if slot.is_playing:
             self.stop_waveform(slot)
@@ -2152,6 +2222,7 @@ class TempoWindow:
         if not self.metronome_enabled_var.get():
             with self.mixer_lock:
                 self.metronome_enabled = False
+                self.beat_sync_enabled = self.beat_sync_enabled_var.get()
             if not any(slot.is_playing for slot in self.waveform_slots):
                 self.stop_mixer_stream()
             return
@@ -2165,6 +2236,7 @@ class TempoWindow:
         self.update_playback_target_tempo()
         with self.mixer_lock:
             self.metronome_enabled = True
+            self.beat_sync_enabled = self.beat_sync_enabled_var.get()
             self.metronome_position_samples = 0.0
         self.ensure_mixer_stream()
         self.ensure_waveform_update_loop()
@@ -2182,6 +2254,7 @@ class TempoWindow:
                     slot.sample_rate = sample_rate
                     slot.position_samples = slot.playhead * len(audio)
 
+                self.sync_slot_to_master_beat(slot)
                 slot.is_playing = True
             if slot.button is not None:
                 slot.button.configure(text="Pause")

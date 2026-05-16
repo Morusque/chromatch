@@ -65,6 +65,7 @@ CHROMA_MAX_FREQ = 10_000
 CHROMA_ATTENUATION_EXPONENT = 0.5
 CHROMA_SMOOTHING = 0.2
 PLAYBACK_TRACK_GAIN = 0.45
+METRONOME_CLICK_GAIN = 0.22
 
 
 @dataclass(frozen=True)
@@ -835,6 +836,7 @@ class TempoWindow:
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
+        self.metronome_enabled_var = tk.BooleanVar(value=False)
         self.detected_selected_tempo_var = tk.StringVar(value="Selected detected: -- BPM")
         self.mixer_stream: object | None = None
         self.mixer_lock = threading.RLock()
@@ -842,6 +844,8 @@ class TempoWindow:
         self.mixer_sample_rate = 44_100
         self.playback_target_tempo: float | None = None
         self.playback_ignore_target_tempo = False
+        self.metronome_enabled = False
+        self.metronome_position_samples = 0.0
         self.suppress_target_slider_callback = False
         self.zoom_seconds = 8.0
         self.status_text = "Drop audio files or folders"
@@ -990,6 +994,12 @@ class TempoWindow:
             variable=self.ignore_target_tempo_var,
             command=self.update_playback_settings_from_ui,
         ).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Metronome",
+            variable=self.metronome_enabled_var,
+            command=self.toggle_metronome,
+        ).pack(side="left", padx=(12, 0))
         self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
         self.play_all_button.pack(side="left", padx=(16, 0))
 
@@ -1355,6 +1365,13 @@ class TempoWindow:
 
     def row_id(self, row: AnalysisRow) -> str:
         return str(row.path.resolve())
+
+    def sync_waveform_rows(self) -> None:
+        rows_by_id = {self.row_id(row): row for row in self.rows}
+        for slot in self.waveform_slots:
+            row = rows_by_id.get(slot.row_id)
+            if row is not None:
+                slot.row = row
 
     def update_similarity_scores(self, targets: list[AnalysisRow] | None = None) -> None:
         if targets is None:
@@ -1890,7 +1907,7 @@ class TempoWindow:
                 beat_time = anchor + beat_index * beat_seconds
                 if start_seconds <= beat_time <= end_seconds:
                     x = int(((beat_time - start_seconds) / window_duration) * width)
-                    color = "#8f6a00" if slot.downbeat_seconds is not None and beat_index % 4 == 0 else "#d6b869"
+                    color = "#8f6a00" if slot.downbeat_seconds is not None and beat_index == 0 else "#d6b869"
                     canvas.create_line(x, 0, x, height, fill=color)
 
         playhead_seconds = slot.playhead * slot.duration
@@ -2111,21 +2128,50 @@ class TempoWindow:
         playing = sum(1 for slot in self.waveform_slots if slot.is_playing)
         self.result.configure(text=f"Playing {playing} displayed track(s).")
 
-    def start_waveform(self, slot: WaveformSlot) -> None:
+    def ensure_sounddevice_available(self) -> bool:
         global sd, SOUNDDEVICE_IMPORT_ERROR
 
-        if sd is None:
-            try:
-                import sounddevice as imported_sounddevice
-            except Exception as exc:
-                SOUNDDEVICE_IMPORT_ERROR = str(exc)
-                messagebox.showerror(
-                    "Chromatch",
-                    f"Could not load sounddevice:\n{SOUNDDEVICE_IMPORT_ERROR}\n\n"
-                    "Try restarting Chromatch after installing dependencies.",
-                )
-                return
-            sd = imported_sounddevice
+        if sd is not None:
+            return True
+
+        try:
+            import sounddevice as imported_sounddevice
+        except Exception as exc:
+            SOUNDDEVICE_IMPORT_ERROR = str(exc)
+            messagebox.showerror(
+                "Chromatch",
+                f"Could not load sounddevice:\n{SOUNDDEVICE_IMPORT_ERROR}\n\n"
+                "Try restarting Chromatch after installing dependencies.",
+            )
+            return False
+
+        sd = imported_sounddevice
+        return True
+
+    def toggle_metronome(self) -> None:
+        if not self.metronome_enabled_var.get():
+            with self.mixer_lock:
+                self.metronome_enabled = False
+            if not any(slot.is_playing for slot in self.waveform_slots):
+                self.stop_mixer_stream()
+            return
+
+        if not self.ensure_sounddevice_available():
+            self.metronome_enabled_var.set(False)
+            with self.mixer_lock:
+                self.metronome_enabled = False
+            return
+
+        self.update_playback_target_tempo()
+        with self.mixer_lock:
+            self.metronome_enabled = True
+            self.metronome_position_samples = 0.0
+        self.ensure_mixer_stream()
+        self.ensure_waveform_update_loop()
+
+    def start_waveform(self, slot: WaveformSlot) -> None:
+        if not self.ensure_sounddevice_available():
+            return
 
         try:
             self.update_playback_target_tempo()
@@ -2155,7 +2201,7 @@ class TempoWindow:
             any_playing = any(candidate.is_playing for candidate in self.waveform_slots)
         if slot.button is not None:
             slot.button.configure(text="Play")
-        if not any_playing:
+        if not any_playing and not self.metronome_enabled:
             self.stop_mixer_stream()
 
     def ensure_mixer_stream(self) -> None:
@@ -2218,6 +2264,22 @@ class TempoWindow:
                 if not slot.loop and slot.position_samples >= max_index:
                     slot.is_playing = False
 
+            if getattr(self, "metronome_enabled", False):
+                tempo = getattr(self, "playback_target_tempo", None)
+                if tempo is not None and tempo > 0:
+                    samples_per_beat = self.mixer_sample_rate * 60.0 / tempo
+                    positions = self.metronome_position_samples + np.arange(frames)
+                    beat_offsets = np.mod(positions, samples_per_beat)
+                    click_mask = beat_offsets < 900
+                    if np.any(click_mask):
+                        click_offsets = beat_offsets[click_mask]
+                        envelope = np.exp(-click_offsets / 180.0)
+                        tone = np.sin(2.0 * np.pi * 1600.0 * (click_offsets / self.mixer_sample_rate))
+                        click = (tone * envelope * METRONOME_CLICK_GAIN).astype(np.float32)
+                        output[click_mask, 0] += click
+                        output[click_mask, 1] += click
+                    self.metronome_position_samples = float((positions[-1] + 1) % samples_per_beat)
+
         outdata[:] = np.clip(output, -1.0, 1.0)
 
     def ensure_waveform_update_loop(self) -> None:
@@ -2228,7 +2290,7 @@ class TempoWindow:
         self.root.after(50, self.update_waveform_playheads)
 
     def update_waveform_playheads(self) -> None:
-        any_playing = False
+        any_playing = self.metronome_enabled
         with self.mixer_lock:
             slots = list(self.waveform_slots)
 
@@ -2320,6 +2382,8 @@ class TempoWindow:
             return
 
         self.rows = updated_rows
+        self.sync_waveform_rows()
+        self.update_target_tempo_from_waveforms()
         self.update_similarity_scores()
         self.refresh_table()
 
@@ -2343,6 +2407,8 @@ class TempoWindow:
             return
 
         self.rows = updated_rows
+        self.sync_waveform_rows()
+        self.update_target_tempo_from_waveforms()
         self.update_similarity_scores()
         self.refresh_table()
 

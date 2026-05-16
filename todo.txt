@@ -7,10 +7,10 @@ zoomed :
 - the zoomed in view could have a better resolution (maybe threaded or cached or something if that's too much to compute)
 - in zoomed view beat bars and waveform could move more in sync with each other when shifted, zoomed etc
 - (probably to be done later) allow to manually place two or more beats to help with tempo detection
-- beat bars don't appear right regarding the tempo (eg on "Superbad - lb..." tempo is right, and a full bar passes while an eneven number of bars seem tohave passed)
+- beat bars don't appear right regarding the tempo (eg on "Superbad - lb..." tempo is right, and a full vertical line passes while an uneven number of vertical lines seem to have passed)
 
 sync :
-- have a master metronome (with a checkbox to hear it), sync beats to it
+- sync beats to the master metronome
 - option (checkbox) beat sync to metronome when pressin play on a track
 - if sync option activated, keep a track in sync even when placing the playhead somewhere else while playing (eg going to the closest sync point or waiting for the current one to be in sync)
 

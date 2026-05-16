@@ -79,6 +79,37 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.update_playback_settings_from_ui()
         self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
 
+    def test_confirmed_tempo_updates_displayed_waveform_and_auto_target(self):
+        row = self.make_row("track.wav", bpm=123.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+
+        self.app.confirm_detected_tempo()
+
+        self.assertEqual(123.0, slot.row.tapped_bpm)
+        self.assertEqual("123.00", self.app.target_tempo_var.get())
+        self.assertAlmostEqual(1.0, self.app.playback_rate_for_slot(slot))
+
+    def test_applied_tapped_tempo_takes_priority_for_auto_target(self):
+        row = self.make_row("track.wav", bpm=100.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.tapped_tempo_var.set("128.5")
+
+        self.app.apply_tapped_tempo()
+
+        self.assertEqual(128.5, slot.row.tapped_bpm)
+        self.assertEqual("128.50", self.app.target_tempo_var.get())
+        self.assertAlmostEqual(1.0, self.app.playback_rate_for_slot(slot))
+
     def test_playing_hidden_slot_is_marked_keep(self):
         first = self.make_row("first.wav")
         second = self.make_row("second.wav")
@@ -208,6 +239,23 @@ class ChromatchRegressionTests(unittest.TestCase):
         chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 16, None, None)
 
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN * 0.25))
+
+    def test_metronome_generates_click_without_tracks(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+            metronome_enabled = True
+            playback_target_tempo = 120.0
+            metronome_position_samples = 0.0
+
+        outdata = np.zeros((1024, 2), dtype=np.float32)
+
+        app = DummyApp()
+        chromatch.TempoWindow.mixer_callback(app, outdata, 1024, None, None)
+
+        self.assertGreater(float(np.max(np.abs(outdata))), 0.0)
+        self.assertGreater(app.metronome_position_samples, 0.0)
 
     def test_looping_track_wraps_in_mixer_and_keeps_playing(self):
         class DummyApp:

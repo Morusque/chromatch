@@ -3,24 +3,19 @@ to review :
 
 todo soon :
 
-- zoomed :
-  - (probably to be done later) allow to manually place two or more beats to help with tempo detection
-- UI :
-- detection :
+investigate and document how to do this first :
+  - allow to manually place two or more beats to help with tempo detection or resync track over time
   - handle variations in tempo and chroma (throughout a track)
   - handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
   - detect/redefine cues for structure parts and loops
-
+  
 todo at some point :
-
-playback :
-- playback is better now, still has some occasional glitch when another track starts while some already play
 
 need the other tool inspection first :
 - integrate track infos from the former tool
 - add the "match/supermatch" marking logic
 - export Graphviz graphs
-- separate the concept of "base" and chroma, allow for defining/detecting both of them
+- separate the concept of "base" and chroma, allow for defining/detecting both of them (eg clicking on a peak in the chromagram to define "base", correcting fuzzy click to actual highest peak, showing a tiny red dot over it)
 
 even later :
 - export as traktor/mixxx file
@@ -29,3 +24,6 @@ even later :
 - automix
 - limit tempo differences when searching for similar tracks or weight it
 - some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)
+- playback is better now, still has some occasional glitch when another track starts while some already play
+- detect when bars and audio get out of sync and resync them over the course of the track
+- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen

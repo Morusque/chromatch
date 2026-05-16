@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import base64
+import json
 import math
 import os
 import queue
@@ -58,6 +59,7 @@ A4_HZ = 440.0
 C0_MIDI = 12
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 CHROMA_BINS = 240
+CHROMA_CANVAS_WIDTH = CHROMA_BINS
 CHROMA_FFT_SIZE = 8_192
 CHROMA_HOP_SIZE = 4_096
 CHROMA_MIN_FREQ = 20
@@ -66,6 +68,8 @@ CHROMA_ATTENUATION_EXPONENT = 0.5
 CHROMA_SMOOTHING = 0.2
 PLAYBACK_TRACK_GAIN = 0.45
 METRONOME_CLICK_GAIN = 0.22
+CHROMA_PREVIEW_GAIN = 0.18
+CHROMA_PREVIEW_SECONDS = 0.45
 
 
 @dataclass(frozen=True)
@@ -102,6 +106,10 @@ class AnalysisRow:
     detail: str
     error: str = ""
     analyzed_at: str = ""
+    beat_anchor_seconds: float | None = None
+    beat_anchor_source: str = ""
+    base_chroma_bin: int | None = None
+    user_beat_seconds: tuple[float, ...] = ()
 
 
 @dataclass
@@ -178,6 +186,45 @@ def parse_optional_float(value: str | None) -> float | None:
         return float(value)
     except ValueError:
         return None
+
+
+def parse_optional_int(value: str | None) -> int | None:
+    parsed = parse_optional_float(value)
+    if parsed is None:
+        return None
+
+    return int(round(parsed))
+
+
+def encode_float_tuple(values: tuple[float, ...]) -> str:
+    if not values:
+        return ""
+
+    return json.dumps([round(float(value), 6) for value in values], separators=(",", ":"))
+
+
+def decode_float_tuple(value: str | None) -> tuple[float, ...]:
+    if value is None or not value.strip():
+        return ()
+
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        parsed = value.replace(";", " ").split()
+
+    if not isinstance(parsed, list):
+        return ()
+
+    values = []
+    for item in parsed:
+        try:
+            number = float(item)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number) and number >= 0:
+            values.append(number)
+
+    return tuple(sorted(set(values)))
 
 
 def analysis_timestamp() -> str:
@@ -516,6 +563,17 @@ def chroma_bin_label(bin_index: int, bins: int) -> str:
     return f"{NOTE_NAMES[nearest_note]}{cents:+.0f}c"
 
 
+def chroma_bin_preview_frequency(bin_index: float, min_hz: float = 200.0, max_hz: float = 400.0) -> float:
+    pitch_class = (bin_index % CHROMA_BINS) / CHROMA_BINS * 12.0
+    midi = 60.0 + pitch_class
+    frequency = A4_HZ * (2.0 ** ((midi - 69.0) / 12.0))
+    while frequency < min_hz:
+        frequency *= 2.0
+    while frequency > max_hz:
+        frequency /= 2.0
+    return frequency
+
+
 def strongest_chroma_peaks(histogram: np.ndarray, count: int = 3, min_strength: float = 0.05) -> list[int]:
     if histogram.size == 0 or np.max(histogram) <= 0:
         return []
@@ -658,6 +716,27 @@ def zoom_waveform_width(duration: float, pixels_per_second: int = 180, max_width
         return 900
 
     return max(900, min(max_width, int(math.ceil(duration * pixels_per_second))))
+
+
+def detect_beat_anchor_seconds(path: Path, bpm: float | None = None) -> float | None:
+    if librosa is None:
+        return None
+
+    audio, sample_rate = librosa.load(path, sr=22_050, mono=True)
+    if audio.size < sample_rate // 4:
+        return None
+
+    beat_kwargs = {"y": audio, "sr": sample_rate, "units": "time", "trim": False}
+    if bpm is not None and bpm > 0:
+        beat_kwargs["bpm"] = bpm
+
+    _tempo, beats = librosa.beat.beat_track(**beat_kwargs)
+    beats = np.asarray(beats, dtype=float)
+    beats = beats[np.isfinite(beats) & (beats >= 0)]
+    if beats.size == 0:
+        return None
+
+    return float(beats[0])
 
 
 def estimate_tempo_with_librosa(path: Path) -> TempoEstimate:
@@ -826,6 +905,7 @@ class TempoWindow:
         self.root.minsize(1200, 620)
 
         self.rows: list[AnalysisRow] = []
+        self.current_csv_path: Path | None = None
         self.is_analyzing = False
         self.analysis_queue: list[Path] = []
         self.analysis_paths: set[Path] = set()
@@ -856,6 +936,9 @@ class TempoWindow:
         self.metronome_enabled = False
         self.beat_sync_enabled = False
         self.metronome_position_samples = 0.0
+        self.preview_tone_frequency: float | None = None
+        self.preview_tone_position_samples = 0
+        self.preview_tone_total_samples = 0
         self.suppress_target_slider_callback = False
         self.zoom_seconds = 8.0
         self.status_text = "Drop audio files or folders"
@@ -922,6 +1005,14 @@ class TempoWindow:
             state="disabled",
         )
         self.export_button.pack(side="right")
+
+        self.update_csv_button = ttk.Button(
+            actions,
+            text="Update CSV",
+            command=self.update_csv,
+            state="disabled",
+        )
+        self.update_csv_button.pack(side="right", padx=(8, 0))
 
         self.pairs_button = ttk.Button(
             actions,
@@ -1042,6 +1133,7 @@ class TempoWindow:
         self.play_table.column("play", width=55, anchor="center", stretch=False)
         self.play_table.grid(row=0, column=0, sticky="ns")
         self.play_table.bind("<ButtonRelease-1>", self.handle_play_click)
+        self.play_table.bind("<Button-3>", self.handle_target_right_click)
 
         columns = (
             "filename",
@@ -1095,6 +1187,7 @@ class TempoWindow:
         scrollbar.grid(row=0, column=2, sticky="ns")
         horizontal_scrollbar.grid(row=1, column=1, sticky="ew")
         self.table.bind("<<TreeviewSelect>>", self.handle_table_selection)
+        self.table.bind("<Button-3>", self.handle_target_right_click)
         self.update_sort_headings()
 
     def scroll_tables(self, *args) -> None:
@@ -1151,7 +1244,9 @@ class TempoWindow:
         self.sort_column = None
         self.sort_descending = False
         self.similarity_target_ids.clear()
+        self.current_csv_path = csv_path
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
@@ -1208,6 +1303,10 @@ class TempoWindow:
             detail=record.get("detail", ""),
             error=record.get("error", ""),
             analyzed_at=record.get("analyzed_at", ""),
+            beat_anchor_seconds=parse_optional_float(record.get("beat_anchor_seconds")),
+            beat_anchor_source=record.get("beat_anchor_source", ""),
+            base_chroma_bin=parse_optional_int(record.get("base_chroma_bin")),
+            user_beat_seconds=decode_float_tuple(record.get("user_beat_seconds")),
         )
 
     def handle_drop(self, event) -> None:
@@ -1248,6 +1347,7 @@ class TempoWindow:
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.result.configure(text=f"Removed {len(selected_ids)} tracks")
 
@@ -1269,6 +1369,7 @@ class TempoWindow:
             return
 
         self.export_button.configure(state="disabled")
+        self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
         queued = len(self.analysis_queue)
         self.result.configure(text=f"Queued {len(new_files)} new files ({queued} waiting)")
@@ -1305,6 +1406,7 @@ class TempoWindow:
             return
 
         self.export_button.configure(state="disabled")
+        self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
         self.result.configure(text=f"Queued {len(new_paths)} selected tracks for re-analysis")
 
@@ -1346,9 +1448,34 @@ class TempoWindow:
             return
 
         self.similarity_target_ids = {self.row_id(row) for row in targets}
+        self.apply_similarity_targets(targets)
+
+    def apply_similarity_targets(self, targets: list[AnalysisRow]) -> None:
+        if not targets:
+            return
+
         self.update_similarity_scores(targets)
         self.refresh_table()
-        self.result.configure(text=f"Similarity target set from {len(targets)} selected tracks")
+        plural = "s" if len(targets) != 1 else ""
+        self.result.configure(text=f"Similarity target set from {len(targets)} track{plural}")
+
+    def handle_target_right_click(self, event) -> str:
+        row_id = event.widget.identify_row(event.y)
+        if not row_id:
+            return "break"
+
+        row = self.row_by_id(row_id)
+        if row is None:
+            return "break"
+
+        self.table.selection_set(row_id)
+        if row.chroma is None:
+            self.result.configure(text="Selected track has no chroma data for similarity target")
+            return "break"
+
+        self.similarity_target_ids = {row_id}
+        self.apply_similarity_targets([row])
+        return "break"
 
     def sort_by_chroma_similarity(self) -> None:
         self.set_similarity_target()
@@ -1388,6 +1515,62 @@ class TempoWindow:
             row = rows_by_id.get(slot.row_id)
             if row is not None:
                 slot.row = row
+                slot.downbeat_seconds = row.beat_anchor_seconds
+
+    def update_row_beat_anchor(self, row_id: str, beat_anchor_seconds: float, source: str | None = None) -> None:
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == row_id:
+                updated_rows.append(
+                    replace(
+                        row,
+                        beat_anchor_seconds=beat_anchor_seconds,
+                        beat_anchor_source=row.beat_anchor_source if source is None else source,
+                    )
+                )
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+
+    def update_row_base_chroma_bin(self, row_id: str, base_chroma_bin: int | None) -> None:
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == row_id:
+                updated_rows.append(replace(row, base_chroma_bin=base_chroma_bin))
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+
+    def add_row_user_beat(self, row_id: str, beat_seconds: float) -> None:
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == row_id:
+                beats = tuple(sorted(set(row.user_beat_seconds + (round(beat_seconds, 6),))))
+                updated_rows.append(replace(row, user_beat_seconds=beats))
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+
+    def remove_nearest_row_user_beat(self, row_id: str, seconds: float, max_distance_seconds: float) -> bool:
+        changed = False
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == row_id and row.user_beat_seconds:
+                nearest = min(row.user_beat_seconds, key=lambda value: abs(value - seconds))
+                if abs(nearest - seconds) <= max_distance_seconds:
+                    beats = tuple(value for value in row.user_beat_seconds if value != nearest)
+                    updated_rows.append(replace(row, user_beat_seconds=beats))
+                    changed = True
+                else:
+                    updated_rows.append(row)
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+        if changed:
+            self.sync_waveform_rows()
+        return changed
 
     def update_similarity_scores(self, targets: list[AnalysisRow] | None = None) -> None:
         if targets is None:
@@ -1658,7 +1841,24 @@ class TempoWindow:
             messagebox.showerror("Chromatch", f"Could not load waveform:\n{exc}")
             return
 
-        slot = WaveformSlot(row_id=row_id, row=row, waveform=waveform, zoom_waveform=zoom_waveform, duration=duration)
+        downbeat_seconds = row.beat_anchor_seconds
+        if downbeat_seconds is None:
+            try:
+                downbeat_seconds = detect_beat_anchor_seconds(row.path, self.row_tempo_for_matching(row))
+            except Exception:
+                downbeat_seconds = None
+            if downbeat_seconds is not None:
+                self.update_row_beat_anchor(row_id, downbeat_seconds, "automatic")
+                row = self.row_by_id(row_id) or row
+
+        slot = WaveformSlot(
+            row_id=row_id,
+            row=row,
+            waveform=waveform,
+            zoom_waveform=zoom_waveform,
+            duration=duration,
+            downbeat_seconds=downbeat_seconds,
+        )
         self.waveform_slots.append(slot)
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
@@ -1808,27 +2008,37 @@ class TempoWindow:
                 command=lambda slot=slot: self.set_slot_downbeat(slot),
             ).pack(side="left", padx=(4, 0))
 
-            canvas = tk.Canvas(frame, width=360, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
-            canvas.pack(side="left", fill="x", expand=True)
-            slot.canvas = canvas
-            canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
-            canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
+            chroma_canvas = tk.Canvas(
+                frame,
+                width=CHROMA_CANVAS_WIDTH,
+                height=54,
+                bg="#ffffff",
+                highlightthickness=1,
+                highlightbackground="#c9c1b8",
+            )
+            chroma_canvas.pack(side="right", padx=(8, 0))
+            slot.chroma_canvas = chroma_canvas
+            chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
+            chroma_canvas.bind("<Button-1>", lambda event, slot=slot: self.set_base_chroma_from_click(slot, event.x))
+            chroma_canvas.bind("<Button-3>", lambda event, slot=slot: self.clear_base_chroma(slot))
 
             zoom_canvas = tk.Canvas(frame, width=260, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
-            zoom_canvas.pack(side="left", padx=(8, 0))
+            zoom_canvas.pack(side="right", padx=(8, 0))
             slot.zoom_canvas = zoom_canvas
             zoom_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_zoomed_waveform(slot))
             zoom_canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_zoomed_waveform(slot, event.x))
             zoom_canvas.bind("<B1-Motion>", lambda event, slot=slot: self.drag_zoomed_waveform(slot, event.x))
             zoom_canvas.bind("<ButtonRelease-1>", lambda event, slot=slot: self.end_zoom_drag(slot))
+            zoom_canvas.bind("<Button-3>", lambda event, slot=slot: self.remove_user_beat_at_zoom_position(slot, event.x))
             zoom_canvas.bind("<MouseWheel>", lambda event, slot=slot: self.zoom_waveform_view(slot, event.delta))
             zoom_canvas.bind("<Button-4>", lambda event, slot=slot: self.zoom_waveform_view(slot, 120))
             zoom_canvas.bind("<Button-5>", lambda event, slot=slot: self.zoom_waveform_view(slot, -120))
 
-            chroma_canvas = tk.Canvas(frame, width=240, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
-            chroma_canvas.pack(side="left", padx=(8, 0))
-            slot.chroma_canvas = chroma_canvas
-            chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
+            canvas = tk.Canvas(frame, width=360, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            canvas.pack(side="left", fill="x", expand=True)
+            slot.canvas = canvas
+            canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
+            canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
             self.draw_waveform(slot)
             self.draw_zoomed_waveform(slot)
             self.draw_chroma_histogram(slot)
@@ -1948,6 +2158,12 @@ class TempoWindow:
             downbeat_x = int(((slot.downbeat_seconds - start_seconds) / window_duration) * width)
             canvas.create_line(downbeat_x, 0, downbeat_x, height, fill="#b00020", width=2)
 
+        for user_beat in slot.row.user_beat_seconds:
+            if start_seconds <= user_beat <= end_seconds:
+                x = int(((user_beat - start_seconds) / window_duration) * width)
+                canvas.create_line(x, 0, x, height, fill="#7b2cff", width=2)
+                canvas.create_oval(x - 3, 3, x + 3, 9, outline="", fill="#7b2cff")
+
         canvas.create_text(
             4,
             3,
@@ -1962,7 +2178,7 @@ class TempoWindow:
             return
 
         canvas = slot.chroma_canvas
-        width = max(1, canvas.winfo_width())
+        width = self.chroma_canvas_content_width(canvas)
         height = max(1, canvas.winfo_height())
         canvas.delete("all")
 
@@ -1974,8 +2190,10 @@ class TempoWindow:
             playback_rate = self.playback_rate_for_slot(slot)
 
         histogram = slot.row.chroma.histogram
+        shift_bins = 0.0
         if playback_rate > 0:
-            histogram = circular_shift(histogram, CHROMA_BINS * math.log2(playback_rate))
+            shift_bins = CHROMA_BINS * math.log2(playback_rate)
+            histogram = circular_shift(histogram, shift_bins)
 
         peak = float(np.max(histogram))
         if peak <= 0:
@@ -1994,6 +2212,61 @@ class TempoWindow:
             canvas.create_line(x, 0, x, height, fill="#e3ddd5")
             if note_index in (0, 3, 6, 9):
                 canvas.create_text(x + 2, 2, anchor="nw", text=note, fill="#555555", font=("Segoe UI", 7))
+
+        if slot.row.base_chroma_bin is not None:
+            display_bin = int(round((slot.row.base_chroma_bin + shift_bins) % CHROMA_BINS))
+            x = display_bin * bar_width
+            value = float(histogram[display_bin])
+            bar_height = (value / peak) * (height - 12)
+            y = max(4, height - bar_height - 5)
+            canvas.create_oval(x - 4, y - 4, x + 4, y + 4, outline="#ffffff", fill="#c40020", width=1)
+
+    def displayed_chroma_for_slot(self, slot: WaveformSlot) -> tuple[np.ndarray | None, float]:
+        if slot.row.chroma is None:
+            return None, 0.0
+
+        with self.mixer_lock:
+            playback_rate = self.playback_rate_for_slot(slot)
+
+        shift_bins = CHROMA_BINS * math.log2(playback_rate) if playback_rate > 0 else 0.0
+        histogram = circular_shift(slot.row.chroma.histogram, shift_bins) if shift_bins else slot.row.chroma.histogram
+        return histogram, shift_bins
+
+    def chroma_canvas_content_width(self, canvas: tk.Canvas) -> int:
+        return CHROMA_CANVAS_WIDTH
+
+    def clicked_base_chroma_bins(self, slot: WaveformSlot, x: int, width: int) -> tuple[int, float] | None:
+        if slot.row.chroma is None or width <= 0:
+            return None
+
+        _histogram, shift_bins = self.displayed_chroma_for_slot(slot)
+        bar_width = max(1.0, width / CHROMA_BINS)
+        clicked_display_bin = max(0.0, min(float(CHROMA_BINS - 1), x / bar_width))
+        preview_bin = clicked_display_bin
+        if width >= CHROMA_BINS:
+            preview_bin = max(0.0, min(float(CHROMA_BINS), (x / max(1, width - 1)) * CHROMA_BINS))
+        base_bin = int(round((clicked_display_bin - shift_bins) % CHROMA_BINS))
+        return base_bin, preview_bin
+
+    def set_base_chroma_from_click(self, slot: WaveformSlot, x: int) -> None:
+        if slot.chroma_canvas is None:
+            return
+
+        width = self.chroma_canvas_content_width(slot.chroma_canvas)
+
+        clicked_bins = self.clicked_base_chroma_bins(slot, x, width)
+        if clicked_bins is None:
+            return
+
+        base_bin, preview_bin = clicked_bins
+        self.update_row_base_chroma_bin(slot.row_id, base_bin)
+        self.play_chroma_preview(preview_bin)
+        self.draw_chroma_histogram(slot)
+
+    def clear_base_chroma(self, slot: WaveformSlot) -> str:
+        self.update_row_base_chroma_bin(slot.row_id, None)
+        self.draw_chroma_histogram(slot)
+        return "break"
 
     def seek_waveform(self, slot: WaveformSlot, x: int) -> None:
         if slot.canvas is None:
@@ -2072,6 +2345,35 @@ class TempoWindow:
             return
 
         slot.downbeat_seconds = slot.playhead * slot.duration
+        self.update_row_beat_anchor(slot.row_id, slot.downbeat_seconds, "user")
+        self.add_row_user_beat(slot.row_id, slot.downbeat_seconds)
+        self.sync_waveform_rows()
+        self.refresh_table()
+        self.draw_zoomed_waveform(slot)
+
+    def remove_user_beat_at_zoom_position(self, slot: WaveformSlot, x: int) -> str:
+        if slot.zoom_canvas is None or slot.duration <= 0:
+            return "break"
+
+        width = max(1, slot.zoom_canvas.winfo_width())
+        start_seconds, end_seconds = self.zoom_window_seconds(slot)
+        window_duration = max(1e-6, end_seconds - start_seconds)
+        seconds = start_seconds + (max(0.0, min(1.0, x / width)) * window_duration)
+        max_distance_seconds = max(window_duration / width * 8, 0.025)
+        if self.remove_nearest_row_user_beat(slot.row_id, seconds, max_distance_seconds):
+            self.draw_zoomed_waveform(slot)
+        return "break"
+
+    def shift_slot_downbeat(self, slot: WaveformSlot, direction: int) -> None:
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or slot.duration <= 0:
+            return
+
+        anchor = self.slot_beat_anchor_seconds(slot)
+        step = beat_seconds / (256 if self.ctrl_pressed else 64)
+        slot.downbeat_seconds = anchor + (step * direction)
+        self.update_row_beat_anchor(slot.row_id, slot.downbeat_seconds, "user")
+        self.sync_waveform_rows()
         self.draw_zoomed_waveform(slot)
 
     def seek_waveform_by_beats(self, slot: WaveformSlot, beat_count: int) -> None:
@@ -2181,6 +2483,18 @@ class TempoWindow:
         if slot.audio is not None:
             slot.position_samples = slot.playhead * len(slot.audio)
 
+    def play_chroma_preview(self, chroma_bin: float) -> None:
+        if not self.ensure_sounddevice_available():
+            return
+
+        with self.mixer_lock:
+            self.preview_tone_frequency = chroma_bin_preview_frequency(chroma_bin)
+            self.preview_tone_position_samples = 0
+            self.preview_tone_total_samples = int(self.mixer_sample_rate * CHROMA_PREVIEW_SECONDS)
+
+        self.ensure_mixer_stream()
+        self.ensure_waveform_update_loop()
+
     def toggle_waveform_playback(self, slot: WaveformSlot) -> None:
         if slot.is_playing:
             self.stop_waveform(slot)
@@ -2272,9 +2586,10 @@ class TempoWindow:
         with self.mixer_lock:
             slot.is_playing = False
             any_playing = any(candidate.is_playing for candidate in self.waveform_slots)
+            preview_active = self.preview_tone_frequency is not None
         if slot.button is not None:
             slot.button.configure(text="Play")
-        if not any_playing and not self.metronome_enabled:
+        if not any_playing and not self.metronome_enabled and not preview_active:
             self.stop_mixer_stream()
 
     def ensure_mixer_stream(self) -> None:
@@ -2353,6 +2668,24 @@ class TempoWindow:
                         output[click_mask, 1] += click
                     self.metronome_position_samples = float((positions[-1] + 1) % samples_per_beat)
 
+            preview_frequency = getattr(self, "preview_tone_frequency", None)
+            preview_total = getattr(self, "preview_tone_total_samples", 0)
+            preview_position = getattr(self, "preview_tone_position_samples", 0)
+            if preview_frequency is not None and preview_total > preview_position:
+                preview_frames = min(frames, preview_total - preview_position)
+                positions = preview_position + np.arange(preview_frames)
+                fade_samples = max(1, int(self.mixer_sample_rate * 0.015))
+                fade_in = np.minimum(1.0, positions / fade_samples)
+                fade_out = np.minimum(1.0, (preview_total - positions) / fade_samples)
+                envelope = np.minimum(fade_in, fade_out)
+                tone = np.sin(2.0 * np.pi * preview_frequency * (positions / self.mixer_sample_rate))
+                preview = (tone * envelope * CHROMA_PREVIEW_GAIN).astype(np.float32)
+                output[:preview_frames, 0] += preview
+                output[:preview_frames, 1] += preview
+                self.preview_tone_position_samples = preview_position + preview_frames
+                if self.preview_tone_position_samples >= preview_total:
+                    self.preview_tone_frequency = None
+
         outdata[:] = np.clip(output, -1.0, 1.0)
 
     def ensure_waveform_update_loop(self) -> None:
@@ -2366,6 +2699,9 @@ class TempoWindow:
         any_playing = self.metronome_enabled
         with self.mixer_lock:
             slots = list(self.waveform_slots)
+            preview_active = self.preview_tone_frequency is not None
+        if preview_active:
+            any_playing = True
 
         for slot in slots:
             if slot.is_playing:
@@ -2381,6 +2717,8 @@ class TempoWindow:
         if any_playing:
             self.root.after(50, self.update_waveform_playheads)
         else:
+            if not any(slot.is_playing for slot in self.waveform_slots) and not self.metronome_enabled:
+                self.stop_mixer_stream()
             self.waveform_update_active = False
 
     def tap_tempo(self) -> None:
@@ -2499,6 +2837,7 @@ class TempoWindow:
                 self.result_queue.put(("started", path.name, remaining))
                 estimate = None
                 chroma = None
+                beat_anchor_seconds = None
                 artist, title, album = read_audio_tags(path)
                 errors = []
 
@@ -2511,6 +2850,11 @@ class TempoWindow:
                     chroma = estimate_chroma(path)
                 except Exception as exc:
                     errors.append(f"chroma: {exc}")
+
+                try:
+                    beat_anchor_seconds = detect_beat_anchor_seconds(path, None if estimate is None else estimate.bpm)
+                except Exception as exc:
+                    errors.append(f"beat anchor: {exc}")
 
                 row = AnalysisRow(
                     path=path,
@@ -2528,6 +2872,8 @@ class TempoWindow:
                     detail="" if estimate is None else estimate.detail,
                     error="; ".join(errors),
                     analyzed_at=analysis_timestamp(),
+                    beat_anchor_seconds=beat_anchor_seconds,
+                    beat_anchor_source="automatic" if beat_anchor_seconds is not None else "",
                 )
 
                 self.result_queue.put(("row", row, processed, remaining))
@@ -2601,6 +2947,7 @@ class TempoWindow:
         analyzed_count = len(self.rows)
         issue_count = sum(1 for row in self.rows if row.error)
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
@@ -2618,7 +2965,35 @@ class TempoWindow:
         if not filename:
             return
 
-        with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+        path = Path(filename)
+        try:
+            self.write_csv_path(path)
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export CSV:\n{exc}")
+            return
+
+        self.current_csv_path = path
+        self.update_csv_button.configure(state="normal")
+        self.result.configure(text=f"Exported CSV: {path.name}")
+
+    def update_csv(self) -> None:
+        if not self.rows:
+            return
+
+        if self.current_csv_path is None:
+            self.export_csv()
+            return
+
+        try:
+            self.write_csv_path(self.current_csv_path)
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not update CSV:\n{exc}")
+            return
+
+        self.result.configure(text=f"Updated CSV: {self.current_csv_path.name}")
+
+    def write_csv_path(self, path: Path) -> None:
+        with open(path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(
                 [
@@ -2631,6 +3006,10 @@ class TempoWindow:
                     "uncertainty_bpm",
                     "confidence_0_100",
                     "tapped_tempo_bpm",
+                    "beat_anchor_seconds",
+                    "beat_anchor_source",
+                    "base_chroma_bin",
+                    "user_beat_seconds",
                     "analyzed_at",
                     "chroma_similarity_0_100",
                     "chroma_tempo_similarity_0_100",
@@ -2655,6 +3034,10 @@ class TempoWindow:
                         "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
                         "" if row.confidence is None else f"{row.confidence:.0f}",
                         "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
+                        "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
+                        row.beat_anchor_source,
+                        "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
+                        encode_float_tuple(row.user_beat_seconds),
                         row.analyzed_at,
                         "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
                         "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",

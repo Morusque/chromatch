@@ -486,6 +486,40 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual({(10, 20): 1}, self.app.match_links)
         self.assertEqual([(20, 1)], self.app.matches_for(10))
 
+    def test_json_roundtrip_preserves_rows_cues_and_matches(self):
+        first = chromatch.replace(
+            self.make_row("first.wav", bpm=120.0),
+            row_uid=10,
+            cue_points=(chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)),
+        )
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.set_match(10, 20, 2)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.json"
+            self.app.write_json_path(path)
+            self.app.rows = []
+            self.app.match_links = {}
+            self.app.load_json_path(path)
+
+        self.assertEqual([10, 20], [row.row_uid for row in self.app.rows])
+        self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), self.app.rows[0].cue_points)
+        self.assertEqual({(10, 20): 2}, self.app.match_links)
+
+    def test_update_data_writes_json_when_loaded_from_json(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.json"
+            self.app.rows = [row]
+            self.app.current_csv_path = path
+            self.app.update_csv()
+            payload = chromatch.json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual("chromatch-analysis", payload["format"])
+        self.assertEqual("10", payload["rows"][0]["row_uid"])
+
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
             mixer_lock = chromatch.threading.RLock()

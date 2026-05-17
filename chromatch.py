@@ -1169,7 +1169,7 @@ class TempoWindow:
         folder = ttk.Button(actions, text="Choose folder", command=self.choose_folder)
         folder.pack(side="left", padx=(8, 0))
 
-        load_csv = ttk.Button(actions, text="Load CSV", command=self.load_csv)
+        load_csv = ttk.Button(actions, text="Load data", command=self.load_csv)
         load_csv.pack(side="left", padx=(8, 0))
 
         remove_selected = ttk.Button(actions, text="Remove selected", command=self.remove_selected_rows)
@@ -1204,11 +1204,19 @@ class TempoWindow:
 
         self.update_csv_button = ttk.Button(
             actions,
-            text="Update CSV",
+            text="Update data",
             command=self.update_csv,
             state="disabled",
         )
         self.update_csv_button.pack(side="right", padx=(8, 0))
+
+        self.export_json_button = ttk.Button(
+            actions,
+            text="Export JSON",
+            command=self.export_json,
+            state="disabled",
+        )
+        self.export_json_button.pack(side="right", padx=(8, 0))
 
         self.pairs_button = ttk.Button(
             actions,
@@ -1434,11 +1442,19 @@ class TempoWindow:
             self.start_analysis([Path(folder)])
 
     def load_csv(self) -> None:
-        filename = filedialog.askopenfilename(filetypes=(("CSV files", "*.csv"), ("All files", "*.*")))
+        filename = filedialog.askopenfilename(
+            filetypes=(("Chromatch data", "*.csv *.json"), ("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*"))
+        )
         if not filename:
             return
 
-        self.load_csv_path(Path(filename))
+        self.load_data_path(Path(filename))
+
+    def load_data_path(self, path: Path) -> None:
+        if path.suffix.lower() == ".json":
+            self.load_json_path(path)
+        else:
+            self.load_csv_path(path)
 
     def load_csv_path(self, csv_path: Path) -> None:
         if self.is_analyzing:
@@ -1467,11 +1483,68 @@ class TempoWindow:
         self.similarity_target_ids.clear()
         self.current_csv_path = csv_path
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.export_json_button.configure(state="normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
+
+    def load_json_path(self, json_path: Path) -> None:
+        if self.is_analyzing:
+            messagebox.showinfo("Chromatch", "Analysis is already running.")
+            return
+
+        try:
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("Expected a JSON object.")
+            row_payload = payload.get("rows", [])
+            if not isinstance(row_payload, list):
+                raise ValueError("Expected rows to be a list.")
+            rows = [
+                self.row_from_csv_record(
+                    {str(key): "" if value is None else str(value) for key, value in record.items()},
+                    json_path.parent,
+                )
+                for record in row_payload
+                if isinstance(record, dict)
+            ]
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not load JSON:\n{exc}")
+            return
+
+        self.rows = rows
+        self.ensure_row_uids()
+        self.match_links = {}
+        match_payload = payload.get("matches", [])
+        if isinstance(match_payload, list):
+            for item in match_payload:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    first_uid = int(item.get("a"))
+                    second_uid = int(item.get("b"))
+                    score = int(item.get("score"))
+                except (TypeError, ValueError):
+                    continue
+                self.set_match(first_uid, second_uid, score)
+        self.prune_match_links()
+        with self.queue_lock:
+            self.analysis_queue.clear()
+            self.analysis_paths.clear()
+        self.is_analyzing = False
+        self.sort_column = None
+        self.sort_descending = False
+        self.similarity_target_ids.clear()
+        self.current_csv_path = json_path
+        self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.export_json_button.configure(state="normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.rows else "disabled")
+        self.pairs_button.configure(state="normal" if self.rows else "disabled")
+        self.similarity_button.configure(state="disabled")
+        self.refresh_table()
+        self.result.configure(text=f"Loaded {len(self.rows)} rows from JSON")
 
     def load_matches_path(self, path: Path) -> None:
         self.match_links = {}
@@ -1571,8 +1644,8 @@ class TempoWindow:
             return
 
         paths = [Path(item) for item in dropped]
-        if len(paths) == 1 and paths[0].suffix.lower() == ".csv":
-            self.load_csv_path(paths[0])
+        if len(paths) == 1 and paths[0].suffix.lower() in {".csv", ".json"}:
+            self.load_data_path(paths[0])
             return
 
         self.start_analysis(paths)
@@ -1604,6 +1677,7 @@ class TempoWindow:
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.export_json_button.configure(state="normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.result.configure(text=f"Removed {len(selected_ids)} tracks")
@@ -1630,6 +1704,7 @@ class TempoWindow:
             return
 
         self.export_button.configure(state="disabled")
+        self.export_json_button.configure(state="disabled")
         self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
         queued = len(self.analysis_queue)
@@ -1667,6 +1742,7 @@ class TempoWindow:
             return
 
         self.export_button.configure(state="disabled")
+        self.export_json_button.configure(state="disabled")
         self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
         self.result.configure(text=f"Queued {len(new_tasks)} selected tracks for re-analysis")
@@ -3845,6 +3921,7 @@ class TempoWindow:
         analyzed_count = len(self.rows)
         issue_count = sum(1 for row in self.rows if row.error)
         self.export_button.configure(state="normal" if self.rows else "disabled")
+        self.export_json_button.configure(state="normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.pairs_button.configure(state="normal" if self.rows else "disabled")
         has_target_chroma = bool(self.selected_target_rows())
@@ -3874,6 +3951,29 @@ class TempoWindow:
         self.update_csv_button.configure(state="normal")
         self.result.configure(text=f"Exported CSV: {path.name}")
 
+    def export_json(self) -> None:
+        if not self.rows:
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+            initialfile="chromatch-analysis.json",
+        )
+        if not filename:
+            return
+
+        path = Path(filename)
+        try:
+            self.write_json_path(path)
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export JSON:\n{exc}")
+            return
+
+        self.current_csv_path = path
+        self.update_csv_button.configure(state="normal")
+        self.result.configure(text=f"Exported JSON: {path.name}")
+
     def update_csv(self) -> None:
         if not self.rows:
             return
@@ -3883,80 +3983,83 @@ class TempoWindow:
             return
 
         try:
-            self.write_csv_path(self.current_csv_path)
+            if self.current_csv_path.suffix.lower() == ".json":
+                self.write_json_path(self.current_csv_path)
+            else:
+                self.write_csv_path(self.current_csv_path)
         except OSError as exc:
-            messagebox.showerror("Chromatch", f"Could not update CSV:\n{exc}")
+            messagebox.showerror("Chromatch", f"Could not update data:\n{exc}")
             return
 
-        self.result.configure(text=f"Updated CSV: {self.current_csv_path.name}")
+        self.result.configure(text=f"Updated data: {self.current_csv_path.name}")
+
+    def row_export_record(self, row: AnalysisRow) -> dict[str, str]:
+        return {
+            "row_uid": "" if row.row_uid is None else str(row.row_uid),
+            "filepath": str(row.path),
+            "filename": row.path.name,
+            "artist": row.artist,
+            "title": row.title,
+            "album": row.album,
+            "detected_tempo_bpm": "" if row.bpm is None else f"{row.bpm:.2f}",
+            "uncertainty_bpm": "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
+            "confidence_0_100": "" if row.confidence is None else f"{row.confidence:.0f}",
+            "tapped_tempo_bpm": "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
+            "part_start_seconds": "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
+            "part_end_seconds": "" if row.part_end_seconds is None else f"{row.part_end_seconds:.6f}",
+            "beat_anchor_seconds": "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
+            "beat_anchor_source": row.beat_anchor_source,
+            "base_chroma_bin": "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
+            "user_beat_seconds": encode_float_tuple(row.user_beat_seconds),
+            "cue_points_json": encode_cue_points(row.cue_points),
+            "analyzed_at": row.analyzed_at,
+            "chroma_similarity_0_100": "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
+            "chroma_tempo_similarity_0_100": "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",
+            "chroma_top_peaks": "" if row.chroma is None else row.chroma.top_peaks,
+            "chroma_least_to_most": "" if row.chroma is None else row.chroma.least_to_most,
+            "chroma_note_values": "" if row.chroma is None else encode_array(row.chroma.note_values),
+            "chroma_histogram": "" if row.chroma is None else encode_array(row.chroma.histogram),
+            "method": row.method,
+            "detail": row.detail,
+            "error": row.error,
+        }
 
     def write_csv_path(self, path: Path) -> None:
         self.ensure_row_uids()
+        fieldnames = [
+            "row_uid",
+            "filepath",
+            "filename",
+            "artist",
+            "title",
+            "album",
+            "detected_tempo_bpm",
+            "uncertainty_bpm",
+            "confidence_0_100",
+            "tapped_tempo_bpm",
+            "part_start_seconds",
+            "part_end_seconds",
+            "beat_anchor_seconds",
+            "beat_anchor_source",
+            "base_chroma_bin",
+            "user_beat_seconds",
+            "cue_points_json",
+            "analyzed_at",
+            "chroma_similarity_0_100",
+            "chroma_tempo_similarity_0_100",
+            "chroma_top_peaks",
+            "chroma_least_to_most",
+            "chroma_note_values",
+            "chroma_histogram",
+            "method",
+            "detail",
+            "error",
+        ]
         with open(path, "w", newline="", encoding="utf-8") as csv_file:
-            writer = csv.writer(csv_file)
-            writer.writerow(
-                [
-                    "row_uid",
-                    "filepath",
-                    "filename",
-                    "artist",
-                    "title",
-                    "album",
-                    "detected_tempo_bpm",
-                    "uncertainty_bpm",
-                    "confidence_0_100",
-                    "tapped_tempo_bpm",
-                    "part_start_seconds",
-                    "part_end_seconds",
-                    "beat_anchor_seconds",
-                    "beat_anchor_source",
-                    "base_chroma_bin",
-                    "user_beat_seconds",
-                    "cue_points_json",
-                    "analyzed_at",
-                    "chroma_similarity_0_100",
-                    "chroma_tempo_similarity_0_100",
-                    "chroma_top_peaks",
-                    "chroma_least_to_most",
-                    "chroma_note_values",
-                    "chroma_histogram",
-                    "method",
-                    "detail",
-                    "error",
-                ]
-            )
+            writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+            writer.writeheader()
             for row in self.rows:
-                writer.writerow(
-                    [
-                        "" if row.row_uid is None else str(row.row_uid),
-                        str(row.path),
-                        row.path.name,
-                        row.artist,
-                        row.title,
-                        row.album,
-                        "" if row.bpm is None else f"{row.bpm:.2f}",
-                        "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
-                        "" if row.confidence is None else f"{row.confidence:.0f}",
-                        "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
-                        "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
-                        "" if row.part_end_seconds is None else f"{row.part_end_seconds:.6f}",
-                        "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
-                        row.beat_anchor_source,
-                        "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
-                        encode_float_tuple(row.user_beat_seconds),
-                        encode_cue_points(row.cue_points),
-                        row.analyzed_at,
-                        "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
-                        "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",
-                        "" if row.chroma is None else row.chroma.top_peaks,
-                        "" if row.chroma is None else row.chroma.least_to_most,
-                        "" if row.chroma is None else encode_array(row.chroma.note_values),
-                        "" if row.chroma is None else encode_array(row.chroma.histogram),
-                        row.method,
-                        row.detail,
-                        row.error,
-                    ]
-                )
+                writer.writerow(self.row_export_record(row))
         self.write_matches_path(matches_sidecar_path(path))
 
     def write_matches_path(self, path: Path) -> None:
@@ -3965,6 +4068,20 @@ class TempoWindow:
             {"a": first_uid, "b": second_uid, "score": score}
             for (first_uid, second_uid), score in sorted(self.match_links.items())
         ]
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def write_json_path(self, path: Path) -> None:
+        self.ensure_row_uids()
+        self.prune_match_links()
+        payload = {
+            "format": "chromatch-analysis",
+            "version": 1,
+            "rows": [self.row_export_record(row) for row in self.rows],
+            "matches": [
+                {"a": first_uid, "b": second_uid, "score": score}
+                for (first_uid, second_uid), score in sorted(self.match_links.items())
+            ],
+        }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_selected_chromagram(self) -> None:

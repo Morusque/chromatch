@@ -1,20 +1,16 @@
 
 to review :
 
-todo soon :
-- allow for json export/import instead (or in addition) to csv (what problem would that bring?)
-
-need the other tool inspection first :
-- integrate track infos from the former tool
-- add the "match/supermatch" marking logic
+next tasks :
+- integrate track infos from the former tool database and traktor database (parts, match & supermatch, base note, anything else?)
+- integrate track infos from the traktor database (tempos, cues and loops, anything else?)
 - export Graphviz graphs
-- separate the concept of "base" and chroma, allow for defining/detecting both of them (eg clicking on a peak in the chromagram to define "base", correcting fuzzy click to actual highest peak, showing a tiny red dot over it)
-- use the old xml and tractor tracks as a guide
 
-even later :
+tasks for later :
 - automix
 - export as traktor/mixxx file
-- inverse match with eq profile
+- add a "number of matches" (smaller name) column
+- inverse associate with eq profile
 - mixing tools (eg DJ-style filter)
 - limit tempo differences when searching for similar tracks or weight it
 - some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)
@@ -34,3 +30,8 @@ even later :
 - use original tempo should be a per-track option
 - generate chromagrams for multi-selection (choose a folder, then use audoi file names with png extension)
 - there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
+- option to remove a cue or loop (proably by right clicking like with manual beats)
+- actually loop loops if some per-track loop checkbox enabled
+- make the interface more compact
+- figure out how "base" could (or could not) be calculated and aim for an automatic base detection
+- interface to manually define matches

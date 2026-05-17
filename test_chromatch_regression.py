@@ -439,6 +439,21 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual((0.5, 1.25), loaded.user_beat_seconds)
 
+    def test_csv_roundtrip_preserves_cue_points(self):
+        row = chromatch.replace(
+            self.make_row("track.wav"),
+            cue_points=(chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)),
+        )
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            self.app.rows = [row]
+            self.app.write_csv_path(path)
+            with path.open(encoding="utf-8") as csv_file:
+                loaded = self.app.row_from_csv_record(next(chromatch.csv.DictReader(csv_file)), path.parent)
+
+        self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), loaded.cue_points)
+
     def test_csv_writer_exports_row_uid_and_sidecar_matches(self):
         first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
         second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
@@ -651,6 +666,37 @@ class ChromatchRegressionTests(unittest.TestCase):
         ]
         self.assertGreater(len(line_items), 0)
 
+    def test_zoomed_waveform_draws_cues_and_loops(self):
+        row = chromatch.replace(
+            self.make_row(bpm=120),
+            cue_points=(chromatch.CuePoint(5.0), chromatch.CuePoint(6.0, 4.0)),
+        )
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5,
+            duration=10.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=100, height=54)
+
+        self.app.draw_zoomed_waveform(slot)
+
+        cue_lines = [
+            item
+            for item in slot.zoom_canvas.find_all()
+            if slot.zoom_canvas.type(item) == "line"
+            and slot.zoom_canvas.itemcget(item, "fill") == "#008c8c"
+        ]
+        loop_rectangles = [
+            item
+            for item in slot.zoom_canvas.find_all()
+            if slot.zoom_canvas.type(item) == "rectangle"
+            and slot.zoom_canvas.itemcget(item, "fill") == "#00a6a6"
+        ]
+        self.assertGreaterEqual(len(cue_lines), 2)
+        self.assertGreaterEqual(len(loop_rectangles), 1)
+
     def test_loaded_waveform_uses_detected_beat_anchor(self):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
@@ -817,6 +863,31 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("75", self.app.part_end_marker_var.get())
         self.assertEqual(75.0, self.app.rows[0].part_end_seconds)
+
+    def test_cue_button_adds_current_playhead_cue(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.25, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.set_slot_cue_point(slot)
+
+        self.assertEqual((chromatch.CuePoint(25.0),), self.app.rows[0].cue_points)
+
+    def test_loop_button_adds_current_playhead_loop_with_beat_length(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.25, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.beat_jump_var.set("0.5")
+
+        self.app.set_slot_loop_point(slot)
+
+        self.assertEqual((chromatch.CuePoint(25.0, 0.5),), self.app.rows[0].cue_points)
 
     def test_manual_part_field_change_updates_row_without_waiting_for_button(self):
         row = self.make_row("track.wav", bpm=120.0)
@@ -1311,19 +1382,19 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(self.app.zoom_seconds, first.zoom_seconds)
         self.assertEqual(self.app.zoom_seconds, second.zoom_seconds)
 
-    def test_beat_jump_count_controls_beat_seek_buttons(self):
+    def test_beat_jump_count_controls_beat_seek_buttons_with_fractional_values(self):
         row = self.make_row(bpm=120)
         slot = chromatch.WaveformSlot(row_id="track", row=row, playhead=0.5, duration=100.0)
-        self.app.beat_jump_var.set(4)
+        self.app.beat_jump_var.set("0.5")
 
         self.app.seek_waveform_by_beats(slot, 1)
 
-        self.assertAlmostEqual(0.52, slot.playhead)
+        self.assertAlmostEqual(0.5025, slot.playhead)
 
-    def test_beat_step_spinbox_uses_power_of_two_values_and_wide_field(self):
-        values = tuple(int(value) for value in self.app.beat_jump_spinbox.cget("values"))
+    def test_beat_step_spinbox_uses_fractional_power_of_two_values_and_wide_field(self):
+        values = tuple(self.app.beat_jump_spinbox.cget("values"))
 
-        self.assertEqual((1, 2, 4, 8, 16, 32, 64), values)
+        self.assertEqual(("0.125", "0.25", "0.5", "1", "2", "4", "8", "16", "32", "64"), values)
         self.assertEqual(12, int(self.app.beat_jump_spinbox.cget("width")))
 
     def test_user_beats_are_used_as_resync_anchors_for_grid_lines(self):

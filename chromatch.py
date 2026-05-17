@@ -113,6 +113,13 @@ class AnalysisRow:
     user_beat_seconds: tuple[float, ...] = ()
     part_start_seconds: float | None = None
     part_end_seconds: float | None = None
+    cue_points: tuple["CuePoint", ...] = ()
+
+
+@dataclass(frozen=True)
+class CuePoint:
+    seconds: float
+    length_beats: float | None = None
 
 
 @dataclass(frozen=True)
@@ -271,6 +278,55 @@ def decode_float_tuple(value: str | None) -> tuple[float, ...]:
             values.append(number)
 
     return tuple(sorted(set(values)))
+
+
+def encode_cue_points(cue_points: tuple[CuePoint, ...]) -> str:
+    if not cue_points:
+        return ""
+
+    payload = []
+    for cue in cue_points:
+        item = {"seconds": round(float(cue.seconds), 6)}
+        if cue.length_beats is not None:
+            item["length_beats"] = round(float(cue.length_beats), 6)
+        payload.append(item)
+    return json.dumps(payload, separators=(",", ":"))
+
+
+def decode_cue_points(value: str | None) -> tuple[CuePoint, ...]:
+    if value is None or not value.strip():
+        return ()
+
+    try:
+        parsed = json.loads(value)
+    except Exception:
+        return ()
+
+    if not isinstance(parsed, list):
+        return ()
+
+    cue_points = []
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            seconds = float(item.get("seconds"))
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(seconds) or seconds < 0:
+            continue
+
+        length_beats = None
+        if item.get("length_beats") is not None:
+            try:
+                length_beats = float(item.get("length_beats"))
+            except (TypeError, ValueError):
+                length_beats = None
+            if length_beats is not None and (not np.isfinite(length_beats) or length_beats <= 0):
+                length_beats = None
+        cue_points.append(CuePoint(round(seconds, 6), None if length_beats is None else round(length_beats, 6)))
+
+    return tuple(sorted(set(cue_points), key=lambda cue: (cue.seconds, cue.length_beats or 0.0)))
 
 
 def format_seconds_compact(seconds: float) -> str:
@@ -1053,7 +1109,7 @@ class TempoWindow:
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
-        self.beat_jump_var = tk.IntVar(value=4)
+        self.beat_jump_var = tk.StringVar(value="4")
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.metronome_enabled_var = tk.BooleanVar(value=False)
@@ -1264,7 +1320,7 @@ class TempoWindow:
         ttk.Label(controls, text="Beat step").pack(side="left", padx=(12, 4))
         self.beat_jump_spinbox = ttk.Spinbox(
             controls,
-            values=(1, 2, 4, 8, 16, 32, 64),
+            values=("0.125", "0.25", "0.5", "1", "2", "4", "8", "16", "32", "64"),
             width=12,
             textvariable=self.beat_jump_var,
         )
@@ -1506,6 +1562,7 @@ class TempoWindow:
             user_beat_seconds=decode_float_tuple(record.get("user_beat_seconds")),
             part_start_seconds=parse_optional_float(record.get("part_start_seconds")),
             part_end_seconds=parse_optional_float(record.get("part_end_seconds")),
+            cue_points=decode_cue_points(record.get("cue_points_json")),
         )
 
     def handle_drop(self, event) -> None:
@@ -1914,6 +1971,21 @@ class TempoWindow:
         if changed:
             self.sync_waveform_rows()
         return changed
+
+    def add_row_cue_point(self, row_id: str, seconds: float, length_beats: float | None = None) -> None:
+        seconds = round(max(0.0, seconds), 6)
+        if length_beats is not None:
+            length_beats = round(max(0.001, length_beats), 6)
+        cue_point = CuePoint(seconds=seconds, length_beats=length_beats)
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == row_id:
+                cue_points = tuple(sorted(set(row.cue_points + (cue_point,)), key=lambda cue: (cue.seconds, cue.length_beats or 0.0)))
+                updated_rows.append(replace(row, cue_points=cue_points))
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+        self.sync_waveform_rows()
 
     def update_similarity_scores(self, targets: list[AnalysisRow] | None = None) -> None:
         if targets is None:
@@ -2424,6 +2496,18 @@ class TempoWindow:
             ).pack(side="left", padx=(4, 0))
             ttk.Button(
                 controls,
+                text="Cue",
+                width=5,
+                command=lambda slot=slot: self.set_slot_cue_point(slot),
+            ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                controls,
+                text="Loop",
+                width=5,
+                command=lambda slot=slot: self.set_slot_loop_point(slot),
+            ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                controls,
                 text="Fit BPM",
                 width=7,
                 command=lambda slot=slot: self.fit_slot_bpm_from_user_beats(slot),
@@ -2623,6 +2707,21 @@ class TempoWindow:
                 canvas.create_line(x, 0, x, height, fill="#7b2cff", width=2)
                 canvas.create_oval(x - 3, 3, x + 3, 9, outline="", fill="#7b2cff")
 
+        beat_seconds = self.slot_beat_seconds(slot)
+        for cue in slot.row.cue_points:
+            if start_seconds <= cue.seconds <= end_seconds:
+                x = int(((cue.seconds - start_seconds) / window_duration) * width)
+                canvas.create_line(x, 0, x, height, fill="#008c8c", width=2)
+                canvas.create_rectangle(x - 3, height - 10, x + 3, height - 4, outline="", fill="#008c8c")
+            if cue.length_beats is not None and beat_seconds is not None:
+                loop_end = cue.seconds + cue.length_beats * beat_seconds
+                overlap_start = max(cue.seconds, start_seconds)
+                overlap_end = min(loop_end, end_seconds)
+                if overlap_start < overlap_end:
+                    x0 = int(((overlap_start - start_seconds) / window_duration) * width)
+                    x1 = int(((overlap_end - start_seconds) / window_duration) * width)
+                    canvas.create_rectangle(x0, height - 7, x1, height - 2, outline="", fill="#00a6a6", stipple="gray50")
+
         canvas.create_text(
             4,
             3,
@@ -2810,6 +2909,29 @@ class TempoWindow:
         self.refresh_table()
         self.draw_zoomed_waveform(slot)
 
+    def set_slot_cue_point(self, slot: WaveformSlot) -> None:
+        if slot.duration <= 0:
+            return
+
+        seconds = slot.playhead * slot.duration
+        self.add_row_cue_point(slot.row_id, seconds)
+        self.refresh_table()
+        self.draw_zoomed_waveform(slot)
+        self.result.configure(text=f"Added cue at {format_seconds_compact(seconds)}s")
+
+    def set_slot_loop_point(self, slot: WaveformSlot) -> None:
+        if slot.duration <= 0:
+            return
+
+        seconds = slot.playhead * slot.duration
+        length_beats = self.beat_jump_count()
+        self.add_row_cue_point(slot.row_id, seconds, length_beats)
+        self.refresh_table()
+        self.draw_zoomed_waveform(slot)
+        self.result.configure(
+            text=f"Added loop at {format_seconds_compact(seconds)}s for {format_seconds_compact(length_beats)} beats"
+        )
+
     def remove_user_beat_at_zoom_position(self, slot: WaveformSlot, x: int) -> str:
         if slot.zoom_canvas is None or slot.duration <= 0:
             return "break"
@@ -2907,6 +3029,7 @@ class TempoWindow:
             part_start_seconds=None if part_start <= 0 else part_start,
             part_end_seconds=None if abs(part_end - slot.duration) < 1e-6 else part_end,
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if part_start <= beat <= part_end),
+            cue_points=tuple(cue for cue in row.cue_points if part_start <= cue.seconds <= part_end),
         )
         updated_id = self.row_id(updated)
         self.rows = [updated if self.row_id(candidate) == old_id else candidate for candidate in self.rows]
@@ -3002,6 +3125,7 @@ class TempoWindow:
             part_start_seconds=None if start <= 0 and row.part_start_seconds is None else start,
             part_end_seconds=split_seconds,
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if start <= beat <= split_seconds),
+            cue_points=tuple(cue for cue in row.cue_points if start <= cue.seconds <= split_seconds),
         )
         second = replace(
             row,
@@ -3009,6 +3133,7 @@ class TempoWindow:
             part_start_seconds=split_seconds,
             part_end_seconds=None if row.part_end_seconds is None and abs(end - slot.duration) < 1e-6 else end,
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if split_seconds <= beat <= end),
+            cue_points=tuple(cue for cue in row.cue_points if split_seconds <= cue.seconds <= end),
         )
 
         old_id = slot.row_id
@@ -3068,11 +3193,11 @@ class TempoWindow:
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
 
-    def beat_jump_count(self) -> int:
+    def beat_jump_count(self) -> float:
         try:
-            return max(1, int(self.beat_jump_var.get()))
+            return max(0.001, float(self.beat_jump_var.get()))
         except (TypeError, ValueError, tk.TclError):
-            return 4
+            return 4.0
 
     def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
         multiplier = max(0.5, min(2.0, float(value)))
@@ -3787,6 +3912,7 @@ class TempoWindow:
                     "beat_anchor_source",
                     "base_chroma_bin",
                     "user_beat_seconds",
+                    "cue_points_json",
                     "analyzed_at",
                     "chroma_similarity_0_100",
                     "chroma_tempo_similarity_0_100",
@@ -3818,6 +3944,7 @@ class TempoWindow:
                         row.beat_anchor_source,
                         "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
                         encode_float_tuple(row.user_beat_seconds),
+                        encode_cue_points(row.cue_points),
                         row.analyzed_at,
                         "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
                         "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",

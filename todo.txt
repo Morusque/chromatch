@@ -2,11 +2,7 @@
 to review :
 
 todo soon :
-- allow non-integer numbers as beat step (eg going down from 1 would do 1/2, 1/4, 1/8 etc) still allowing to manually type any value
-- allow manually adding cue points for structure parts and loops (a loop is a cue point + a length expressed in beats)
-- csv is still acceptable as the portable analysis table for now, but dynamic/structured data is likely to need JSON fields, a sidecar JSON, or SQLite later
-
-todo at some point :
+- allow for json export/import instead (or in addition) to csv (what problem would that bring?)
 
 need the other tool inspection first :
 - integrate track infos from the former tool
@@ -37,3 +33,4 @@ even later :
 - handle variations in tempo and chroma (throughout a track)
 - use original tempo should be a per-track option
 - generate chromagrams for multi-selection (choose a folder, then use audoi file names with png extension)
+- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)

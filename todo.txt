@@ -2,7 +2,6 @@
 to review :
 
 next tasks :
-- generate chromagrams for multi-selection (choose a folder, then use audoi file names with png extension)
 - auto beat detection is often places slightly too late compared to the actual transient, is there a reason for this?
 
 then :

@@ -4191,29 +4191,87 @@ class TempoWindow:
     def export_selected_chromagram(self) -> None:
         selected = self.table.selection()
         if not selected:
-            messagebox.showinfo("Chromatch", "Select one track first.")
+            messagebox.showinfo("Chromatch", "Select one or more tracks first.")
             return
 
-        row = self.row_by_id(selected[-1])
-        if row is None:
+        selected_rows = [row for row_id in selected if (row := self.row_by_id(row_id)) is not None]
+        if not selected_rows:
             return
 
+        if len(selected_rows) > 1:
+            self.export_chromagrams_to_folder(selected_rows)
+            return
+
+        row = selected_rows[0]
+        path = self.chromagram_save_path_for_row(row)
+        if path is None:
+            return
+
+        if self.export_chromagram_for_row(row, path):
+            self.result.configure(text=f"Exported chromagram: {path.name}")
+
+    def chromagram_save_path_for_row(self, row: AnalysisRow) -> Path | None:
         filename = filedialog.asksaveasfilename(
             defaultextension=".png",
             filetypes=(("PNG images", "*.png"), ("All files", "*.*")),
             initialfile=f"{row.path.stem}-chromagram.png",
         )
-        if not filename:
+        return None if not filename else Path(filename)
+
+    def chromagram_batch_path(self, folder: Path, row: AnalysisRow, used_names: set[str]) -> Path:
+        stem = row.path.stem
+        candidate = f"{stem}.png"
+        if candidate.lower() not in used_names:
+            used_names.add(candidate.lower())
+            return folder / candidate
+
+        part_suffix = f"-part{self.row_part_number(row)}"
+        candidate = f"{stem}{part_suffix}.png"
+        if candidate.lower() not in used_names:
+            used_names.add(candidate.lower())
+            return folder / candidate
+
+        index = 2
+        while True:
+            candidate = f"{stem}{part_suffix}-{index}.png"
+            if candidate.lower() not in used_names:
+                used_names.add(candidate.lower())
+                return folder / candidate
+            index += 1
+
+    def export_chromagrams_to_folder(self, rows: list[AnalysisRow]) -> None:
+        folder_name = filedialog.askdirectory()
+        if not folder_name:
             return
 
+        folder = Path(folder_name)
+        used_names: set[str] = set()
+        exported = 0
+        failures = []
+
+        for row in rows:
+            path = self.chromagram_batch_path(folder, row, used_names)
+            if self.export_chromagram_for_row(row, path, show_errors=False):
+                exported += 1
+            else:
+                failures.append(row.path.name)
+
+        if failures:
+            messagebox.showerror(
+                "Chromatch",
+                "Could not export chromagrams for:\n" + "\n".join(failures[:10]),
+            )
+        self.result.configure(text=f"Exported {exported} chromagram{'s' if exported != 1 else ''} to {folder.name}")
+
+    def export_chromagram_for_row(self, row: AnalysisRow, path: Path, show_errors: bool = True) -> bool:
         try:
             image = render_evolving_chromagram(row.path)
-            image.save(filename)
+            image.save(path)
         except Exception as exc:
-            messagebox.showerror("Chromatch", f"Could not export chromagram:\n{exc}")
-            return
-
-        self.result.configure(text=f"Exported chromagram: {Path(filename).name}")
+            if show_errors:
+                messagebox.showerror("Chromatch", f"Could not export chromagram:\n{exc}")
+            return False
+        return True
 
     def export_closest_pairs(self) -> None:
         candidates = [

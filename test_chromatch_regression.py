@@ -212,6 +212,38 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertGreater(image.width, 0)
         self.assertGreaterEqual(image.height, 360)
 
+    def test_chromagram_batch_path_uses_audio_filename_and_part_suffix_for_collisions(self):
+        first = self.make_row("track.wav")
+        second = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        self.app.rows = [first, second]
+        used_names = set()
+
+        first_path = self.app.chromagram_batch_path(Path("out"), first, used_names)
+        second_path = self.app.chromagram_batch_path(Path("out"), second, used_names)
+
+        self.assertEqual(Path("out") / "track.png", first_path)
+        self.assertEqual(Path("out") / "track-part2.png", second_path)
+
+    def test_multiple_selected_chromagrams_export_to_folder(self):
+        first = self.make_row("first.wav")
+        second = self.make_row("second.wav")
+        self.app.rows = [first, second]
+        exported = []
+        original_askdirectory = chromatch.filedialog.askdirectory
+        original_export = self.app.export_chromagram_for_row
+        chromatch.filedialog.askdirectory = lambda: "out"
+        self.app.export_chromagram_for_row = lambda row, path, show_errors=True: exported.append((row.path.name, path)) or True
+        try:
+            self.app.export_chromagrams_to_folder([first, second])
+        finally:
+            chromatch.filedialog.askdirectory = original_askdirectory
+            self.app.export_chromagram_for_row = original_export
+
+        self.assertEqual(
+            [("first.wav", Path("out") / "first.png"), ("second.wav", Path("out") / "second.png")],
+            exported,
+        )
+
     def test_waveform_overview_stretches_short_files_to_full_width(self):
         sample_rate = 8_000
         audio = np.zeros(100, dtype=np.float32)

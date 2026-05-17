@@ -2,11 +2,9 @@
 to review :
 
 next tasks :
-- integrate track infos from the former tool database and traktor database (parts, match & supermatch, base note, anything else?)
-- integrate track infos from the traktor database (tempos, cues and loops, anything else?)
-- export Graphviz graphs
 
 tasks for later :
+- integrate features from the old tool into the new one
 - automix
 - export as traktor/mixxx file
 - add a "number of matches" (smaller name) column
@@ -34,4 +32,10 @@ tasks for later :
 - actually loop loops if some per-track loop checkbox enabled
 - make the interface more compact
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
+- have a "base/bpm sim" column in addition to the "chroma/bpm sim"
 - interface to manually define matches
+- option to relink track with file
+- option to keep absolute and/or relative url of files
+- export Graphviz graphs
+- handle case where tempo is tapped over a modified (because of pitch change) tempo
+

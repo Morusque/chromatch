@@ -17,6 +17,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
     def make_row(self, name="track.wav", bpm=120.0):
         return chromatch.AnalysisRow(
+            row_uid=None,
             path=Path(name),
             artist="",
             title="",
@@ -310,6 +311,29 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("2026-05-15T10:20:30+02:00", row.analyzed_at)
 
+    def test_csv_loader_preserves_row_uid(self):
+        row = self.app.row_from_csv_record(
+            {
+                "row_uid": "42",
+                "filepath": "track.wav",
+            },
+            Path("."),
+        )
+
+        self.assertEqual(42, row.row_uid)
+
+    def test_load_csv_assigns_missing_row_uids(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            path.write_text(
+                "filepath,detected_tempo_bpm\nfirst.wav,120\nsecond.wav,121\n",
+                encoding="utf-8",
+            )
+
+            self.app.load_csv_path(path)
+
+        self.assertEqual([1, 2], [row.row_uid for row in self.app.rows])
+
     def test_load_csv_strips_nul_bytes(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "analysis.csv"
@@ -414,6 +438,38 @@ class ChromatchRegressionTests(unittest.TestCase):
                 loaded = self.app.row_from_csv_record(next(chromatch.csv.DictReader(csv_file)), path.parent)
 
         self.assertEqual((0.5, 1.25), loaded.user_beat_seconds)
+
+    def test_csv_writer_exports_row_uid_and_sidecar_matches(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.set_match(20, 10, 2)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            self.app.write_csv_path(path)
+            contents = path.read_text(encoding="utf-8")
+            matches = chromatch.json.loads(chromatch.matches_sidecar_path(path).read_text(encoding="utf-8"))
+
+        self.assertIn("row_uid", contents)
+        self.assertEqual([{"a": 10, "b": 20, "score": 2}], matches)
+
+    def test_load_csv_reads_sidecar_matches(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            path.write_text(
+                "row_uid,filepath,detected_tempo_bpm\n10,first.wav,120\n20,second.wav,121\n",
+                encoding="utf-8",
+            )
+            chromatch.matches_sidecar_path(path).write_text(
+                '[{"a":20,"b":10,"score":1}]',
+                encoding="utf-8",
+            )
+
+            self.app.load_csv_path(path)
+
+        self.assertEqual({(10, 20): 1}, self.app.match_links)
+        self.assertEqual([(20, 1)], self.app.matches_for(10))
 
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
@@ -698,7 +754,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(expected_bpm, self.app.rows[0].tapped_bpm, places=2)
 
     def test_split_slot_at_playhead_replaces_row_with_two_parts(self):
-        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), user_beat_seconds=(2.0, 6.0, 8.0))
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=7, user_beat_seconds=(2.0, 6.0, 8.0))
         row_id = self.app.row_id(row)
         slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.5, duration=10.0)
         self.app.rows = [row]
@@ -714,6 +770,8 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual((2.0,), self.app.rows[0].user_beat_seconds)
         self.assertEqual((6.0, 8.0), self.app.rows[1].user_beat_seconds)
         self.assertEqual(self.app.row_id(self.app.rows[0]), slot.row_id)
+        self.assertNotEqual(7, self.app.rows[0].row_uid)
+        self.assertNotEqual(7, self.app.rows[1].row_uid)
 
     def test_split_existing_part_splits_within_part_range(self):
         row = chromatch.replace(
@@ -795,6 +853,18 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertGreaterEqual(len(rectangles), 2)
         fills = {slot.canvas.itemcget(item, "fill") for item in rectangles}
         self.assertIn("#d8d5d0", fills)
+
+    def test_remove_selected_rows_prunes_matches(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.set_match(10, 20, 1)
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(first))
+
+        self.app.remove_selected_rows()
+
+        self.assertEqual({}, self.app.match_links)
 
     def test_right_click_zoom_removes_nearest_user_beat(self):
         row = chromatch.replace(self.make_row("track.wav", bpm=120.0), user_beat_seconds=(2.5,))
@@ -1176,7 +1246,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIn(row_id, self.app.analysis_paths)
 
     def test_add_result_replaces_existing_row_when_reanalyzed(self):
-        old_row = self.make_row("first.wav", bpm=100)
+        old_row = chromatch.replace(self.make_row("first.wav", bpm=100), row_uid=42)
         new_row = self.make_row("first.wav", bpm=127.37)
         row_id = self.app.row_id(old_row)
         self.app.rows = [old_row]
@@ -1188,7 +1258,9 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual(1, len(self.app.rows))
         self.assertAlmostEqual(127.37, self.app.rows[0].bpm)
-        self.assertIs(slot.row, new_row)
+        self.assertEqual(42, self.app.rows[0].row_uid)
+        self.assertEqual(42, slot.row.row_uid)
+        self.assertAlmostEqual(127.37, slot.row.bpm)
         self.assertNotIn(row_id, self.app.analysis_paths)
 
     def test_zoomed_waveform_click_positions_playhead(self):

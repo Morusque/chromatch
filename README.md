@@ -17,7 +17,7 @@ It analyzes audio files, estimates tempo, builds chroma profiles, compares track
 
 ## Interface
 
-![Chromatch interface](files/interface02.PNG)
+![Chromatch interface](files/interface03.PNG)
 
 ## Generated Evolving Chromagrams
 

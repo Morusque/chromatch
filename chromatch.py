@@ -91,6 +91,7 @@ class ChromaEstimate:
 
 @dataclass(frozen=True)
 class AnalysisRow:
+    row_uid: int | None
     path: Path
     artist: str
     title: str
@@ -283,6 +284,10 @@ def analysis_timestamp() -> str:
 def strip_nul_bytes(lines):
     for line in lines:
         yield line.replace("\x00", "")
+
+
+def matches_sidecar_path(csv_path: Path) -> Path:
+    return csv_path.with_suffix(".matches.json")
 
 
 def encode_array(values: np.ndarray) -> str:
@@ -1025,6 +1030,8 @@ class TempoWindow:
         self.root.minsize(1200, 620)
 
         self.rows: list[AnalysisRow] = []
+        self.match_links: dict[tuple[int, int], int] = {}
+        self.next_available_row_uid = 1
         self.current_csv_path: Path | None = None
         self.is_analyzing = False
         self.analysis_queue: list[AnalysisTask] = []
@@ -1393,6 +1400,8 @@ class TempoWindow:
             return
 
         self.rows = rows
+        self.ensure_row_uids()
+        self.load_matches_path(matches_sidecar_path(csv_path))
         with self.queue_lock:
             self.analysis_queue.clear()
             self.analysis_paths.clear()
@@ -1407,6 +1416,32 @@ class TempoWindow:
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
+
+    def load_matches_path(self, path: Path) -> None:
+        self.match_links = {}
+        if not path.exists():
+            return
+
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not load matches:\n{exc}")
+            return
+
+        if not isinstance(payload, list):
+            return
+
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            try:
+                first_uid = int(item.get("a"))
+                second_uid = int(item.get("b"))
+                score = int(item.get("score"))
+            except (TypeError, ValueError):
+                continue
+            self.set_match(first_uid, second_uid, score)
+        self.prune_match_links()
 
     def row_from_csv_record(
         self,
@@ -1449,6 +1484,7 @@ class TempoWindow:
             album = album or file_album
 
         return AnalysisRow(
+            row_uid=parse_optional_int(record.get("row_uid")),
             path=path,
             artist=artist,
             title=title,
@@ -1498,6 +1534,7 @@ class TempoWindow:
             self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id not in selected_ids]
         self.rows = [row for row in self.rows if self.row_id(row) not in selected_ids]
         self.similarity_target_ids.difference_update(selected_ids)
+        self.prune_match_links()
 
         with self.queue_lock:
             self.analysis_queue = [
@@ -1672,6 +1709,68 @@ class TempoWindow:
             if self.row_id(row) == row_id:
                 return row
         return None
+
+    def next_row_uid(self) -> int:
+        used = {row.row_uid for row in self.rows if row.row_uid is not None}
+        while self.next_available_row_uid in used:
+            self.next_available_row_uid += 1
+        row_uid = self.next_available_row_uid
+        self.next_available_row_uid += 1
+        return row_uid
+
+    def ensure_row_uids(self) -> None:
+        used: set[int] = set()
+        updated_rows: list[AnalysisRow] = []
+        next_uid = max(1, self.next_available_row_uid)
+        for row in self.rows:
+            row_uid = row.row_uid
+            if row_uid is None or row_uid <= 0 or row_uid in used:
+                while next_uid in used:
+                    next_uid += 1
+                row_uid = next_uid
+                next_uid += 1
+            used.add(row_uid)
+            updated_rows.append(row if row.row_uid == row_uid else replace(row, row_uid=row_uid))
+        self.rows = updated_rows
+        self.next_available_row_uid = max(next_uid, max(used, default=0) + 1)
+        self.prune_match_links()
+
+    def canonical_match_pair(self, first_uid: int, second_uid: int) -> tuple[int, int] | None:
+        if first_uid <= 0 or second_uid <= 0 or first_uid == second_uid:
+            return None
+        return (first_uid, second_uid) if first_uid < second_uid else (second_uid, first_uid)
+
+    def set_match(self, first_uid: int, second_uid: int, score: int) -> bool:
+        pair = self.canonical_match_pair(first_uid, second_uid)
+        if pair is None or score not in (1, 2):
+            return False
+        self.match_links[pair] = score
+        return True
+
+    def remove_match(self, first_uid: int, second_uid: int) -> bool:
+        pair = self.canonical_match_pair(first_uid, second_uid)
+        if pair is None:
+            return False
+        return self.match_links.pop(pair, None) is not None
+
+    def matches_for(self, row_uid: int | None) -> list[tuple[int, int]]:
+        if row_uid is None:
+            return []
+        matches = []
+        for (first_uid, second_uid), score in self.match_links.items():
+            if first_uid == row_uid:
+                matches.append((second_uid, score))
+            elif second_uid == row_uid:
+                matches.append((first_uid, score))
+        return sorted(matches)
+
+    def prune_match_links(self) -> None:
+        valid_uids = {row.row_uid for row in self.rows if row.row_uid is not None}
+        self.match_links = {
+            pair: score
+            for pair, score in self.match_links.items()
+            if pair[0] in valid_uids and pair[1] in valid_uids and score in (1, 2)
+        }
 
     def row_id(self, row: AnalysisRow) -> str:
         row_id = str(row.path.resolve())
@@ -2899,12 +2998,14 @@ class TempoWindow:
 
         first = replace(
             row,
+            row_uid=self.next_row_uid(),
             part_start_seconds=None if start <= 0 and row.part_start_seconds is None else start,
             part_end_seconds=split_seconds,
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if start <= beat <= split_seconds),
         )
         second = replace(
             row,
+            row_uid=self.next_row_uid(),
             part_start_seconds=split_seconds,
             part_end_seconds=None if row.part_end_seconds is None and abs(end - slot.duration) < 1e-6 else end,
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if split_seconds <= beat <= end),
@@ -2923,6 +3024,7 @@ class TempoWindow:
             return
 
         self.rows = updated_rows
+        self.prune_match_links()
         slot.row = first
         slot.row_id = self.row_id(first)
         slot.downbeat_seconds = first.beat_anchor_seconds
@@ -3525,6 +3627,7 @@ class TempoWindow:
                     errors.append(f"beat anchor: {exc}")
 
                 row = AnalysisRow(
+                    row_uid=None,
                     path=path,
                     artist=artist,
                     title=title,
@@ -3584,18 +3687,18 @@ class TempoWindow:
         updated_rows = []
         for existing_row in self.rows:
             if self.row_id(existing_row) == row_id:
-                updated_rows.append(row)
+                updated_rows.append(replace(row, row_uid=existing_row.row_uid))
                 replaced = True
             else:
                 updated_rows.append(existing_row)
         if replaced:
             self.rows = updated_rows
         else:
-            self.rows.append(row)
+            self.rows.append(row if row.row_uid is not None else replace(row, row_uid=self.next_row_uid()))
 
         for slot in self.waveform_slots:
             if slot.row_id == row_id:
-                slot.row = row
+                slot.row = self.row_by_id(row_id) or row
 
         if self.current_similarity_target_rows() or self.table.selection():
             self.update_similarity_scores()
@@ -3663,10 +3766,12 @@ class TempoWindow:
         self.result.configure(text=f"Updated CSV: {self.current_csv_path.name}")
 
     def write_csv_path(self, path: Path) -> None:
+        self.ensure_row_uids()
         with open(path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(
                 [
+                    "row_uid",
                     "filepath",
                     "filename",
                     "artist",
@@ -3697,6 +3802,7 @@ class TempoWindow:
             for row in self.rows:
                 writer.writerow(
                     [
+                        "" if row.row_uid is None else str(row.row_uid),
                         str(row.path),
                         row.path.name,
                         row.artist,
@@ -3724,6 +3830,15 @@ class TempoWindow:
                         row.error,
                     ]
                 )
+        self.write_matches_path(matches_sidecar_path(path))
+
+    def write_matches_path(self, path: Path) -> None:
+        self.prune_match_links()
+        payload = [
+            {"a": first_uid, "b": second_uid, "score": score}
+            for (first_uid, second_uid), score in sorted(self.match_links.items())
+        ]
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
     def export_selected_chromagram(self) -> None:
         selected = self.table.selection()

@@ -136,6 +136,7 @@ class WaveformSlot:
     row: AnalysisRow
     tempo_multiplier: float = 1.0
     volume: float = 1.0
+    use_original_tempo: bool = False
     kept: bool = False
     loop: bool = False
     playhead: float = 0.0
@@ -154,6 +155,7 @@ class WaveformSlot:
     tempo_multiplier_label: ttk.Label | None = None
     volume_var: tk.DoubleVar | None = None
     volume_label: ttk.Label | None = None
+    original_tempo_var: tk.BooleanVar | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
     sample_rate: int = 0
@@ -164,6 +166,7 @@ class WaveformSlot:
     stinger_restore_playhead: float | None = None
     waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     zoom_waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
+    transient_tokens: tuple[float, ...] = ()
 
 
 def fold_bpm(bpm: float) -> float:
@@ -172,6 +175,12 @@ def fold_bpm(bpm: float) -> float:
     while bpm > 260:
         bpm /= 2
     return bpm
+
+
+def tapped_tempo_inertia(tap_count: int) -> float:
+    if tap_count < 3:
+        return 0.0
+    return min(0.85, (tap_count - 2) * 0.075)
 
 
 def confidence_from_uncertainty(bpm: float, uncertainty_bpm: float) -> float:
@@ -874,11 +883,106 @@ def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
     return peaks.astype(np.float32), duration
 
 
-def zoom_waveform_width(duration: float, pixels_per_second: int = 180, max_width: int = 60_000) -> int:
+def zoom_waveform_width(duration: float, pixels_per_second: int = 720, max_width: int = 240_000) -> int:
     if duration <= 0:
         return 900
 
     return max(900, min(max_width, int(math.ceil(duration * pixels_per_second))))
+
+
+def transient_token_times(
+    waveform: np.ndarray,
+    duration: float,
+    min_spacing_seconds: float = 0.035,
+) -> tuple[float, ...]:
+    if duration <= 0 or waveform.size < 3:
+        return ()
+
+    peaks = np.asarray(waveform, dtype=np.float32)
+    if peaks.size < 3:
+        return ()
+
+    max_peak = float(np.max(peaks))
+    if max_peak <= 1e-6:
+        return ()
+
+    positive = peaks[peaks > 0]
+    level_threshold = max(0.15 * max_peak, float(np.percentile(positive, 75)) * 0.6)
+    onset = np.diff(peaks, prepend=peaks[0])
+    onset[onset < 0] = 0
+    score = onset * peaks
+    max_score = float(np.max(score))
+    if max_score <= 1e-8:
+        return ()
+
+    score_threshold = max(max_score * 0.15, float(np.percentile(score[score > 0], 85)) * 0.5)
+    candidates = [
+        index
+        for index in range(1, peaks.size - 1)
+        if peaks[index] >= level_threshold
+        and score[index] >= score_threshold
+        and score[index] >= score[index - 1]
+        and score[index] >= score[index + 1]
+    ]
+    candidates.sort(key=lambda index: score[index], reverse=True)
+
+    seconds_per_sample = duration / max(1, peaks.size - 1)
+    min_spacing_indexes = max(1, int(round(min_spacing_seconds / seconds_per_sample)))
+    selected: list[int] = []
+    for index in candidates:
+        if all(abs(index - existing) >= min_spacing_indexes for existing in selected):
+            selected.append(index)
+
+    return tuple(round(index * seconds_per_sample, 6) for index in sorted(selected))
+
+
+def refine_beat_anchor_to_transient(
+    audio: np.ndarray,
+    sample_rate: int,
+    beat_seconds: float,
+    search_before_seconds: float = 0.12,
+    search_after_seconds: float = 0.04,
+) -> float:
+    if sample_rate <= 0 or audio.size == 0 or not np.isfinite(beat_seconds):
+        return beat_seconds
+
+    center = int(round(beat_seconds * sample_rate))
+    start = max(0, center - int(round(search_before_seconds * sample_rate)))
+    end = min(audio.size, center + int(round(search_after_seconds * sample_rate)))
+    if end - start < 8:
+        return beat_seconds
+
+    window = np.abs(audio[start:end].astype(np.float32, copy=False))
+    peak = float(np.max(window))
+    if peak <= 1e-6:
+        return beat_seconds
+
+    frame_size = max(16, int(round(sample_rate * 0.006)))
+    if window.size <= frame_size:
+        return beat_seconds
+
+    kernel = np.ones(frame_size, dtype=np.float32) / frame_size
+    left_pad = frame_size // 2
+    right_pad = frame_size - 1 - left_pad
+    padded = np.pad(window, (left_pad, right_pad), mode="edge")
+    envelope = np.convolve(padded, kernel, mode="valid")
+    onset = np.diff(envelope, prepend=envelope[0])
+    onset[onset < 0] = 0
+    if float(np.max(onset)) <= peak * 0.002:
+        return beat_seconds
+
+    onset_index = int(np.argmax(onset))
+    threshold = peak * 0.08
+    attack_index = onset_index
+    while attack_index > 0 and envelope[attack_index] > threshold:
+        attack_index -= 1
+    if envelope[attack_index] <= threshold and attack_index + 1 < envelope.size:
+        attack_index += 1
+
+    refined_seconds = (start + attack_index) / sample_rate
+    if abs(refined_seconds - beat_seconds) > search_before_seconds:
+        return beat_seconds
+    return refined_seconds
 
 
 def detect_beat_anchor_seconds(
@@ -905,7 +1009,10 @@ def detect_beat_anchor_seconds(
     if beats.size == 0:
         return None
 
-    return offset + float(beats[0])
+    beat_seconds = float(beats[0])
+    beat_seconds = refine_beat_anchor_to_transient(audio, sample_rate, beat_seconds)
+    return offset + beat_seconds
+
 
 
 def estimate_tempo_with_librosa(
@@ -2470,6 +2577,7 @@ class TempoWindow:
             row=row,
             waveform=waveform,
             zoom_waveform=zoom_waveform,
+            transient_tokens=transient_token_times(zoom_waveform, duration),
             duration=duration,
             downbeat_seconds=downbeat_seconds,
         )
@@ -2639,6 +2747,13 @@ class TempoWindow:
             )
             volume_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_volume(slot))
             volume_scale.pack(side="left")
+            slot.original_tempo_var = tk.BooleanVar(value=slot.use_original_tempo)
+            ttk.Checkbutton(
+                controls,
+                text="Orig",
+                variable=slot.original_tempo_var,
+                command=lambda slot=slot: self.set_waveform_original_tempo(slot),
+            ).pack(side="left", padx=(4, 0))
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
                 controls,
@@ -2765,7 +2880,7 @@ class TempoWindow:
 
         center = slot.playhead * slot.duration
         zoom_seconds = self.zoom_seconds_for_slot(slot)
-        half_width = min(slot.duration, max(0.25, zoom_seconds)) / 2
+        half_width = min(slot.duration, max(0.05, zoom_seconds)) / 2
         start = max(0.0, center - half_width)
         end = min(slot.duration, center + half_width)
         if end - start < zoom_seconds and slot.duration > zoom_seconds:
@@ -2781,7 +2896,7 @@ class TempoWindow:
 
         if playback_rate <= 0:
             playback_rate = 1.0
-        return max(0.25, min(60.0, self.zoom_seconds * playback_rate))
+        return max(0.05, min(60.0, self.zoom_seconds * playback_rate))
 
     def slot_beat_seconds(self, slot: WaveformSlot) -> float | None:
         tempo = self.row_tempo_for_matching(slot.row)
@@ -2805,7 +2920,10 @@ class TempoWindow:
             return []
 
         anchors = [self.slot_beat_anchor_seconds(slot)]
-        anchors.extend(beat for beat in slot.row.user_beat_seconds if start_seconds <= beat <= end_seconds)
+        previous_user_anchors = [beat for beat in slot.row.user_beat_seconds if beat <= start_seconds]
+        if previous_user_anchors:
+            anchors.append(max(previous_user_anchors))
+        anchors.extend(beat for beat in slot.row.user_beat_seconds if start_seconds < beat <= end_seconds)
         anchors = sorted(set(round(anchor, 6) for anchor in anchors))
         line_times: set[float] = set()
 
@@ -2851,6 +2969,13 @@ class TempoWindow:
         for x, value in enumerate(shown):
             y = int(value * (height * 0.42))
             canvas.create_line(x, mid - y, x, mid + y, fill="#2f5568")
+
+        if window_duration <= 3.0:
+            for token_seconds in slot.transient_tokens:
+                if start_seconds <= token_seconds <= end_seconds:
+                    x = int(((token_seconds - start_seconds) / window_duration) * width)
+                    canvas.create_line(x, height - 14, x, height - 1, fill="#202020")
+                    canvas.create_line(x - 2, height - 4, x, height - 1, x + 2, height - 4, fill="#202020")
 
         beat_seconds = self.slot_beat_seconds(slot)
         if beat_seconds is not None:
@@ -3058,7 +3183,7 @@ class TempoWindow:
 
     def zoom_waveform_view(self, slot: WaveformSlot, delta: int) -> None:
         factor = 0.8 if delta > 0 else 1.25
-        self.zoom_seconds = max(0.5, min(60.0, self.zoom_seconds * factor))
+        self.zoom_seconds = max(0.05, min(60.0, self.zoom_seconds * factor))
         for candidate in self.waveform_slots:
             candidate.zoom_seconds = self.zoom_seconds
         self.draw_all_zoomed_waveforms()
@@ -3419,6 +3544,14 @@ class TempoWindow:
     def set_waveform_loop(self, slot: WaveformSlot) -> None:
         slot.loop = bool(slot.loop_var.get()) if slot.loop_var is not None else not slot.loop
 
+    def set_waveform_original_tempo(self, slot: WaveformSlot) -> None:
+        slot.use_original_tempo = (
+            bool(slot.original_tempo_var.get()) if slot.original_tempo_var is not None else not slot.use_original_tempo
+        )
+        self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
+        self.draw_chroma_histogram(slot)
+
     def remove_waveform(self, slot: WaveformSlot) -> None:
         self.stop_waveform(slot)
         with self.mixer_lock:
@@ -3427,7 +3560,7 @@ class TempoWindow:
         self.update_target_tempo_from_waveforms()
 
     def playback_rate_for_slot(self, slot: WaveformSlot) -> float:
-        if self.playback_ignore_target_tempo:
+        if self.playback_ignore_target_tempo or slot.use_original_tempo:
             return slot.tempo_multiplier
 
         target_tempo = self.playback_target_tempo
@@ -3816,8 +3949,8 @@ class TempoWindow:
         median_bpm = fold_bpm(60.0 / median_interval)
         bpm = regression_bpm if regression_bpm is not None else median_bpm
 
-        if self.current_tapped_bpm is not None and len(self.tap_times) >= 4:
-            inertia = min(0.85, 0.45 + len(self.tap_times) * 0.025)
+        if self.current_tapped_bpm is not None:
+            inertia = tapped_tempo_inertia(len(self.tap_times))
             bpm = self.current_tapped_bpm * inertia + bpm * (1.0 - inertia)
 
         return bpm
@@ -3826,6 +3959,13 @@ class TempoWindow:
         self.tap_times.clear()
         self.current_tapped_bpm = None
         self.tapped_tempo_var.set("")
+
+    def tapped_bpm_for_row(self, row: AnalysisRow, manual_bpm: float) -> float:
+        row_id = self.row_id(row)
+        for slot in self.waveform_slots:
+            if slot.row_id == row_id and slot.tempo_multiplier > 0:
+                return manual_bpm / slot.tempo_multiplier
+        return manual_bpm
 
     def apply_tapped_tempo(self) -> None:
         manual_bpm = parse_optional_float(self.tapped_tempo_var.get())
@@ -3843,7 +3983,7 @@ class TempoWindow:
         applied = False
         for row in self.rows:
             if self.row_id(row) in selected_ids:
-                updated_rows.append(replace(row, tapped_bpm=manual_bpm))
+                updated_rows.append(replace(row, tapped_bpm=self.tapped_bpm_for_row(row, manual_bpm)))
                 applied = True
             else:
                 updated_rows.append(row)

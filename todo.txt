@@ -2,21 +2,14 @@
 to review :
 
 next tasks :
-- auto beat detection is often places slightly too late compared to the actual transient, is there a reason for this?
 
 then :
-- integrate features from the old tool into the new one (list them)
-- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
-- really zoomed in waveform is still not at a good resolution, if this is a problem just adding small tokens for transients would help placing beats correctly
 - "search" field (filters results that contain text in any field or in specified filed (dropdown selection of all/what field))
-- use original tempo should be a per-track option
 - make the interface more compact
 - have a "base/bpm sim" column in addition to the "chroma/bpm sim" and/or a combined one (close base filter, then chroma)
 - interface to manually define matches (how?)
-
-tap tempo :
-- tap tempo should have less inertia on the first taps (after reset) then inertia should build over the taps
-- handle case where tempo is tapped over a modified (because of pitch change) tempo
+- handle case where tempo is tapped over a modified (because of pitch change) tempo (I should explain this better)
+- integrate features from the old tool into the new one (read list first)
 
 tasks for later :
 - automix
@@ -39,3 +32,8 @@ tasks for later :
 - option to keep absolute and/or relative url of files
 - export Graphviz graphs
 - manually track and reencode files not parsed correctly
+- allow ctrl+A on the list
+- don't alanyse track on drop, wait for the user to ask for analysis?
+- auto beat detection could still be better, maybe refine this kind of detection on proven files
+- zoomed waveform resolution could be even better probably
+- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen

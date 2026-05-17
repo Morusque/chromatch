@@ -170,6 +170,25 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual(0.0, chromatch.chroma_similarity_score(flat, target))
 
+    def test_row_values_include_match_and_marker_counts(self):
+        first = chromatch.replace(
+            self.make_row("first.wav"),
+            row_uid=1,
+            user_beat_seconds=(0.5, 1.0),
+            cue_points=(
+                chromatch.CuePoint(8.0),
+                chromatch.CuePoint(16.0, 4.0),
+            ),
+        )
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=2)
+        self.app.rows = [first, second]
+        self.app.set_match(1, 2, 2)
+
+        values = self.app.row_values(first)
+
+        self.assertEqual("1", values[2])
+        self.assertEqual("B2 C1 L1", values[3])
+
     def test_evolving_chromagram_renderer_exports_image(self):
         sample_rate = 8_000
         seconds = 1.0
@@ -237,9 +256,11 @@ class ChromatchRegressionTests(unittest.TestCase):
         row = self.make_chroma_row("track.wav", 123.034, 180)
         values = self.app.row_values(row)
         self.assertEqual("1", values[1])
-        self.assertEqual("123.03 (A)", values[2])
-        self.assertNotIn("BPM", values[2])
-        self.assertEqual(3, len(values[6].split()))
+        self.assertEqual("", values[2])
+        self.assertEqual("", values[3])
+        self.assertEqual("123.03 (A)", values[4])
+        self.assertNotIn("BPM", values[4])
+        self.assertEqual(3, len(values[8].split()))
 
     def test_part_rows_have_range_ids_and_part_numbers(self):
         row = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
@@ -990,6 +1011,50 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("break", result)
         self.assertEqual((), self.app.rows[0].user_beat_seconds)
 
+    def test_right_click_zoom_removes_nearest_cue(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            cue_points=(chromatch.CuePoint(2.5),),
+        )
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(
+            row_id=row_id,
+            row=row,
+            playhead=0.25,
+            duration=10.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=100, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        result = self.app.remove_timeline_marker_at_zoom_position(slot, 31)
+
+        self.assertEqual("break", result)
+        self.assertEqual((), self.app.rows[0].cue_points)
+
+    def test_right_click_zoom_removes_loop_when_clicking_inside_loop_bar(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            cue_points=(chromatch.CuePoint(2.0, 4.0),),
+        )
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(
+            row_id=row_id,
+            row=row,
+            playhead=0.25,
+            duration=10.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=100, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        result = self.app.remove_timeline_marker_at_zoom_position(slot, 50)
+
+        self.assertEqual("break", result)
+        self.assertEqual((), self.app.rows[0].cue_points)
+
     def test_chroma_click_sets_base_to_clicked_pixel_and_right_click_clears_it(self):
         row = self.make_chroma_row("track.wav", 120, 80)
         row_id = self.app.row_id(row)
@@ -1368,7 +1433,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(127.37, slot.row.bpm)
         self.assertNotIn(row_id, self.app.analysis_paths)
 
-    def test_zoomed_waveform_click_positions_playhead(self):
+    def test_zoomed_waveform_click_starts_drag_without_moving_playhead(self):
         row = self.make_row(bpm=120)
         slot = chromatch.WaveformSlot(
             row_id="track",
@@ -1380,9 +1445,11 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.zoom_seconds = 10.0
         slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
 
-        self.app.seek_zoomed_waveform(slot, 200)
+        result = self.app.begin_zoom_drag(slot, 200)
 
-        self.assertAlmostEqual(0.55, slot.playhead, places=2)
+        self.assertEqual("break", result)
+        self.assertEqual(200, slot.zoom_drag_last_x)
+        self.assertAlmostEqual(0.5, slot.playhead)
 
     def test_waveform_click_uses_actual_canvas_width(self):
         row = self.make_row(bpm=120)

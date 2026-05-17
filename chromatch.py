@@ -1362,6 +1362,8 @@ class TempoWindow:
         columns = (
             "filename",
             "part",
+            "matches",
+            "markers",
             "tempo",
             "uncertainty",
             "chroma_similarity",
@@ -1375,6 +1377,8 @@ class TempoWindow:
         headings = {
             "filename": "Filename",
             "part": "Part",
+            "matches": "M",
+            "markers": "Marks",
             "tempo": "Tempo",
             "uncertainty": "Uncertainty",
             "chroma_similarity": "Chroma sim",
@@ -1394,6 +1398,8 @@ class TempoWindow:
 
         self.table.column("filename", width=260, anchor="w")
         self.table.column("part", width=55, anchor="center", stretch=False)
+        self.table.column("matches", width=45, anchor="center", stretch=False)
+        self.table.column("markers", width=75, anchor="center", stretch=False)
         self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
         self.table.column("chroma_similarity", width=90, anchor="center")
@@ -1759,6 +1765,8 @@ class TempoWindow:
         else:
             self.sort_column = column
             self.sort_descending = column in {
+                "matches",
+                "markers",
                 "tempo",
                 "chroma_similarity",
                 "chroma_tempo_similarity",
@@ -2048,6 +2056,65 @@ class TempoWindow:
             self.sync_waveform_rows()
         return changed
 
+    def remove_nearest_row_timeline_marker(
+        self,
+        row_id: str,
+        seconds: float,
+        max_distance_seconds: float,
+        beat_seconds: float | None = None,
+    ) -> str | None:
+        changed_kind = None
+        updated_rows = []
+
+        for row in self.rows:
+            if self.row_id(row) != row_id:
+                updated_rows.append(row)
+                continue
+
+            beat_candidate = None
+            beat_distance = float("inf")
+            if row.user_beat_seconds:
+                beat_candidate = min(row.user_beat_seconds, key=lambda value: abs(value - seconds))
+                beat_distance = abs(beat_candidate - seconds)
+
+            cue_candidate = None
+            cue_distance = float("inf")
+            for cue in row.cue_points:
+                distance = abs(cue.seconds - seconds)
+                if cue.length_beats is not None and beat_seconds is not None:
+                    loop_end = cue.seconds + cue.length_beats * beat_seconds
+                    if cue.seconds <= seconds <= loop_end:
+                        distance = 0.0
+                    else:
+                        distance = min(distance, abs(loop_end - seconds))
+                if distance < cue_distance:
+                    cue_candidate = cue
+                    cue_distance = distance
+
+            if cue_candidate is not None and cue_distance <= max_distance_seconds and cue_distance <= beat_distance:
+                updated_rows.append(
+                    replace(
+                        row,
+                        cue_points=tuple(cue for cue in row.cue_points if cue != cue_candidate),
+                    )
+                )
+                changed_kind = "loop" if cue_candidate.length_beats is not None else "cue"
+            elif beat_candidate is not None and beat_distance <= max_distance_seconds:
+                updated_rows.append(
+                    replace(
+                        row,
+                        user_beat_seconds=tuple(value for value in row.user_beat_seconds if value != beat_candidate),
+                    )
+                )
+                changed_kind = "beat"
+            else:
+                updated_rows.append(row)
+
+        self.rows = updated_rows
+        if changed_kind is not None:
+            self.sync_waveform_rows()
+        return changed_kind
+
     def add_row_cue_point(self, row_id: str, seconds: float, length_beats: float | None = None) -> None:
         seconds = round(max(0.0, seconds), 6)
         if length_beats is not None:
@@ -2219,6 +2286,10 @@ class TempoWindow:
             return (row.path.name.lower(), self.row_part_start(row))
         if self.sort_column == "part":
             return (row.path.name.lower(), self.row_part_number(row))
+        if self.sort_column == "matches":
+            return len(self.matches_for(row.row_uid))
+        if self.sort_column == "markers":
+            return self.row_marker_count(row)
         if self.sort_column == "tempo":
             tempo = self.row_tempo_for_matching(row)
             return tempo if tempo is not None else missing_number
@@ -2244,6 +2315,22 @@ class TempoWindow:
             return list(self.rows)
 
         return sorted(self.rows, key=self.sort_key, reverse=self.sort_descending)
+
+    def row_marker_count(self, row: AnalysisRow) -> int:
+        return len(row.user_beat_seconds) + len(row.cue_points)
+
+    def row_marker_summary(self, row: AnalysisRow) -> str:
+        beats = len(row.user_beat_seconds)
+        cues = sum(1 for cue in row.cue_points if cue.length_beats is None)
+        loops = sum(1 for cue in row.cue_points if cue.length_beats is not None)
+        parts = []
+        if beats:
+            parts.append(f"B{beats}")
+        if cues:
+            parts.append(f"C{cues}")
+        if loops:
+            parts.append(f"L{loops}")
+        return " ".join(parts)
 
     def refresh_table(self) -> None:
         selected_ids = set(self.table.selection())
@@ -2288,6 +2375,8 @@ class TempoWindow:
         return (
             self.row_display_name(row),
             str(self.row_part_number(row)),
+            str(len(self.matches_for(row.row_uid))) if row.row_uid is not None else "",
+            self.row_marker_summary(row),
             tempo_text,
             uncertainty_text,
             chroma_similarity_text,
@@ -2607,10 +2696,10 @@ class TempoWindow:
             zoom_canvas.pack(side="right", padx=(8, 0))
             slot.zoom_canvas = zoom_canvas
             zoom_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_zoomed_waveform(slot))
-            zoom_canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_zoomed_waveform(slot, event.x))
+            zoom_canvas.bind("<Button-1>", lambda event, slot=slot: self.begin_zoom_drag(slot, event.x))
             zoom_canvas.bind("<B1-Motion>", lambda event, slot=slot: self.drag_zoomed_waveform(slot, event.x))
             zoom_canvas.bind("<ButtonRelease-1>", lambda event, slot=slot: self.end_zoom_drag(slot))
-            zoom_canvas.bind("<Button-3>", lambda event, slot=slot: self.remove_user_beat_at_zoom_position(slot, event.x))
+            zoom_canvas.bind("<Button-3>", lambda event, slot=slot: self.remove_timeline_marker_at_zoom_position(slot, event.x))
             zoom_canvas.bind("<MouseWheel>", lambda event, slot=slot: self.zoom_waveform_view(slot, event.delta))
             zoom_canvas.bind("<Button-4>", lambda event, slot=slot: self.zoom_waveform_view(slot, 120))
             zoom_canvas.bind("<Button-5>", lambda event, slot=slot: self.zoom_waveform_view(slot, -120))
@@ -2935,6 +3024,10 @@ class TempoWindow:
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
 
+    def begin_zoom_drag(self, slot: WaveformSlot, x: int) -> str:
+        slot.zoom_drag_last_x = x
+        return "break"
+
     def drag_zoomed_waveform(self, slot: WaveformSlot, x: int) -> None:
         if slot.zoom_canvas is None or slot.duration <= 0:
             return
@@ -3009,6 +3102,9 @@ class TempoWindow:
         )
 
     def remove_user_beat_at_zoom_position(self, slot: WaveformSlot, x: int) -> str:
+        return self.remove_timeline_marker_at_zoom_position(slot, x)
+
+    def remove_timeline_marker_at_zoom_position(self, slot: WaveformSlot, x: int) -> str:
         if slot.zoom_canvas is None or slot.duration <= 0:
             return "break"
 
@@ -3017,8 +3113,16 @@ class TempoWindow:
         window_duration = max(1e-6, end_seconds - start_seconds)
         seconds = start_seconds + (max(0.0, min(1.0, x / width)) * window_duration)
         max_distance_seconds = max(window_duration / width * 8, 0.025)
-        if self.remove_nearest_row_user_beat(slot.row_id, seconds, max_distance_seconds):
+        removed_kind = self.remove_nearest_row_timeline_marker(
+            slot.row_id,
+            seconds,
+            max_distance_seconds,
+            self.slot_beat_seconds(slot),
+        )
+        if removed_kind is not None:
+            self.refresh_table()
             self.draw_zoomed_waveform(slot)
+            self.result.configure(text=f"Removed {removed_kind} marker")
         return "break"
 
     def fit_slot_bpm_from_user_beats(self, slot: WaveformSlot) -> None:

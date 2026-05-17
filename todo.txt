@@ -2,40 +2,41 @@
 to review :
 
 next tasks :
+- generate chromagrams for multi-selection (choose a folder, then use audoi file names with png extension)
+- auto beat detection is often places slightly too late compared to the actual transient, is there a reason for this?
+
+then :
+- integrate features from the old tool into the new one (list them)
+- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
+- really zoomed in waveform is still not at a good resolution, if this is a problem just adding small tokens for transients would help placing beats correctly
+- "search" field (filters results that contain text in any field or in specified filed (dropdown selection of all/what field))
+- use original tempo should be a per-track option
+- make the interface more compact
+- have a "base/bpm sim" column in addition to the "chroma/bpm sim" and/or a combined one (close base filter, then chroma)
+- interface to manually define matches (how?)
+
+tap tempo :
+- tap tempo should have less inertia on the first taps (after reset) then inertia should build over the taps
+- handle case where tempo is tapped over a modified (because of pitch change) tempo
 
 tasks for later :
-- integrate features from the old tool into the new one
 - automix
 - export as traktor/mixxx file
-- add a "number of matches" (smaller name) column
 - inverse associate with eq profile
 - mixing tools (eg DJ-style filter)
 - limit tempo differences when searching for similar tracks or weight it
 - some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)
 - playback is better now, still has some occasional glitch when another track starts while some already play
 - detect when bars and audio get out of sync and resync them over the course of the track
-- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
 - handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
-- really zoomed in waveform is still not at a good resolution, if this is a problem just adding small tokens for transients would help placing beats correctly
-- auto beat detection is often places slightly too late compared to the actual transient
 - analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
-- "search" field (filters results that contain text in any field or in specified filed (dropdown selection of all/what field))
-- revise the "drang and drop" behavior on the zoomed waveform (it should be dragged but not changed right when clicked)
-- tap tempo should have less inertia on the first taps (after reset) then inertia should build over the taps
 - find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
 - detect cue points for structure parts and loops
 - handle variations in tempo and chroma (throughout a track)
-- use original tempo should be a per-track option
-- generate chromagrams for multi-selection (choose a folder, then use audoi file names with png extension)
 - there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
-- option to remove a cue or loop (proably by right clicking like with manual beats)
 - actually loop loops if some per-track loop checkbox enabled
-- make the interface more compact
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
-- have a "base/bpm sim" column in addition to the "chroma/bpm sim"
-- interface to manually define matches
 - option to relink track with file
 - option to keep absolute and/or relative url of files
 - export Graphviz graphs
-- handle case where tempo is tapped over a modified (because of pitch change) tempo
-
+- manually track and reencode files not parsed correctly

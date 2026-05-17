@@ -3,27 +3,35 @@ to review :
 
 todo soon :
 
-investigate and document how to do this first :
-  - allow to manually place two or more beats to help with tempo detection or resync track over time
-  - handle variations in tempo and chroma (throughout a track)
-  - handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
-  - detect/redefine cues for structure parts and loops
-  
 todo at some point :
+- allow non-integer numbers as beat step (eg going down from 1 would do 1/2, 1/4, 1/8 etc) still allowing to manually type any value
+- allow manually adding cue points for structure parts and loops (a loop is a cue point + a length expressed in beats)
+- csv is still acceptable as the portable analysis table for now, but dynamic/structured data is likely to need JSON fields, a sidecar JSON, or SQLite later
 
 need the other tool inspection first :
 - integrate track infos from the former tool
 - add the "match/supermatch" marking logic
 - export Graphviz graphs
 - separate the concept of "base" and chroma, allow for defining/detecting both of them (eg clicking on a peak in the chromagram to define "base", correcting fuzzy click to actual highest peak, showing a tiny red dot over it)
+- use the old xml and tractor tracks as a guide
 
 even later :
+- automix
 - export as traktor/mixxx file
 - inverse match with eq profile
-- mixing tools (eg filters)
-- automix
+- mixing tools (eg DJ-style filter)
 - limit tempo differences when searching for similar tracks or weight it
 - some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)
 - playback is better now, still has some occasional glitch when another track starts while some already play
 - detect when bars and audio get out of sync and resync them over the course of the track
 - sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
+- handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
+- really zoomed in waveform is still not at a good resolution, if this is a problem just adding small tokens for transients would help placing beats correctly
+- auto beat detection is often places slightly too late compared to the actual transient
+- analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
+- "search" field (filters results that contain text in any field or in specified filed (dropdown selection of all/what field))
+- revise the "drang and drop" behavior on the zoomed waveform (it should be dragged but not changed right when clicked)
+- tap tempo should have less inertia on the first taps (after reset) then inertia should build over the taps
+- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
+- detect cue points for structure parts and loops
+- handle variations in tempo and chroma (throughout a track)

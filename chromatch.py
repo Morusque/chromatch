@@ -110,6 +110,16 @@ class AnalysisRow:
     beat_anchor_source: str = ""
     base_chroma_bin: int | None = None
     user_beat_seconds: tuple[float, ...] = ()
+    part_start_seconds: float | None = None
+    part_end_seconds: float | None = None
+
+
+@dataclass(frozen=True)
+class AnalysisTask:
+    path: Path
+    row_id: str | None = None
+    part_start_seconds: float | None = None
+    part_end_seconds: float | None = None
 
 
 @dataclass
@@ -141,6 +151,9 @@ class WaveformSlot:
     sample_rate: int = 0
     duration: float = 0.0
     position_samples: float = 0.0
+    stinger_remaining_samples: float | None = None
+    stinger_restore_position_samples: float | None = None
+    stinger_restore_playhead: float | None = None
     waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     zoom_waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
 
@@ -148,7 +161,7 @@ class WaveformSlot:
 def fold_bpm(bpm: float) -> float:
     while bpm < 80:
         bpm *= 2
-    while bpm > 180:
+    while bpm > 260:
         bpm /= 2
     return bpm
 
@@ -172,6 +185,38 @@ def refine_tempo_from_beats(beats: np.ndarray) -> float | None:
         return None
 
     return fold_bpm(60.0 / float(interval_seconds))
+
+
+def fit_tempo_grid_from_user_beats(
+    beat_seconds: tuple[float, ...],
+    current_bpm: float,
+) -> tuple[float, float] | None:
+    if len(beat_seconds) < 2 or current_bpm <= 0:
+        return None
+
+    beats = np.array(sorted(beat_seconds), dtype=float)
+    if not np.all(np.isfinite(beats)):
+        return None
+
+    current_interval = 60.0 / current_bpm
+    if current_interval <= 0:
+        return None
+
+    beat_indexes = np.rint((beats - beats[0]) / current_interval).astype(float)
+    if np.unique(beat_indexes).size < 2:
+        return None
+
+    try:
+        interval_seconds, anchor_seconds = np.polyfit(beat_indexes, beats, 1)
+    except Exception:
+        return None
+
+    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
+        return None
+    if not np.isfinite(anchor_seconds):
+        return None
+
+    return fold_bpm(60.0 / float(interval_seconds)), float(anchor_seconds)
 
 
 def parse_optional_float(value: str | None) -> float | None:
@@ -227,8 +272,17 @@ def decode_float_tuple(value: str | None) -> tuple[float, ...]:
     return tuple(sorted(set(values)))
 
 
+def format_seconds_compact(seconds: float) -> str:
+    return f"{seconds:.3f}".rstrip("0").rstrip(".")
+
+
 def analysis_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def strip_nul_bytes(lines):
+    for line in lines:
+        yield line.replace("\x00", "")
 
 
 def encode_array(values: np.ndarray) -> str:
@@ -385,9 +439,50 @@ def read_audio_tags(path: Path) -> tuple[str, str, str]:
     )
 
 
-def load_audio_mono(path: Path, target_sample_rate: int = 22_050) -> tuple[np.ndarray, int]:
+def slice_audio_segment(
+    mono: np.ndarray,
+    sample_rate: int,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> np.ndarray:
+    start_sample = 0 if start_seconds is None else max(0, int(round(start_seconds * sample_rate)))
+    end_sample = mono.size if end_seconds is None else max(start_sample, int(round(end_seconds * sample_rate)))
+    return mono[start_sample:min(end_sample, mono.size)]
+
+
+def segment_duration(start_seconds: float | None, end_seconds: float | None) -> float | None:
+    if start_seconds is None or end_seconds is None:
+        return None
+    duration = max(0.0, end_seconds - start_seconds)
+    return duration if duration > 0 else None
+
+
+def librosa_load_segment(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> tuple[np.ndarray, int]:
+    if librosa is None:
+        raise RuntimeError("librosa is not installed.")
+
+    offset = 0.0 if start_seconds is None else max(0.0, start_seconds)
+    duration = segment_duration(start_seconds, end_seconds)
+    try:
+        return librosa.load(path, sr=22_050, mono=True, offset=offset, duration=duration)
+    except TypeError:
+        audio, sample_rate = librosa.load(path, sr=22_050, mono=True)
+        return slice_audio_segment(np.asarray(audio), sample_rate, start_seconds, end_seconds), sample_rate
+
+
+def load_audio_mono(
+    path: Path,
+    target_sample_rate: int = 22_050,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> tuple[np.ndarray, int]:
     audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
     mono = audio.mean(axis=1)
+    mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
 
     if sample_rate != target_sample_rate:
         divisor = math.gcd(sample_rate, target_sample_rate)
@@ -412,9 +507,12 @@ def analyze_chroma_histogram(
     max_freq: int = CHROMA_MAX_FREQ,
     attenuation_exponent: float = CHROMA_ATTENUATION_EXPONENT,
     smoothing: float = CHROMA_SMOOTHING,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
 ) -> np.ndarray:
     audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
     mono = audio.mean(axis=1)
+    mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
 
     if mono.size < fft_size:
         raise ValueError("The file is too short to estimate chroma.")
@@ -594,8 +692,12 @@ def strongest_chroma_peaks(histogram: np.ndarray, count: int = 3, min_strength: 
     return peaks
 
 
-def estimate_chroma(path: Path) -> ChromaEstimate:
-    histogram = analyze_chroma_histogram(path)
+def estimate_chroma(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> ChromaEstimate:
+    histogram = analyze_chroma_histogram(path, start_seconds=start_seconds, end_seconds=end_seconds)
     if np.max(histogram) > 0:
         histogram = histogram / np.max(histogram)
 
@@ -718,11 +820,17 @@ def zoom_waveform_width(duration: float, pixels_per_second: int = 180, max_width
     return max(900, min(max_width, int(math.ceil(duration * pixels_per_second))))
 
 
-def detect_beat_anchor_seconds(path: Path, bpm: float | None = None) -> float | None:
+def detect_beat_anchor_seconds(
+    path: Path,
+    bpm: float | None = None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
     if librosa is None:
         return None
 
-    audio, sample_rate = librosa.load(path, sr=22_050, mono=True)
+    offset = 0.0 if start_seconds is None else max(0.0, start_seconds)
+    audio, sample_rate = librosa_load_segment(path, start_seconds, end_seconds)
     if audio.size < sample_rate // 4:
         return None
 
@@ -736,14 +844,18 @@ def detect_beat_anchor_seconds(path: Path, bpm: float | None = None) -> float | 
     if beats.size == 0:
         return None
 
-    return float(beats[0])
+    return offset + float(beats[0])
 
 
-def estimate_tempo_with_librosa(path: Path) -> TempoEstimate:
+def estimate_tempo_with_librosa(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate:
     if librosa is None:
         raise RuntimeError("librosa is not installed.")
 
-    audio, sample_rate = librosa.load(path, sr=22_050, mono=True)
+    audio, sample_rate = librosa_load_segment(path, start_seconds, end_seconds)
     if audio.size < sample_rate:
         raise ValueError("The file is too short to estimate a tempo.")
 
@@ -778,8 +890,12 @@ def estimate_tempo_with_librosa(path: Path) -> TempoEstimate:
     )
 
 
-def estimate_tempo_with_autocorrelation(path: Path) -> TempoEstimate:
-    audio, sample_rate = load_audio_mono(path)
+def estimate_tempo_with_autocorrelation(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate:
+    audio, sample_rate = load_audio_mono(path, start_seconds=start_seconds, end_seconds=end_seconds)
     if audio.size < sample_rate:
         raise ValueError("The file is too short to estimate a tempo.")
 
@@ -843,14 +959,18 @@ def estimate_tempo_with_autocorrelation(path: Path) -> TempoEstimate:
     )
 
 
-def estimate_tempo(path: Path) -> TempoEstimate:
+def estimate_tempo(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate:
     try:
-        primary = estimate_tempo_with_librosa(path)
+        primary = estimate_tempo_with_librosa(path, start_seconds=start_seconds, end_seconds=end_seconds)
     except Exception:
-        return estimate_tempo_with_autocorrelation(path)
+        return estimate_tempo_with_autocorrelation(path, start_seconds=start_seconds, end_seconds=end_seconds)
 
     try:
-        secondary = estimate_tempo_with_autocorrelation(path)
+        secondary = estimate_tempo_with_autocorrelation(path, start_seconds=start_seconds, end_seconds=end_seconds)
     except Exception:
         return primary
 
@@ -907,21 +1027,26 @@ class TempoWindow:
         self.rows: list[AnalysisRow] = []
         self.current_csv_path: Path | None = None
         self.is_analyzing = False
-        self.analysis_queue: list[Path] = []
-        self.analysis_paths: set[Path] = set()
+        self.analysis_queue: list[AnalysisTask] = []
+        self.analysis_paths: set[str] = set()
         self.result_queue: queue.Queue = queue.Queue()
         self.queue_lock = threading.Lock()
         self.sort_column: str | None = None
         self.sort_descending = False
         self.similarity_target_ids: set[str] = set()
         self.table_headings: dict[str, str] = {}
+        self.row_part_numbers: dict[str, int] = {}
         self.tap_times: list[float] = []
         self.current_tapped_bpm: float | None = None
         self.ctrl_pressed = False
         self.tapped_tempo_var = tk.StringVar(value="")
+        self.part_start_marker_var = tk.StringVar(value="")
+        self.part_end_marker_var = tk.StringVar(value="")
+        self.suppress_part_marker_update = False
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
+        self.beat_jump_var = tk.IntVar(value=4)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.metronome_enabled_var = tk.BooleanVar(value=False)
@@ -998,6 +1123,14 @@ class TempoWindow:
         )
         self.similarity_button.pack(side="left", padx=(8, 0))
 
+        self.split_button = ttk.Button(
+            actions,
+            text="Split",
+            command=self.split_selected_at_playhead,
+            state="disabled",
+        )
+        self.split_button.pack(side="left", padx=(8, 0))
+
         self.export_button = ttk.Button(
             actions,
             text="Export CSV",
@@ -1054,6 +1187,18 @@ class TempoWindow:
         self.tap_entry = ttk.Entry(tap_frame, textvariable=self.tapped_tempo_var, width=10)
         self.tap_entry.pack(side="left", padx=(6, 0))
         ttk.Label(tap_frame, text="BPM").pack(side="left", padx=(4, 0))
+        ttk.Label(tap_frame, text="Part start").pack(side="left", padx=(14, 0))
+        self.part_start_marker_entry = ttk.Entry(tap_frame, textvariable=self.part_start_marker_var, width=8)
+        self.part_start_marker_entry.pack(side="left", padx=(6, 0))
+        self.part_start_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
+        self.part_start_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
+        ttk.Button(tap_frame, text="Set start", command=self.set_selected_part_start).pack(side="left", padx=(8, 0))
+        ttk.Label(tap_frame, text="Part end").pack(side="left", padx=(14, 0))
+        self.part_end_marker_entry = ttk.Entry(tap_frame, textvariable=self.part_end_marker_var, width=8)
+        self.part_end_marker_entry.pack(side="left", padx=(6, 0))
+        self.part_end_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
+        self.part_end_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
+        ttk.Button(tap_frame, text="Set end", command=self.set_selected_part_end).pack(side="left", padx=(8, 0))
 
         self.table.drop_target_register(DND_FILES)
         self.table.dnd_bind("<<Drop>>", self.handle_drop)
@@ -1075,7 +1220,7 @@ class TempoWindow:
         self.target_tempo_slider = ttk.Scale(
             controls,
             from_=60,
-            to=200,
+            to=260,
             orient="horizontal",
             length=180,
             variable=self.target_tempo_slider_var,
@@ -1109,6 +1254,14 @@ class TempoWindow:
         ).pack(side="left", padx=(8, 0))
         self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
         self.play_all_button.pack(side="left", padx=(16, 0))
+        ttk.Label(controls, text="Beat step").pack(side="left", padx=(12, 4))
+        self.beat_jump_spinbox = ttk.Spinbox(
+            controls,
+            values=(1, 2, 4, 8, 16, 32, 64),
+            width=12,
+            textvariable=self.beat_jump_var,
+        )
+        self.beat_jump_spinbox.pack(side="left")
 
         self.waveform_container = ttk.Frame(panel)
         self.waveform_container.pack(fill="x", pady=(8, 0))
@@ -1133,10 +1286,11 @@ class TempoWindow:
         self.play_table.column("play", width=55, anchor="center", stretch=False)
         self.play_table.grid(row=0, column=0, sticky="ns")
         self.play_table.bind("<ButtonRelease-1>", self.handle_play_click)
-        self.play_table.bind("<Button-3>", self.handle_target_right_click)
+        self.play_table.bind("<Button-3>", self.handle_play_stinger_click)
 
         columns = (
             "filename",
+            "part",
             "tempo",
             "uncertainty",
             "chroma_similarity",
@@ -1149,6 +1303,7 @@ class TempoWindow:
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
         headings = {
             "filename": "Filename",
+            "part": "Part",
             "tempo": "Tempo",
             "uncertainty": "Uncertainty",
             "chroma_similarity": "Chroma sim",
@@ -1167,6 +1322,7 @@ class TempoWindow:
             )
 
         self.table.column("filename", width=260, anchor="w")
+        self.table.column("part", width=55, anchor="center", stretch=False)
         self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
         self.table.column("chroma_similarity", width=90, anchor="center")
@@ -1229,7 +1385,7 @@ class TempoWindow:
         rows: list[AnalysisRow] = []
         try:
             with open(csv_path, newline="", encoding="utf-8") as csv_file:
-                reader = csv.DictReader(csv_file)
+                reader = csv.DictReader(strip_nul_bytes(csv_file))
                 for record in reader:
                     rows.append(self.row_from_csv_record(record, csv_path.parent))
         except Exception as exc:
@@ -1252,7 +1408,12 @@ class TempoWindow:
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
 
-    def row_from_csv_record(self, record: dict[str, str], csv_folder: Path) -> AnalysisRow:
+    def row_from_csv_record(
+        self,
+        record: dict[str, str],
+        csv_folder: Path,
+        refresh_missing_tags: bool = False,
+    ) -> AnalysisRow:
         filepath = record.get("filepath") or record.get("path") or record.get("filename") or "unknown"
         path = Path(filepath)
         if not path.is_absolute():
@@ -1281,7 +1442,7 @@ class TempoWindow:
         artist = record.get("artist", "")
         title = record.get("title", "")
         album = record.get("album", "")
-        if path.exists() and not (artist and title and album):
+        if refresh_missing_tags and path.exists() and not (artist and title and album):
             file_artist, file_title, file_album = read_audio_tags(path)
             artist = artist or file_artist
             title = title or file_title
@@ -1307,6 +1468,8 @@ class TempoWindow:
             beat_anchor_source=record.get("beat_anchor_source", ""),
             base_chroma_bin=parse_optional_int(record.get("base_chroma_bin")),
             user_beat_seconds=decode_float_tuple(record.get("user_beat_seconds")),
+            part_start_seconds=parse_optional_float(record.get("part_start_seconds")),
+            part_end_seconds=parse_optional_float(record.get("part_end_seconds")),
         )
 
     def handle_drop(self, event) -> None:
@@ -1337,10 +1500,10 @@ class TempoWindow:
         self.similarity_target_ids.difference_update(selected_ids)
 
         with self.queue_lock:
-            self.analysis_queue = [path for path in self.analysis_queue if str(path.resolve()) not in selected_ids]
-            self.analysis_paths = {
-                path for path in self.analysis_paths if str(path) not in selected_ids
-            }
+            self.analysis_queue = [
+                task for task in self.analysis_queue if self.analysis_task_id(task) not in selected_ids
+            ]
+            self.analysis_paths = {task_id for task_id in self.analysis_paths if task_id not in selected_ids}
 
         self.update_similarity_scores()
         self.refresh_table()
@@ -1357,14 +1520,18 @@ class TempoWindow:
             messagebox.showerror("Chromatch", "No supported audio files were found.")
             return
 
-        known_paths = {Path(row.path).resolve() for row in self.rows}
+        known_ids = {str(Path(row.path).resolve()) for row in self.rows}
         with self.queue_lock:
-            known_paths.update(self.analysis_paths)
-            new_files = [path for path in audio_files if path.resolve() not in known_paths]
-            self.analysis_queue.extend(new_files)
-            self.analysis_paths.update(path.resolve() for path in new_files)
+            known_ids.update(self.analysis_paths)
+            new_tasks = [
+                self.analysis_task_from_path(path)
+                for path in audio_files
+                if str(path.resolve()) not in known_ids
+            ]
+            self.analysis_queue.extend(new_tasks)
+            self.analysis_paths.update(self.analysis_task_id(task) for task in new_tasks)
 
-        if not new_files:
+        if not new_tasks:
             self.result.configure(text="No new files to add")
             return
 
@@ -1372,7 +1539,7 @@ class TempoWindow:
         self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
         queued = len(self.analysis_queue)
-        self.result.configure(text=f"Queued {len(new_files)} new files ({queued} waiting)")
+        self.result.configure(text=f"Queued {len(new_tasks)} new files ({queued} waiting)")
 
         if not self.is_analyzing:
             self.is_analyzing = True
@@ -1386,29 +1553,29 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "Select one or more rows first.")
             return
 
-        selected_paths = []
+        selected_tasks = []
         for row in self.rows:
             if self.row_id(row) in selected_ids:
-                selected_paths.append(row.path)
+                selected_tasks.append(self.analysis_task_from_row(row))
 
-        if not selected_paths:
+        if not selected_tasks:
             messagebox.showinfo("Chromatch", "No selected rows were found.")
             return
 
         with self.queue_lock:
-            queued_ids = {str(path) for path in self.analysis_paths}
-            new_paths = [path for path in selected_paths if str(path.resolve()) not in queued_ids]
-            self.analysis_queue.extend(new_paths)
-            self.analysis_paths.update(path.resolve() for path in new_paths)
+            queued_ids = set(self.analysis_paths)
+            new_tasks = [task for task in selected_tasks if self.analysis_task_id(task) not in queued_ids]
+            self.analysis_queue.extend(new_tasks)
+            self.analysis_paths.update(self.analysis_task_id(task) for task in new_tasks)
 
-        if not new_paths:
+        if not new_tasks:
             self.result.configure(text="Selected rows are already queued")
             return
 
         self.export_button.configure(state="disabled")
         self.update_csv_button.configure(state="disabled")
         self.pairs_button.configure(state="disabled")
-        self.result.configure(text=f"Queued {len(new_paths)} selected tracks for re-analysis")
+        self.result.configure(text=f"Queued {len(new_tasks)} selected tracks for re-analysis")
 
         if not self.is_analyzing:
             self.is_analyzing = True
@@ -1507,7 +1674,84 @@ class TempoWindow:
         return None
 
     def row_id(self, row: AnalysisRow) -> str:
-        return str(row.path.resolve())
+        row_id = str(row.path.resolve())
+        if row.part_start_seconds is not None or row.part_end_seconds is not None:
+            start = 0.0 if row.part_start_seconds is None else row.part_start_seconds
+            end = -1.0 if row.part_end_seconds is None else row.part_end_seconds
+            row_id = f"{row_id}#part={start:.6f}-{end:.6f}"
+        return row_id
+
+    def analysis_task_from_path(self, path: Path) -> AnalysisTask:
+        return AnalysisTask(path=path)
+
+    def analysis_task_from_row(self, row: AnalysisRow) -> AnalysisTask:
+        return AnalysisTask(
+            path=row.path,
+            row_id=self.row_id(row),
+            part_start_seconds=row.part_start_seconds,
+            part_end_seconds=row.part_end_seconds,
+        )
+
+    def analysis_task_id(self, task: AnalysisTask) -> str:
+        if task.row_id:
+            return task.row_id
+        row_id = str(task.path.resolve())
+        if task.part_start_seconds is not None or task.part_end_seconds is not None:
+            start = 0.0 if task.part_start_seconds is None else task.part_start_seconds
+            end = -1.0 if task.part_end_seconds is None else task.part_end_seconds
+            row_id = f"{row_id}#part={start:.6f}-{end:.6f}"
+        return row_id
+
+    def row_part_start(self, row: AnalysisRow) -> float:
+        return 0.0 if row.part_start_seconds is None else row.part_start_seconds
+
+    def row_part_end(self, row: AnalysisRow, duration: float | None = None) -> float | None:
+        if row.part_end_seconds is not None:
+            return row.part_end_seconds
+        return duration
+
+    def is_part_row(self, row: AnalysisRow) -> bool:
+        return row.part_start_seconds is not None or row.part_end_seconds is not None
+
+    def row_display_name(self, row: AnalysisRow) -> str:
+        return row.path.name
+
+    def row_part_number(self, row: AnalysisRow) -> int:
+        row_id = self.row_id(row)
+        cached = self.row_part_numbers.get(row_id)
+        if cached is not None:
+            return cached
+
+        siblings = [
+            candidate
+            for candidate in self.rows
+            if candidate.path.resolve() == row.path.resolve()
+        ]
+        if not siblings:
+            return 1
+
+        siblings.sort(key=lambda candidate: (self.row_part_start(candidate), self.row_part_end(candidate, float("inf")) or float("inf")))
+        for index, candidate in enumerate(siblings, start=1):
+            if self.row_id(candidate) == row_id:
+                return index
+        return 1
+
+    def update_row_part_numbers(self) -> None:
+        groups: dict[Path, list[AnalysisRow]] = {}
+        for row in self.rows:
+            groups.setdefault(row.path.resolve(), []).append(row)
+
+        part_numbers: dict[str, int] = {}
+        for siblings in groups.values():
+            siblings.sort(
+                key=lambda candidate: (
+                    self.row_part_start(candidate),
+                    self.row_part_end(candidate, float("inf")) or float("inf"),
+                )
+            )
+            for index, row in enumerate(siblings, start=1):
+                part_numbers[self.row_id(row)] = index
+        self.row_part_numbers = part_numbers
 
     def sync_waveform_rows(self) -> None:
         rows_by_id = {self.row_id(row): row for row in self.rows}
@@ -1630,7 +1874,7 @@ class TempoWindow:
         tempo = self.target_tempo()
         if tempo is not None:
             self.suppress_target_slider_callback = True
-            self.target_tempo_slider_var.set(max(60.0, min(200.0, tempo)))
+            self.target_tempo_slider_var.set(max(60.0, min(260.0, tempo)))
             self.suppress_target_slider_callback = False
         with self.mixer_lock:
             self.playback_target_tempo = tempo
@@ -1725,7 +1969,9 @@ class TempoWindow:
         missing_number = float("-inf") if self.sort_descending else float("inf")
 
         if self.sort_column == "filename":
-            return row.path.name.lower()
+            return (row.path.name.lower(), self.row_part_start(row))
+        if self.sort_column == "part":
+            return (row.path.name.lower(), self.row_part_number(row))
         if self.sort_column == "tempo":
             tempo = self.row_tempo_for_matching(row)
             return tempo if tempo is not None else missing_number
@@ -1755,6 +2001,7 @@ class TempoWindow:
     def refresh_table(self) -> None:
         selected_ids = set(self.table.selection())
         self.clear_tables()
+        self.update_row_part_numbers()
 
         for row in self.sorted_rows():
             row_id = self.row_id(row)
@@ -1792,7 +2039,8 @@ class TempoWindow:
             uncertainty_text = f"failed: {row.error}"
 
         return (
-            row.path.name,
+            self.row_display_name(row),
+            str(self.row_part_number(row)),
             tempo_text,
             uncertainty_text,
             chroma_similarity_text,
@@ -1816,12 +2064,37 @@ class TempoWindow:
         if column == "#1":
             self.play_file(row)
 
+    def handle_play_stinger_click(self, event) -> str:
+        row_id = event.widget.identify_row(event.y)
+        column = event.widget.identify_column(event.x)
+        if not row_id or column != "#1":
+            return "break"
+
+        slot = self.slot_by_row_id(row_id)
+        if slot is None:
+            row = self.row_by_id(row_id)
+            if row is not None:
+                self.add_waveform(row)
+                slot = self.slot_by_row_id(row_id)
+
+        if slot is not None:
+            self.start_waveform_stinger(slot)
+        return "break"
+
+    def slot_by_row_id(self, row_id: str) -> WaveformSlot | None:
+        for slot in self.waveform_slots:
+            if slot.row_id == row_id:
+                return slot
+        return None
+
     def handle_table_selection(self, _event=None) -> None:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
+        self.split_button.configure(state="normal" if self.table.selection() else "disabled")
         self.chromagram_button.configure(state="normal" if self.table.selection() else "disabled")
         self.update_selected_detected_tempo()
         self.update_waveform_selection()
+        self.update_selected_edit_fields()
 
     def play_file(self, row: AnalysisRow) -> None:
         try:
@@ -1844,7 +2117,12 @@ class TempoWindow:
         downbeat_seconds = row.beat_anchor_seconds
         if downbeat_seconds is None:
             try:
-                downbeat_seconds = detect_beat_anchor_seconds(row.path, self.row_tempo_for_matching(row))
+                downbeat_seconds = detect_beat_anchor_seconds(
+                    row.path,
+                    self.row_tempo_for_matching(row),
+                    start_seconds=row.part_start_seconds,
+                    end_seconds=row.part_end_seconds,
+                )
             except Exception:
                 downbeat_seconds = None
             if downbeat_seconds is not None:
@@ -1900,6 +2178,31 @@ class TempoWindow:
 
         self.detected_selected_tempo_var.set(f"Selected detected: {row.bpm:.1f} BPM")
 
+    def update_selected_edit_fields(self) -> None:
+        selected_ids = list(self.table.selection())
+        if len(selected_ids) != 1:
+            self.tapped_tempo_var.set("")
+            self.part_start_marker_var.set("")
+            self.part_end_marker_var.set("")
+            return
+
+        row = self.row_by_id(selected_ids[0])
+        if row is None:
+            self.tapped_tempo_var.set("")
+            self.part_start_marker_var.set("")
+            self.part_end_marker_var.set("")
+            return
+
+        self.suppress_part_marker_update = True
+        try:
+            self.tapped_tempo_var.set("" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}")
+            self.part_start_marker_var.set(format_seconds_compact(self.row_part_start(row)))
+            slot = self.slot_by_row_id(selected_ids[0])
+            end = self.row_part_end(row, None if slot is None else slot.duration)
+            self.part_end_marker_var.set("" if end is None else format_seconds_compact(end))
+        finally:
+            self.suppress_part_marker_update = False
+
     def update_target_tempo_from_waveforms(self) -> None:
         if not self.auto_target_tempo_var.get():
             return
@@ -1924,6 +2227,18 @@ class TempoWindow:
             self.draw_waveform(slot)
             self.draw_zoomed_waveform(slot)
             self.draw_chroma_histogram(slot)
+
+    def canvas_event_width(self, canvas: tk.Canvas) -> int:
+        width = canvas.winfo_width()
+        if width <= 1:
+            width = canvas.winfo_reqwidth()
+        return max(1, width)
+
+    def canvas_event_height(self, canvas: tk.Canvas) -> int:
+        height = canvas.winfo_height()
+        if height <= 1:
+            height = canvas.winfo_reqheight()
+        return max(1, height)
 
     def render_waveforms(self) -> None:
         for child in self.waveform_container.winfo_children():
@@ -1953,6 +2268,7 @@ class TempoWindow:
                 command=lambda slot=slot: self.toggle_waveform_playback(slot),
             )
             slot.button.pack(side="left")
+            slot.button.bind("<Button-3>", lambda event, slot=slot: self.start_waveform_stinger_from_event(slot))
             ttk.Button(controls, text="< Beat", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, -1)).pack(side="left", padx=(4, 0))
             ttk.Button(controls, text="Beat >", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, 1)).pack(side="left", padx=(4, 0))
             slot.tempo_multiplier_var = tk.DoubleVar(value=slot.tempo_multiplier)
@@ -2007,6 +2323,12 @@ class TempoWindow:
                 width=6,
                 command=lambda slot=slot: self.set_slot_downbeat(slot),
             ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                controls,
+                text="Fit BPM",
+                width=7,
+                command=lambda slot=slot: self.fit_slot_bpm_from_user_beats(slot),
+            ).pack(side="left", padx=(4, 0))
 
             chroma_canvas = tk.Canvas(
                 frame,
@@ -2048,8 +2370,8 @@ class TempoWindow:
             return
 
         canvas = slot.canvas
-        width = max(1, canvas.winfo_width())
-        height = max(1, canvas.winfo_height())
+        width = self.canvas_event_width(canvas)
+        height = self.canvas_event_height(canvas)
         mid = height // 2
         canvas.delete("all")
 
@@ -2062,6 +2384,18 @@ class TempoWindow:
         for x, value in enumerate(shown):
             y = int(value * (height * 0.45))
             canvas.create_line(x, mid - y, x, mid + y, fill="#44606d")
+
+        if self.is_part_row(slot.row) and slot.duration > 0:
+            start = self.row_part_start(slot.row)
+            end = self.row_part_end(slot.row, slot.duration)
+            x0 = int(max(0.0, min(1.0, start / slot.duration)) * width)
+            x1 = width if end is None else int(max(0.0, min(1.0, end / slot.duration)) * width)
+            if x0 > 0:
+                canvas.create_rectangle(0, 0, x0, height, outline="", fill="#d8d5d0", stipple="gray50")
+            if x1 < width:
+                canvas.create_rectangle(x1, 0, width, height, outline="", fill="#d8d5d0", stipple="gray50")
+            canvas.create_line(x0, 0, x0, height, fill="#777777")
+            canvas.create_line(x1, 0, x1, height, fill="#777777")
 
         playhead_x = int(slot.playhead * width)
         canvas.create_line(playhead_x, 0, playhead_x, height, fill="#b57900", width=2)
@@ -2111,13 +2445,44 @@ class TempoWindow:
     def slot_beat_anchor_seconds(self, slot: WaveformSlot) -> float:
         return slot.downbeat_seconds if slot.downbeat_seconds is not None else 0.0
 
+    def slot_resync_anchor_seconds(self, slot: WaveformSlot, seconds: float) -> float:
+        anchors = [beat for beat in slot.row.user_beat_seconds if beat <= seconds]
+        if anchors:
+            return max(anchors)
+        return self.slot_beat_anchor_seconds(slot)
+
+    def resynced_beat_line_times(self, slot: WaveformSlot, start_seconds: float, end_seconds: float) -> list[float]:
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None:
+            return []
+
+        anchors = [self.slot_beat_anchor_seconds(slot)]
+        anchors.extend(beat for beat in slot.row.user_beat_seconds if start_seconds <= beat <= end_seconds)
+        anchors = sorted(set(round(anchor, 6) for anchor in anchors))
+        line_times: set[float] = set()
+
+        for index, anchor in enumerate(anchors):
+            segment_start = start_seconds if index == 0 else max(start_seconds, anchor)
+            segment_end = end_seconds
+            if index + 1 < len(anchors):
+                segment_end = min(segment_end, anchors[index + 1])
+
+            first_beat = math.floor((segment_start - anchor) / beat_seconds)
+            last_beat = math.ceil((segment_end - anchor) / beat_seconds)
+            for beat_index in range(first_beat, last_beat + 1):
+                beat_time = anchor + beat_index * beat_seconds
+                if segment_start <= beat_time <= segment_end:
+                    line_times.add(round(beat_time, 6))
+
+        return sorted(line_times)
+
     def draw_zoomed_waveform(self, slot: WaveformSlot) -> None:
         if slot.zoom_canvas is None:
             return
 
         canvas = slot.zoom_canvas
-        width = max(1, canvas.winfo_width())
-        height = max(1, canvas.winfo_height())
+        width = self.canvas_event_width(canvas)
+        height = self.canvas_event_height(canvas)
         mid = height // 2
         canvas.delete("all")
 
@@ -2141,14 +2506,9 @@ class TempoWindow:
 
         beat_seconds = self.slot_beat_seconds(slot)
         if beat_seconds is not None:
-            anchor = self.slot_beat_anchor_seconds(slot)
-            first_beat = math.floor((start_seconds - anchor) / beat_seconds)
-            last_beat = math.ceil((end_seconds - anchor) / beat_seconds)
-            for beat_index in range(first_beat, last_beat + 1):
-                beat_time = anchor + beat_index * beat_seconds
-                if start_seconds <= beat_time <= end_seconds:
-                    x = int(((beat_time - start_seconds) / window_duration) * width)
-                    canvas.create_line(x, 0, x, height, fill="#d6b869")
+            for beat_time in self.resynced_beat_line_times(slot, start_seconds, end_seconds):
+                x = int(((beat_time - start_seconds) / window_duration) * width)
+                canvas.create_line(x, 0, x, height, fill="#d6b869")
 
         playhead_seconds = slot.playhead * slot.duration
         playhead_x = int(((playhead_seconds - start_seconds) / window_duration) * width)
@@ -2179,7 +2539,7 @@ class TempoWindow:
 
         canvas = slot.chroma_canvas
         width = self.chroma_canvas_content_width(canvas)
-        height = max(1, canvas.winfo_height())
+        height = self.canvas_event_height(canvas)
         canvas.delete("all")
 
         if slot.row.chroma is None:
@@ -2272,7 +2632,7 @@ class TempoWindow:
         if slot.canvas is None:
             return
 
-        width = max(1, slot.canvas.winfo_width())
+        width = self.canvas_event_width(slot.canvas)
         with self.mixer_lock:
             slot.playhead = max(0.0, min(1.0, x / width))
             if slot.audio is not None:
@@ -2288,7 +2648,7 @@ class TempoWindow:
             return
 
         slot.zoom_drag_last_x = x
-        width = max(1, slot.zoom_canvas.winfo_width())
+        width = self.canvas_event_width(slot.zoom_canvas)
         start_seconds, end_seconds = self.zoom_window_seconds(slot)
         seek_seconds = start_seconds + (max(0.0, min(1.0, x / width)) * (end_seconds - start_seconds))
         with self.mixer_lock:
@@ -2309,7 +2669,7 @@ class TempoWindow:
             slot.zoom_drag_last_x = x
             return
 
-        width = max(1, slot.zoom_canvas.winfo_width())
+        width = self.canvas_event_width(slot.zoom_canvas)
         start_seconds, end_seconds = self.zoom_window_seconds(slot)
         seconds_per_pixel = (end_seconds - start_seconds) / width
         delta_seconds = (slot.zoom_drag_last_x - x) * seconds_per_pixel
@@ -2355,7 +2715,7 @@ class TempoWindow:
         if slot.zoom_canvas is None or slot.duration <= 0:
             return "break"
 
-        width = max(1, slot.zoom_canvas.winfo_width())
+        width = self.canvas_event_width(slot.zoom_canvas)
         start_seconds, end_seconds = self.zoom_window_seconds(slot)
         window_duration = max(1e-6, end_seconds - start_seconds)
         seconds = start_seconds + (max(0.0, min(1.0, x / width)) * window_duration)
@@ -2363,6 +2723,217 @@ class TempoWindow:
         if self.remove_nearest_row_user_beat(slot.row_id, seconds, max_distance_seconds):
             self.draw_zoomed_waveform(slot)
         return "break"
+
+    def fit_slot_bpm_from_user_beats(self, slot: WaveformSlot) -> None:
+        current_row = self.row_by_id(slot.row_id) or slot.row
+        current_tempo = self.row_tempo_for_matching(current_row)
+        if current_tempo is None:
+            messagebox.showinfo("Chromatch", "This track needs a tempo before fitting BPM from beats.")
+            return
+
+        user_beats = current_row.user_beat_seconds
+        fit = fit_tempo_grid_from_user_beats(user_beats, current_tempo)
+        if fit is None:
+            messagebox.showinfo("Chromatch", "Place at least two distinct beats first.")
+            return
+
+        fitted_bpm, anchor_seconds = fit
+        updated_rows = []
+        for row in self.rows:
+            if self.row_id(row) == slot.row_id:
+                updated_rows.append(
+                    replace(
+                        row,
+                        tapped_bpm=fitted_bpm,
+                        beat_anchor_seconds=anchor_seconds,
+                        beat_anchor_source="user-fit",
+                    )
+                )
+            else:
+                updated_rows.append(row)
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+        self.update_target_tempo_from_waveforms()
+        self.update_similarity_scores()
+        self.refresh_table()
+        self.draw_all_waveforms()
+        self.result.configure(text=f"Fitted BPM from {len(user_beats)} beats: {fitted_bpm:.2f}")
+
+    def selected_waveform_slot(self) -> WaveformSlot | None:
+        selected_ids = list(self.table.selection())
+        if selected_ids:
+            selected_id = selected_ids[-1]
+            slot = self.slot_by_row_id(selected_id)
+            if slot is not None:
+                return slot
+        if len(self.waveform_slots) == 1:
+            return self.waveform_slots[0]
+        return None
+
+    def current_slot_seconds(self, slot: WaveformSlot) -> float | None:
+        if slot.duration <= 0:
+            return None
+        return max(0.0, min(slot.duration, slot.playhead * slot.duration))
+
+    def update_slot_part_marker(
+        self,
+        slot: WaveformSlot,
+        *,
+        start: float | None = None,
+        end: float | None = None,
+        show_errors: bool = True,
+        refresh_table: bool = True,
+    ) -> bool:
+        if slot.duration <= 0:
+            if show_errors:
+                messagebox.showinfo("Chromatch", "Load the waveform before setting part markers.")
+            return False
+
+        row = slot.row
+        part_start = self.row_part_start(row) if start is None else start
+        part_end = self.row_part_end(row, slot.duration) if end is None else end
+        if part_end is None:
+            part_end = slot.duration
+
+        part_start = max(0.0, min(slot.duration, part_start))
+        part_end = max(0.0, min(slot.duration, part_end))
+        if part_start >= part_end:
+            if show_errors:
+                messagebox.showinfo("Chromatch", "Part start must be before part end.")
+            return False
+
+        old_id = slot.row_id
+        updated = replace(
+            row,
+            part_start_seconds=None if part_start <= 0 else part_start,
+            part_end_seconds=None if abs(part_end - slot.duration) < 1e-6 else part_end,
+            user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if part_start <= beat <= part_end),
+        )
+        updated_id = self.row_id(updated)
+        self.rows = [updated if self.row_id(candidate) == old_id else candidate for candidate in self.rows]
+        slot.row = updated
+        slot.row_id = updated_id
+        slot.downbeat_seconds = updated.beat_anchor_seconds
+        if old_id in self.similarity_target_ids:
+            self.similarity_target_ids.discard(old_id)
+            self.similarity_target_ids.add(updated_id)
+        self.sync_waveform_rows()
+        if refresh_table:
+            self.refresh_table()
+            self.table.selection_set(updated_id)
+        self.draw_all_waveforms()
+        self.result.configure(text=f"Updated part markers for {row.path.name}")
+        return True
+
+    def apply_part_marker_entries(self, _event=None, refresh_table: bool = False) -> None:
+        if self.suppress_part_marker_update:
+            return
+
+        slot = self.selected_waveform_slot()
+        if slot is None:
+            return
+
+        start = parse_optional_float(self.part_start_marker_var.get())
+        end = parse_optional_float(self.part_end_marker_var.get())
+        if start is None or end is None:
+            return
+
+        self.update_slot_part_marker(
+            slot,
+            start=start,
+            end=end,
+            show_errors=False,
+            refresh_table=refresh_table,
+        )
+
+    def apply_part_marker_entries_and_refresh(self, event=None) -> None:
+        self.apply_part_marker_entries(event, refresh_table=True)
+
+    def set_selected_part_start(self) -> None:
+        slot = self.selected_waveform_slot()
+        if slot is None:
+            messagebox.showinfo("Chromatch", "Select a displayed waveform first.")
+            return
+        marker = self.current_slot_seconds(slot)
+        if marker is not None:
+            self.suppress_part_marker_update = True
+            self.part_start_marker_var.set(format_seconds_compact(marker))
+            self.suppress_part_marker_update = False
+            self.update_slot_part_marker(slot, start=marker)
+
+    def set_selected_part_end(self) -> None:
+        slot = self.selected_waveform_slot()
+        if slot is None:
+            messagebox.showinfo("Chromatch", "Select a displayed waveform first.")
+            return
+        marker = self.current_slot_seconds(slot)
+        if marker is not None:
+            self.suppress_part_marker_update = True
+            self.part_end_marker_var.set(format_seconds_compact(marker))
+            self.suppress_part_marker_update = False
+            self.update_slot_part_marker(slot, end=marker)
+
+    def split_selected_at_playhead(self) -> None:
+        slot = self.selected_waveform_slot()
+        if slot is None:
+            messagebox.showinfo("Chromatch", "Select a displayed waveform first.")
+            return
+        self.split_slot_at_playhead(slot)
+
+    def split_slot_at_playhead(self, slot: WaveformSlot) -> None:
+        if slot.duration <= 0:
+            messagebox.showinfo("Chromatch", "Load the waveform before splitting this track.")
+            return
+
+        split_seconds = slot.playhead * slot.duration
+        row = slot.row
+        start = self.row_part_start(row)
+        end = self.row_part_end(row, slot.duration)
+        if end is None:
+            end = slot.duration
+
+        min_gap = 0.05
+        if split_seconds <= start + min_gap or split_seconds >= end - min_gap:
+            messagebox.showinfo("Chromatch", "Move the playhead inside this track part before splitting.")
+            return
+
+        first = replace(
+            row,
+            part_start_seconds=None if start <= 0 and row.part_start_seconds is None else start,
+            part_end_seconds=split_seconds,
+            user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if start <= beat <= split_seconds),
+        )
+        second = replace(
+            row,
+            part_start_seconds=split_seconds,
+            part_end_seconds=None if row.part_end_seconds is None and abs(end - slot.duration) < 1e-6 else end,
+            user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if split_seconds <= beat <= end),
+        )
+
+        old_id = slot.row_id
+        updated_rows = []
+        replaced_row = False
+        for candidate in self.rows:
+            if self.row_id(candidate) == old_id:
+                updated_rows.extend([first, second])
+                replaced_row = True
+            else:
+                updated_rows.append(candidate)
+        if not replaced_row:
+            return
+
+        self.rows = updated_rows
+        slot.row = first
+        slot.row_id = self.row_id(first)
+        slot.downbeat_seconds = first.beat_anchor_seconds
+        self.similarity_target_ids.discard(old_id)
+        self.refresh_table()
+        self.table.selection_set(slot.row_id)
+        self.update_waveform_selection()
+        self.update_similarity_scores()
+        self.refresh_table()
+        self.draw_all_waveforms()
+        self.result.configure(text=f"Split {row.path.name} at {format_seconds_compact(split_seconds)}s")
 
     def shift_slot_downbeat(self, slot: WaveformSlot, direction: int) -> None:
         beat_seconds = self.slot_beat_seconds(slot)
@@ -2381,6 +2952,7 @@ class TempoWindow:
         if tempo is None or tempo <= 0 or slot.duration <= 0:
             return
 
+        beat_count *= self.beat_jump_count()
         beat_seconds = 60.0 / tempo
         with self.mixer_lock:
             current_seconds = slot.playhead * slot.duration
@@ -2393,6 +2965,12 @@ class TempoWindow:
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
+
+    def beat_jump_count(self) -> int:
+        try:
+            return max(1, int(self.beat_jump_var.get()))
+        except (TypeError, ValueError, tk.TclError):
+            return 4
 
     def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
         multiplier = max(0.5, min(2.0, float(value)))
@@ -2468,7 +3046,7 @@ class TempoWindow:
             return current_seconds
 
         target_phase = self.metronome_beat_phase()
-        anchor = self.slot_beat_anchor_seconds(slot)
+        anchor = self.slot_resync_anchor_seconds(slot, current_seconds)
         beat_number = round(((current_seconds - anchor) / beat_seconds) - target_phase)
         synced_seconds = anchor + (beat_number + target_phase) * beat_seconds
         return max(0.0, min(slot.duration, synced_seconds))
@@ -2495,7 +3073,15 @@ class TempoWindow:
         self.ensure_mixer_stream()
         self.ensure_waveform_update_loop()
 
+    def start_waveform_stinger_from_event(self, slot: WaveformSlot) -> str:
+        self.start_waveform_stinger(slot)
+        return "break"
+
     def toggle_waveform_playback(self, slot: WaveformSlot) -> None:
+        if self.ctrl_pressed:
+            self.start_waveform_stinger(slot)
+            return
+
         if slot.is_playing:
             self.stop_waveform(slot)
         else:
@@ -2562,13 +3148,12 @@ class TempoWindow:
         try:
             self.update_playback_target_tempo()
             with self.mixer_lock:
-                if slot.audio is None:
-                    audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
-                    slot.audio = audio
-                    slot.sample_rate = sample_rate
-                    slot.position_samples = slot.playhead * len(audio)
+                self.ensure_slot_audio_loaded(slot)
 
                 self.sync_slot_to_master_beat(slot)
+                slot.stinger_remaining_samples = None
+                slot.stinger_restore_position_samples = None
+                slot.stinger_restore_playhead = None
                 slot.is_playing = True
             if slot.button is not None:
                 slot.button.configure(text="Pause")
@@ -2582,9 +3167,59 @@ class TempoWindow:
                 slot.button.configure(text="Play")
             messagebox.showerror("Chromatch", f"Could not play waveform:\n{exc}")
 
+    def ensure_slot_audio_loaded(self, slot: WaveformSlot) -> None:
+        if slot.audio is not None:
+            return
+
+        audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
+        slot.audio = audio
+        slot.sample_rate = sample_rate
+        slot.position_samples = slot.playhead * len(audio)
+
+    def start_waveform_stinger(self, slot: WaveformSlot) -> None:
+        if not self.ensure_sounddevice_available():
+            return
+
+        tempo = self.row_tempo_for_matching(slot.row)
+        if tempo is None or tempo <= 0:
+            messagebox.showinfo("Chromatch", "This track needs a tempo before playing one beat.")
+            return
+
+        try:
+            self.update_playback_target_tempo()
+            with self.mixer_lock:
+                self.ensure_slot_audio_loaded(slot)
+                if slot.audio is None or slot.sample_rate <= 0:
+                    return
+
+                restore_playhead = slot.playhead
+                restore_position = restore_playhead * len(slot.audio)
+                slot.position_samples = restore_position
+                slot.stinger_restore_position_samples = restore_position
+                slot.stinger_restore_playhead = restore_playhead
+                slot.stinger_remaining_samples = (60.0 / tempo) * slot.sample_rate
+                slot.is_playing = True
+            if slot.button is not None:
+                slot.button.configure(text="Pause")
+
+            self.ensure_mixer_stream()
+            self.ensure_waveform_update_loop()
+        except Exception as exc:
+            with self.mixer_lock:
+                slot.is_playing = False
+                slot.stinger_remaining_samples = None
+                slot.stinger_restore_position_samples = None
+                slot.stinger_restore_playhead = None
+            if slot.button is not None:
+                slot.button.configure(text="Play")
+            messagebox.showerror("Chromatch", f"Could not play beat preview:\n{exc}")
+
     def stop_waveform(self, slot: WaveformSlot) -> None:
         with self.mixer_lock:
             slot.is_playing = False
+            slot.stinger_remaining_samples = None
+            slot.stinger_restore_position_samples = None
+            slot.stinger_restore_playhead = None
             any_playing = any(candidate.is_playing for candidate in self.waveform_slots)
             preview_active = self.preview_tone_frequency is not None
         if slot.button is not None:
@@ -2626,6 +3261,7 @@ class TempoWindow:
                     continue
 
                 rate = self.playback_rate_for_slot(slot)
+                stinger_remaining = slot.stinger_remaining_samples
                 positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
                 max_index = len(slot.audio) - 1
                 if slot.loop and max_index > 0:
@@ -2634,6 +3270,9 @@ class TempoWindow:
                 else:
                     sample_positions = positions
                     valid = positions < max_index
+                if stinger_remaining is not None:
+                    source_offsets = np.abs(positions - slot.position_samples)
+                    valid &= source_offsets < stinger_remaining
                 if np.any(valid):
                     lower = np.floor(sample_positions[valid]).astype(int)
                     upper = np.minimum(lower + 1, max_index)
@@ -2644,13 +3283,27 @@ class TempoWindow:
                     output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN * slot.volume
 
                 next_position = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
-                if slot.loop and max_index > 0:
+                if stinger_remaining is not None:
+                    source_advance = abs(next_position - slot.position_samples)
+                    slot.stinger_remaining_samples = stinger_remaining - source_advance
+                    slot.position_samples = next_position
+                    if slot.stinger_remaining_samples <= 0 or not np.any(valid):
+                        if slot.stinger_restore_position_samples is not None:
+                            slot.position_samples = slot.stinger_restore_position_samples
+                        if slot.stinger_restore_playhead is not None:
+                            slot.playhead = slot.stinger_restore_playhead
+                        slot.stinger_remaining_samples = None
+                        slot.stinger_restore_position_samples = None
+                        slot.stinger_restore_playhead = None
+                        slot.is_playing = False
+                elif slot.loop and max_index > 0:
                     slot.position_samples = next_position % max_index
+                    slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
                 else:
                     slot.position_samples = next_position
-                slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
-                if not slot.loop and slot.position_samples >= max_index:
-                    slot.is_playing = False
+                    slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
+                    if slot.position_samples >= max_index:
+                        slot.is_playing = False
 
             if getattr(self, "metronome_enabled", False):
                 tempo = getattr(self, "playback_target_tempo", None)
@@ -2830,10 +3483,12 @@ class TempoWindow:
                 with self.queue_lock:
                     if not self.analysis_queue:
                         break
-                    path = self.analysis_queue.pop(0)
+                    task = self.analysis_queue.pop(0)
                     remaining = len(self.analysis_queue)
 
                 processed += 1
+                path = task.path
+                task_id = self.analysis_task_id(task)
                 self.result_queue.put(("started", path.name, remaining))
                 estimate = None
                 chroma = None
@@ -2842,17 +3497,30 @@ class TempoWindow:
                 errors = []
 
                 try:
-                    estimate = estimate_tempo(path)
+                    estimate = estimate_tempo(
+                        path,
+                        start_seconds=task.part_start_seconds,
+                        end_seconds=task.part_end_seconds,
+                    )
                 except Exception as exc:
                     errors.append(f"tempo: {exc}")
 
                 try:
-                    chroma = estimate_chroma(path)
+                    chroma = estimate_chroma(
+                        path,
+                        start_seconds=task.part_start_seconds,
+                        end_seconds=task.part_end_seconds,
+                    )
                 except Exception as exc:
                     errors.append(f"chroma: {exc}")
 
                 try:
-                    beat_anchor_seconds = detect_beat_anchor_seconds(path, None if estimate is None else estimate.bpm)
+                    beat_anchor_seconds = detect_beat_anchor_seconds(
+                        path,
+                        None if estimate is None else estimate.bpm,
+                        start_seconds=task.part_start_seconds,
+                        end_seconds=task.part_end_seconds,
+                    )
                 except Exception as exc:
                     errors.append(f"beat anchor: {exc}")
 
@@ -2874,9 +3542,11 @@ class TempoWindow:
                     analyzed_at=analysis_timestamp(),
                     beat_anchor_seconds=beat_anchor_seconds,
                     beat_anchor_source="automatic" if beat_anchor_seconds is not None else "",
+                    part_start_seconds=task.part_start_seconds,
+                    part_end_seconds=task.part_end_seconds,
                 )
 
-                self.result_queue.put(("row", row, processed, remaining))
+                self.result_queue.put(("row", row, processed, remaining, task_id))
         except Exception as exc:
             self.result_queue.put(("worker_error", str(exc)))
         finally:
@@ -2894,8 +3564,8 @@ class TempoWindow:
                 _, filename, remaining = message
                 self.result.configure(text=f"Analyzing {filename} ({remaining} queued)")
             elif kind == "row":
-                _, row, processed, remaining = message
-                self._add_result(row, processed, remaining)
+                _, row, processed, remaining, task_id = message
+                self._add_result(row, processed, remaining, task_id)
             elif kind == "worker_error":
                 _, error = message
                 self.result.configure(text=f"Analysis worker failed: {error}")
@@ -2905,9 +3575,9 @@ class TempoWindow:
         if self.is_analyzing:
             self.root.after(50, self.process_analysis_results)
 
-    def _add_result(self, row: AnalysisRow, processed: int, remaining: int) -> None:
+    def _add_result(self, row: AnalysisRow, processed: int, remaining: int, task_id: str | None = None) -> None:
         with self.queue_lock:
-            self.analysis_paths.discard(row.path.resolve())
+            self.analysis_paths.discard(task_id or self.row_id(row))
 
         row_id = self.row_id(row)
         replaced = False
@@ -3006,6 +3676,8 @@ class TempoWindow:
                     "uncertainty_bpm",
                     "confidence_0_100",
                     "tapped_tempo_bpm",
+                    "part_start_seconds",
+                    "part_end_seconds",
                     "beat_anchor_seconds",
                     "beat_anchor_source",
                     "base_chroma_bin",
@@ -3034,6 +3706,8 @@ class TempoWindow:
                         "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
                         "" if row.confidence is None else f"{row.confidence:.0f}",
                         "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
+                        "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
+                        "" if row.part_end_seconds is None else f"{row.part_end_seconds:.6f}",
                         "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
                         row.beat_anchor_source,
                         "" if row.base_chroma_bin is None else str(row.base_chroma_bin),

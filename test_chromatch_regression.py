@@ -61,6 +61,27 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(expected_bpm, chromatch.refine_tempo_from_beats(beats), places=2)
 
+    def test_fit_tempo_grid_from_user_beats_handles_non_consecutive_beats(self):
+        expected_bpm = 121.52
+        interval = 60.0 / expected_bpm
+        anchor = 10.25
+        beats = (
+            anchor,
+            anchor + interval * 4,
+            anchor + interval * 15,
+        )
+
+        fit = chromatch.fit_tempo_grid_from_user_beats(beats, 120.0)
+
+        self.assertIsNotNone(fit)
+        fitted_bpm, fitted_anchor = fit
+        self.assertAlmostEqual(expected_bpm, fitted_bpm, places=2)
+        self.assertAlmostEqual(anchor, fitted_anchor, places=6)
+
+    def test_fold_bpm_preserves_fast_tempo(self):
+        self.assertEqual(240.0, chromatch.fold_bpm(240.0))
+        self.assertEqual(140.0, chromatch.fold_bpm(280.0))
+
     def test_slider_callback_does_not_reenter_when_tempo_is_set_programmatically(self):
         calls = []
         original_draw = self.app.draw_all_waveforms
@@ -214,9 +235,68 @@ class ChromatchRegressionTests(unittest.TestCase):
     def test_row_values_use_compact_tempo_and_chroma_display(self):
         row = self.make_chroma_row("track.wav", 123.034, 180)
         values = self.app.row_values(row)
-        self.assertEqual("123.03 (A)", values[1])
-        self.assertNotIn("BPM", values[1])
-        self.assertEqual(3, len(values[5].split()))
+        self.assertEqual("1", values[1])
+        self.assertEqual("123.03 (A)", values[2])
+        self.assertNotIn("BPM", values[2])
+        self.assertEqual(3, len(values[6].split()))
+
+    def test_part_rows_have_range_ids_and_part_numbers(self):
+        row = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        other = chromatch.replace(self.make_row("track.wav"), part_start_seconds=20.0, part_end_seconds=30.0)
+        self.app.rows = [row, other]
+
+        self.assertIn("#part=10.000000-20.000000", self.app.row_id(row))
+        self.assertEqual("track.wav", self.app.row_display_name(row))
+        self.assertEqual(1, self.app.row_part_number(row))
+        self.assertEqual(2, self.app.row_part_number(other))
+
+    def test_single_selection_updates_tempo_and_part_fields(self):
+        row = chromatch.replace(
+            self.make_row("track.wav"),
+            tapped_bpm=128.5,
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.refresh_table()
+
+        self.app.table.selection_set(row_id)
+        self.app.update_selected_edit_fields()
+
+        self.assertEqual("128.50", self.app.tapped_tempo_var.get())
+        self.assertEqual("10", self.app.part_start_marker_var.get())
+        self.assertEqual("20", self.app.part_end_marker_var.get())
+
+    def test_default_part_fields_are_zero_and_duration(self):
+        row = self.make_row("track.wav")
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, duration=193.86)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+
+        self.app.table.selection_set(row_id)
+        self.app.update_selected_edit_fields()
+
+        self.assertEqual("0", self.app.part_start_marker_var.get())
+        self.assertEqual("193.86", self.app.part_end_marker_var.get())
+
+    def test_multiple_selection_clears_tempo_and_part_fields(self):
+        first = self.make_row("first.wav")
+        second = self.make_row("second.wav")
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        self.app.table.selection_set([self.app.row_id(first), self.app.row_id(second)])
+        self.app.tapped_tempo_var.set("123.00")
+        self.app.part_start_marker_var.set("1")
+        self.app.part_end_marker_var.set("2")
+
+        self.app.update_selected_edit_fields()
+
+        self.assertEqual("", self.app.tapped_tempo_var.get())
+        self.assertEqual("", self.app.part_start_marker_var.get())
+        self.assertEqual("", self.app.part_end_marker_var.get())
 
     def test_csv_loader_preserves_analysis_timestamp(self):
         row = self.app.row_from_csv_record(
@@ -230,6 +310,35 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("2026-05-15T10:20:30+02:00", row.analyzed_at)
 
+    def test_load_csv_strips_nul_bytes(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            path.write_bytes(
+                b"filepath,artist,title,album,detected_tempo_bpm\n"
+                b"track.wav,N\x00ame,Title,,120.0\n"
+            )
+
+            self.app.load_csv_path(path)
+
+        self.assertEqual(1, len(self.app.rows))
+        self.assertEqual("Name", self.app.rows[0].artist)
+
+    def test_csv_loader_does_not_refresh_missing_tags_by_default(self):
+        original_read_tags = chromatch.read_audio_tags
+        try:
+            chromatch.read_audio_tags = lambda _path: (_ for _ in ()).throw(AssertionError("unexpected tag read"))
+            row = self.app.row_from_csv_record(
+                {
+                    "filepath": __file__,
+                    "detected_tempo_bpm": "123.45",
+                },
+                Path("."),
+            )
+        finally:
+            chromatch.read_audio_tags = original_read_tags
+
+        self.assertEqual("", row.artist)
+
     def test_csv_loader_preserves_beat_anchor(self):
         row = self.app.row_from_csv_record(
             {
@@ -238,6 +347,8 @@ class ChromatchRegressionTests(unittest.TestCase):
                 "beat_anchor_source": "user",
                 "base_chroma_bin": "42",
                 "user_beat_seconds": "[0.5,1.0]",
+                "part_start_seconds": "10.0",
+                "part_end_seconds": "20.0",
             },
             Path("."),
         )
@@ -246,6 +357,8 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("user", row.beat_anchor_source)
         self.assertEqual(42, row.base_chroma_bin)
         self.assertEqual((0.5, 1.0), row.user_beat_seconds)
+        self.assertEqual(10.0, row.part_start_seconds)
+        self.assertEqual(20.0, row.part_end_seconds)
 
     def test_update_csv_writes_to_current_loaded_path(self):
         row = self.make_row("track.wav", bpm=123.45)
@@ -271,6 +384,8 @@ class ChromatchRegressionTests(unittest.TestCase):
             beat_anchor_source="user",
             base_chroma_bin=42,
             user_beat_seconds=(0.5, 1.0),
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
         )
 
         with tempfile.TemporaryDirectory() as folder:
@@ -284,7 +399,21 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIn("beat_anchor_source", contents)
         self.assertIn("base_chroma_bin", contents)
         self.assertIn("user_beat_seconds", contents)
+        self.assertIn("part_start_seconds", contents)
+        self.assertIn("part_end_seconds", contents)
         self.assertIn('"[0.5,1.0]"', contents)
+
+    def test_csv_roundtrip_preserves_user_beats(self):
+        row = chromatch.replace(self.make_row("track.wav"), user_beat_seconds=(0.5, 1.25))
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            self.app.rows = [row]
+            self.app.write_csv_path(path)
+            with path.open(encoding="utf-8") as csv_file:
+                loaded = self.app.row_from_csv_record(next(chromatch.csv.DictReader(csv_file)), path.parent)
+
+        self.assertEqual((0.5, 1.25), loaded.user_beat_seconds)
 
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
@@ -391,6 +520,39 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertLess(slot.position_samples, len(audio) - 1)
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN))
 
+    def test_stinger_playback_restores_original_position_and_playhead(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+        row = self.make_row()
+        audio = np.ones((4096, 2), dtype=np.float32)
+        slot = chromatch.WaveformSlot(
+            row_id="stinger",
+            row=row,
+            is_playing=True,
+            audio=audio,
+            sample_rate=44_100,
+            playhead=0.25,
+            position_samples=1024.0,
+            stinger_remaining_samples=512.0,
+            stinger_restore_position_samples=1024.0,
+            stinger_restore_playhead=0.25,
+        )
+        DummyApp.waveform_slots = [slot]
+        outdata = np.zeros((1024, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 1024, None, None)
+
+        self.assertFalse(slot.is_playing)
+        self.assertAlmostEqual(1024.0, slot.position_samples)
+        self.assertAlmostEqual(0.25, slot.playhead)
+        self.assertGreater(float(np.max(np.abs(outdata))), 0.0)
+
     def test_waveform_loop_toggle_updates_slot_state(self):
         row = self.make_row()
         slot = chromatch.WaveformSlot(row_id="track", row=row)
@@ -445,7 +607,12 @@ class ChromatchRegressionTests(unittest.TestCase):
             row = self.make_row(path, bpm=120.0)
             self.app.rows = [row]
 
-            chromatch.detect_beat_anchor_seconds = lambda path, bpm: detected_calls.append((path, bpm)) or 0.37
+            chromatch.detect_beat_anchor_seconds = (
+                lambda path, bpm, start_seconds=None, end_seconds=None: detected_calls.append(
+                    (path, bpm, start_seconds, end_seconds)
+                )
+                or 0.37
+            )
             try:
                 self.app.add_waveform(row)
             finally:
@@ -454,7 +621,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(1, len(self.app.waveform_slots))
         self.assertAlmostEqual(0.37, self.app.waveform_slots[0].downbeat_seconds)
         self.assertEqual("automatic", self.app.waveform_slots[0].row.beat_anchor_source)
-        self.assertEqual([(path, 120.0)], detected_calls)
+        self.assertEqual([(path, 120.0, None, None)], detected_calls)
 
     def test_loaded_waveform_persists_detected_beat_anchor_to_row(self):
         sample_rate = 8_000
@@ -467,7 +634,7 @@ class ChromatchRegressionTests(unittest.TestCase):
             row = self.make_row(path, bpm=120.0)
             self.app.rows = [row]
 
-            chromatch.detect_beat_anchor_seconds = lambda _path, _bpm: 0.37
+            chromatch.detect_beat_anchor_seconds = lambda _path, _bpm, start_seconds=None, end_seconds=None: 0.37
             try:
                 self.app.add_waveform(row)
             finally:
@@ -492,6 +659,142 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual((2.5,), self.app.rows[0].user_beat_seconds)
         self.assertAlmostEqual(2.5, slot.row.beat_anchor_seconds)
         self.assertAlmostEqual(2.5, slot.downbeat_seconds)
+
+    def test_fit_bpm_button_updates_tapped_tempo_and_anchor_from_user_beats(self):
+        expected_bpm = 121.52
+        interval = 60.0 / expected_bpm
+        anchor = 10.25
+        beats = (
+            anchor,
+            anchor + interval * 4,
+            anchor + interval * 15,
+        )
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), user_beat_seconds=beats)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, duration=60.0)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.fit_slot_bpm_from_user_beats(slot)
+
+        self.assertAlmostEqual(expected_bpm, self.app.rows[0].tapped_bpm, places=2)
+        self.assertAlmostEqual(anchor, self.app.rows[0].beat_anchor_seconds, places=6)
+        self.assertEqual("user-fit", self.app.rows[0].beat_anchor_source)
+        self.assertAlmostEqual(expected_bpm, slot.row.tapped_bpm, places=2)
+
+    def test_fit_bpm_button_uses_latest_row_beats(self):
+        expected_bpm = 121.52
+        interval = 60.0 / expected_bpm
+        beats = (10.25, 10.25 + interval * 4)
+        stale_row = self.make_row("track.wav", bpm=120.0)
+        current_row = chromatch.replace(stale_row, user_beat_seconds=beats)
+        row_id = self.app.row_id(current_row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=stale_row, duration=60.0)
+        self.app.rows = [current_row]
+        self.app.waveform_slots = [slot]
+
+        self.app.fit_slot_bpm_from_user_beats(slot)
+
+        self.assertAlmostEqual(expected_bpm, self.app.rows[0].tapped_bpm, places=2)
+
+    def test_split_slot_at_playhead_replaces_row_with_two_parts(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), user_beat_seconds=(2.0, 6.0, 8.0))
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.5, duration=10.0)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.split_slot_at_playhead(slot)
+
+        self.assertEqual(2, len(self.app.rows))
+        self.assertIsNone(self.app.rows[0].part_start_seconds)
+        self.assertAlmostEqual(5.0, self.app.rows[0].part_end_seconds)
+        self.assertAlmostEqual(5.0, self.app.rows[1].part_start_seconds)
+        self.assertIsNone(self.app.rows[1].part_end_seconds)
+        self.assertEqual((2.0,), self.app.rows[0].user_beat_seconds)
+        self.assertEqual((6.0, 8.0), self.app.rows[1].user_beat_seconds)
+        self.assertEqual(self.app.row_id(self.app.rows[0]), slot.row_id)
+
+    def test_split_existing_part_splits_within_part_range(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.15, duration=100.0)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.split_slot_at_playhead(slot)
+
+        self.assertEqual(2, len(self.app.rows))
+        self.assertEqual(10.0, self.app.rows[0].part_start_seconds)
+        self.assertEqual(15.0, self.app.rows[0].part_end_seconds)
+        self.assertEqual(15.0, self.app.rows[1].part_start_seconds)
+        self.assertEqual(20.0, self.app.rows[1].part_end_seconds)
+
+    def test_set_start_button_uses_current_playhead(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.25, duration=100.0)
+        slot.canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.set_selected_part_start()
+
+        self.assertEqual("25", self.app.part_start_marker_var.get())
+        self.assertEqual(25.0, self.app.rows[0].part_start_seconds)
+
+    def test_set_end_button_uses_current_playhead(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.75, duration=100.0)
+        slot.canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.set_selected_part_end()
+
+        self.assertEqual("75", self.app.part_end_marker_var.get())
+        self.assertEqual(75.0, self.app.rows[0].part_end_seconds)
+
+    def test_manual_part_field_change_updates_row_without_waiting_for_button(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, duration=100.0)
+        slot.canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.part_start_marker_var.set("12.5")
+        self.app.part_end_marker_var.set("80")
+
+        self.app.apply_part_marker_entries()
+
+        self.assertEqual(12.5, self.app.rows[0].part_start_seconds)
+        self.assertEqual(80.0, self.app.rows[0].part_end_seconds)
+
+    def test_part_rows_grey_unused_waveform_ranges(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        slot = chromatch.WaveformSlot(
+            row_id=self.app.row_id(row),
+            row=row,
+            duration=100.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+
+        self.app.draw_waveform(slot)
+
+        rectangles = [item for item in slot.canvas.find_all() if slot.canvas.type(item) == "rectangle"]
+        self.assertGreaterEqual(len(rectangles), 2)
+        fills = {slot.canvas.itemcget(item, "fill") for item in rectangles}
+        self.assertIn("#d8d5d0", fills)
 
     def test_right_click_zoom_removes_nearest_user_beat(self):
         row = chromatch.replace(self.make_row("track.wav", bpm=120.0), user_beat_seconds=(2.5,))
@@ -713,6 +1016,66 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertTrue(first.is_playing)
         self.assertTrue(second.is_playing)
 
+    def test_ctrl_play_starts_one_beat_stinger(self):
+        row = self.make_row()
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+        called = []
+        self.app.ctrl_pressed = True
+        original_stinger = self.app.start_waveform_stinger
+        self.app.start_waveform_stinger = lambda slot: called.append(slot.row_id)
+
+        try:
+            self.app.toggle_waveform_playback(slot)
+        finally:
+            self.app.start_waveform_stinger = original_stinger
+
+        self.assertEqual(["track"], called)
+
+    def test_right_click_play_lane_starts_one_beat_stinger(self):
+        row = self.make_row("track.wav")
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        called = []
+        original_stinger = self.app.start_waveform_stinger
+        self.app.start_waveform_stinger = lambda slot: called.append(slot.row_id)
+
+        class Widget:
+            def identify_row(self, _y):
+                return row_id
+
+            def identify_column(self, _x):
+                return "#1"
+
+        class Event:
+            widget = Widget()
+            x = 1
+            y = 1
+
+        try:
+            result = self.app.handle_play_stinger_click(Event())
+        finally:
+            self.app.start_waveform_stinger = original_stinger
+
+        self.assertEqual("break", result)
+        self.assertEqual([row_id], called)
+
+    def test_right_click_waveform_play_button_starts_one_beat_stinger(self):
+        row = self.make_row("track.wav")
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+        called = []
+        original_stinger = self.app.start_waveform_stinger
+        self.app.start_waveform_stinger = lambda slot: called.append(slot.row_id)
+
+        try:
+            result = self.app.start_waveform_stinger_from_event(slot)
+        finally:
+            self.app.start_waveform_stinger = original_stinger
+
+        self.assertEqual("break", result)
+        self.assertEqual(["track"], called)
+
     def test_sort_heading_shows_direction_marker(self):
         self.app.sort_by_column("filename")
         self.assertTrue(self.app.table.heading("filename")["text"].endswith(" ^"))
@@ -788,8 +1151,29 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.app.reanalyze_selected_rows()
 
-        self.assertEqual([row.path], self.app.analysis_queue)
-        self.assertIn(row.path.resolve(), self.app.analysis_paths)
+        self.assertEqual([chromatch.AnalysisTask(path=row.path, row_id=row_id)], self.app.analysis_queue)
+        self.assertIn(row_id, self.app.analysis_paths)
+
+    def test_reanalyze_selected_part_preserves_analysis_range(self):
+        row = chromatch.replace(
+            self.make_row("first.wav"),
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.is_analyzing = True
+
+        self.app.reanalyze_selected_rows()
+
+        self.assertEqual(1, len(self.app.analysis_queue))
+        task = self.app.analysis_queue[0]
+        self.assertEqual(row_id, task.row_id)
+        self.assertEqual(10.0, task.part_start_seconds)
+        self.assertEqual(20.0, task.part_end_seconds)
+        self.assertIn(row_id, self.app.analysis_paths)
 
     def test_add_result_replaces_existing_row_when_reanalyzed(self):
         old_row = self.make_row("first.wav", bpm=100)
@@ -798,14 +1182,14 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.rows = [old_row]
         slot = chromatch.WaveformSlot(row_id=row_id, row=old_row)
         self.app.waveform_slots = [slot]
-        self.app.analysis_paths = {old_row.path.resolve()}
+        self.app.analysis_paths = {row_id}
 
         self.app._add_result(new_row, 1, 0)
 
         self.assertEqual(1, len(self.app.rows))
         self.assertAlmostEqual(127.37, self.app.rows[0].bpm)
         self.assertIs(slot.row, new_row)
-        self.assertNotIn(old_row.path.resolve(), self.app.analysis_paths)
+        self.assertNotIn(row_id, self.app.analysis_paths)
 
     def test_zoomed_waveform_click_positions_playhead(self):
         row = self.make_row(bpm=120)
@@ -823,6 +1207,24 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.55, slot.playhead, places=2)
 
+    def test_waveform_click_uses_actual_canvas_width(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            duration=100.0,
+            waveform=np.ones(900, dtype=np.float32),
+        )
+        slot.canvas = chromatch.tk.Canvas(self.app.root, width=360, height=54)
+        slot.canvas.pack()
+        self.app.root.update_idletasks()
+        slot.canvas.configure(width=720)
+        self.app.root.update_idletasks()
+
+        self.app.seek_waveform(slot, 360)
+
+        self.assertAlmostEqual(0.5, slot.playhead, places=2)
+
     def test_zoomed_waveform_mousewheel_changes_all_windows(self):
         row = self.make_row()
         first = chromatch.WaveformSlot(row_id="first", row=row, duration=100.0)
@@ -836,6 +1238,43 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertLess(self.app.zoom_seconds, 8.0)
         self.assertEqual(self.app.zoom_seconds, first.zoom_seconds)
         self.assertEqual(self.app.zoom_seconds, second.zoom_seconds)
+
+    def test_beat_jump_count_controls_beat_seek_buttons(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(row_id="track", row=row, playhead=0.5, duration=100.0)
+        self.app.beat_jump_var.set(4)
+
+        self.app.seek_waveform_by_beats(slot, 1)
+
+        self.assertAlmostEqual(0.52, slot.playhead)
+
+    def test_beat_step_spinbox_uses_power_of_two_values_and_wide_field(self):
+        values = tuple(int(value) for value in self.app.beat_jump_spinbox.cget("values"))
+
+        self.assertEqual((1, 2, 4, 8, 16, 32, 64), values)
+        self.assertEqual(12, int(self.app.beat_jump_spinbox.cget("width")))
+
+    def test_user_beats_are_used_as_resync_anchors_for_grid_lines(self):
+        row = chromatch.replace(self.make_row(bpm=120), user_beat_seconds=(10.25,))
+        slot = chromatch.WaveformSlot(row_id="track", row=row, downbeat_seconds=0.0)
+
+        lines = self.app.resynced_beat_line_times(slot, 9.8, 11.0)
+
+        self.assertIn(10.25, lines)
+        self.assertIn(10.75, lines)
+
+    def test_beat_sync_uses_latest_user_beat_as_local_anchor(self):
+        row = chromatch.replace(self.make_row(bpm=120), user_beat_seconds=(10.25,))
+        slot = chromatch.WaveformSlot(row_id="track", row=row, duration=100.0, playhead=0.107)
+        self.app.beat_sync_enabled_var.set(True)
+        self.app.target_tempo_var.set("120")
+        self.app.update_playback_settings_from_ui()
+        self.app.metronome_position_samples = 0.0
+
+        with self.app.mixer_lock:
+            synced = self.app.synced_source_seconds_for_slot(slot, 10.7)
+
+        self.assertAlmostEqual(10.75, synced)
 
     def test_set_downbeat_uses_current_playhead_and_draws_beats(self):
         row = self.make_row(bpm=120)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import csv
 import base64
+import html
+import itertools
 import json
 import math
 import os
@@ -70,6 +72,27 @@ PLAYBACK_TRACK_GAIN = 0.45
 METRONOME_CLICK_GAIN = 0.22
 CHROMA_PREVIEW_GAIN = 0.18
 CHROMA_PREVIEW_SECONDS = 0.45
+SIMILARITY_CHROMA = "Chroma"
+SIMILARITY_CHROMA_TEMPO = "Chroma/tempo"
+SIMILARITY_BASE_BPM = "Base/BPM + chroma"
+SIMILARITY_MODES = (SIMILARITY_BASE_BPM, SIMILARITY_CHROMA_TEMPO, SIMILARITY_CHROMA)
+SEARCH_FIELDS = ("All", "Filename", "Artist", "Title", "Album", "Tempo", "Similarity", "Chroma", "Marks", "Matches", "Part")
+EXPORT_CSV = "CSV"
+EXPORT_JSON = "JSON"
+EXPORT_CHROMAGRAM = "Chromagram"
+EXPORT_MAP = "HTML map"
+EXPORT_GRAPH_SVG = "Graph SVG"
+EXPORT_GRAPHVIZ = "Graphviz DOT"
+EXPORT_CLOSEST_PAIRS = "Closest pairs"
+EXPORT_MODES = (
+    EXPORT_CSV,
+    EXPORT_JSON,
+    EXPORT_CHROMAGRAM,
+    EXPORT_MAP,
+    EXPORT_GRAPH_SVG,
+    EXPORT_GRAPHVIZ,
+    EXPORT_CLOSEST_PAIRS,
+)
 
 
 @dataclass(frozen=True)
@@ -1205,6 +1228,12 @@ class TempoWindow:
         self.sort_descending = False
         self.similarity_target_ids: set[str] = set()
         self.table_headings: dict[str, str] = {}
+        self.similarity_mode_var = tk.StringVar(value=SIMILARITY_BASE_BPM)
+        self.search_text_var = tk.StringVar(value="")
+        self.search_field_var = tk.StringVar(value="All")
+        self.match_cycle_var = tk.StringVar(value="Match: --")
+        self.export_mode_var = tk.StringVar(value=EXPORT_CSV)
+        self.match_count_by_uid: dict[int, int] = {}
         self.row_part_numbers: dict[str, int] = {}
         self.tap_times: list[float] = []
         self.current_tapped_bpm: float | None = None
@@ -1269,77 +1298,98 @@ class TempoWindow:
 
         actions = ttk.Frame(main)
         actions.pack(fill="x", pady=(14, 0))
+        primary_actions = ttk.Frame(actions)
+        primary_actions.pack(fill="x")
+        secondary_actions = ttk.Frame(actions)
+        secondary_actions.pack(fill="x", pady=(4, 0))
 
-        browse = ttk.Button(actions, text="Choose audio files", command=self.choose_files)
+        browse = ttk.Button(primary_actions, text="Choose audio files", command=self.choose_files)
         browse.pack(side="left")
 
-        folder = ttk.Button(actions, text="Choose folder", command=self.choose_folder)
+        folder = ttk.Button(primary_actions, text="Choose folder", command=self.choose_folder)
         folder.pack(side="left", padx=(8, 0))
 
-        load_csv = ttk.Button(actions, text="Load data", command=self.load_csv)
+        load_csv = ttk.Button(primary_actions, text="Load data", command=self.load_csv)
         load_csv.pack(side="left", padx=(8, 0))
 
-        remove_selected = ttk.Button(actions, text="Remove selected", command=self.remove_selected_rows)
+        remove_selected = ttk.Button(primary_actions, text="Remove selected", command=self.remove_selected_rows)
         remove_selected.pack(side="left", padx=(8, 0))
 
-        reanalyze_selected = ttk.Button(actions, text="Re-analyze selected", command=self.reanalyze_selected_rows)
+        reanalyze_selected = ttk.Button(primary_actions, text="Re-analyze selected", command=self.reanalyze_selected_rows)
         reanalyze_selected.pack(side="left", padx=(8, 0))
 
+        ttk.Label(primary_actions, text="Search").pack(side="left", padx=(12, 4))
+        self.search_entry = ttk.Entry(primary_actions, textvariable=self.search_text_var, width=22)
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<KeyRelease>", self.update_table_filter)
+        self.search_field_combo = ttk.Combobox(
+            primary_actions,
+            textvariable=self.search_field_var,
+            values=SEARCH_FIELDS,
+            state="readonly",
+            width=10,
+        )
+        self.search_field_combo.pack(side="left", padx=(4, 0))
+        self.search_field_combo.bind("<<ComboboxSelected>>", self.update_table_filter)
+
         self.similarity_button = ttk.Button(
-            actions,
+            primary_actions,
             text="Set target from selection",
             command=self.set_similarity_target,
             state="disabled",
         )
         self.similarity_button.pack(side="left", padx=(8, 0))
+        ttk.Label(primary_actions, text="Similarity").pack(side="left", padx=(12, 4))
+        self.similarity_mode_combo = ttk.Combobox(
+            primary_actions,
+            textvariable=self.similarity_mode_var,
+            values=SIMILARITY_MODES,
+            state="readonly",
+            width=18,
+        )
+        self.similarity_mode_combo.pack(side="left")
+        self.similarity_mode_combo.bind("<<ComboboxSelected>>", self.set_similarity_mode)
 
         self.split_button = ttk.Button(
-            actions,
+            secondary_actions,
             text="Split",
             command=self.split_selected_at_playhead,
             state="disabled",
         )
-        self.split_button.pack(side="left", padx=(8, 0))
+        self.split_button.pack(side="left")
 
-        self.export_button = ttk.Button(
-            actions,
-            text="Export CSV",
-            command=self.export_csv,
+        self.match_cycle_button = ttk.Button(
+            secondary_actions,
+            textvariable=self.match_cycle_var,
+            command=self.cycle_selected_match_state,
             state="disabled",
         )
-        self.export_button.pack(side="right")
+        self.match_cycle_button.pack(side="left", padx=(8, 0))
 
         self.update_csv_button = ttk.Button(
-            actions,
+            secondary_actions,
             text="Update data",
             command=self.update_csv,
             state="disabled",
         )
         self.update_csv_button.pack(side="right", padx=(8, 0))
 
-        self.export_json_button = ttk.Button(
-            actions,
-            text="Export JSON",
-            command=self.export_json,
+        self.export_button = ttk.Button(
+            secondary_actions,
+            text="Export",
+            command=self.export_selected_mode,
             state="disabled",
         )
-        self.export_json_button.pack(side="right", padx=(8, 0))
+        self.export_button.pack(side="right")
 
-        self.pairs_button = ttk.Button(
-            actions,
-            text="Export closest pairs",
-            command=self.export_closest_pairs,
-            state="disabled",
+        self.export_mode_combo = ttk.Combobox(
+            secondary_actions,
+            textvariable=self.export_mode_var,
+            values=EXPORT_MODES,
+            state="readonly",
+            width=16,
         )
-        self.pairs_button.pack(side="right", padx=(8, 0))
-
-        self.chromagram_button = ttk.Button(
-            actions,
-            text="Export chromagram",
-            command=self.export_selected_chromagram,
-            state="disabled",
-        )
-        self.chromagram_button.pack(side="right", padx=(8, 0))
+        self.export_mode_combo.pack(side="right", padx=(8, 0))
 
         tap_frame = ttk.Frame(main)
         tap_frame.pack(fill="x", pady=(10, 0))
@@ -1473,8 +1523,7 @@ class TempoWindow:
             "markers",
             "tempo",
             "uncertainty",
-            "chroma_similarity",
-            "chroma_tempo_similarity",
+            "similarity",
             "chroma",
             "artist",
             "title",
@@ -1488,8 +1537,7 @@ class TempoWindow:
             "markers": "Marks",
             "tempo": "Tempo",
             "uncertainty": "Uncertainty",
-            "chroma_similarity": "Chroma sim",
-            "chroma_tempo_similarity": "Chroma/tempo sim",
+            "similarity": "Sim",
             "chroma": "Chroma peaks",
             "artist": "Artist",
             "title": "Title",
@@ -1509,8 +1557,7 @@ class TempoWindow:
         self.table.column("markers", width=75, anchor="center", stretch=False)
         self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
-        self.table.column("chroma_similarity", width=90, anchor="center")
-        self.table.column("chroma_tempo_similarity", width=115, anchor="center")
+        self.table.column("similarity", width=105, anchor="center")
         self.table.column("chroma", width=95, anchor="center")
         self.table.column("artist", width=150, anchor="w")
         self.table.column("title", width=180, anchor="w")
@@ -1539,6 +1586,10 @@ class TempoWindow:
 
     def clear_ctrl_pressed(self, _event=None) -> None:
         self.ctrl_pressed = False
+
+    def set_export_state(self, state: str) -> None:
+        self.export_button.configure(state=state)
+        self.export_mode_combo.configure(state="readonly" if state == "normal" else "disabled")
 
     def sync_table_scroll(self, scrollbar: ttk.Scrollbar, first: str, last: str) -> None:
         scrollbar.set(first, last)
@@ -1595,10 +1646,8 @@ class TempoWindow:
         self.sort_descending = False
         self.similarity_target_ids.clear()
         self.current_csv_path = csv_path
-        self.export_button.configure(state="normal" if self.rows else "disabled")
-        self.export_json_button.configure(state="normal" if self.rows else "disabled")
+        self.set_export_state("normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
-        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from CSV")
@@ -1651,10 +1700,8 @@ class TempoWindow:
         self.sort_descending = False
         self.similarity_target_ids.clear()
         self.current_csv_path = json_path
-        self.export_button.configure(state="normal" if self.rows else "disabled")
-        self.export_json_button.configure(state="normal" if self.rows else "disabled")
+        self.set_export_state("normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
-        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from JSON")
@@ -1789,10 +1836,8 @@ class TempoWindow:
         self.refresh_table()
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
-        self.export_button.configure(state="normal" if self.rows else "disabled")
-        self.export_json_button.configure(state="normal" if self.rows else "disabled")
+        self.set_export_state("normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
-        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         self.result.configure(text=f"Removed {len(selected_ids)} tracks")
 
     def start_analysis(self, paths: list[Path]) -> None:
@@ -1816,10 +1861,8 @@ class TempoWindow:
             self.result.configure(text="No new files to add")
             return
 
-        self.export_button.configure(state="disabled")
-        self.export_json_button.configure(state="disabled")
+        self.set_export_state("disabled")
         self.update_csv_button.configure(state="disabled")
-        self.pairs_button.configure(state="disabled")
         queued = len(self.analysis_queue)
         self.result.configure(text=f"Queued {len(new_tasks)} new files ({queued} waiting)")
 
@@ -1854,10 +1897,8 @@ class TempoWindow:
             self.result.configure(text="Selected rows are already queued")
             return
 
-        self.export_button.configure(state="disabled")
-        self.export_json_button.configure(state="disabled")
+        self.set_export_state("disabled")
         self.update_csv_button.configure(state="disabled")
-        self.pairs_button.configure(state="disabled")
         self.result.configure(text=f"Queued {len(new_tasks)} selected tracks for re-analysis")
 
         if not self.is_analyzing:
@@ -1875,8 +1916,7 @@ class TempoWindow:
                 "matches",
                 "markers",
                 "tempo",
-                "chroma_similarity",
-                "chroma_tempo_similarity",
+                "similarity",
             }
 
         self.update_sort_headings()
@@ -1911,6 +1951,16 @@ class TempoWindow:
         plural = "s" if len(targets) != 1 else ""
         self.result.configure(text=f"Similarity target set from {len(targets)} track{plural}")
 
+    def set_similarity_mode(self, _event=None) -> None:
+        if self.sort_column in {"chroma_similarity", "chroma_tempo_similarity"}:
+            self.sort_column = "similarity"
+            self.sort_descending = True
+        self.update_sort_headings()
+        self.refresh_table()
+
+    def update_table_filter(self, _event=None) -> None:
+        self.refresh_table()
+
     def handle_target_right_click(self, event) -> str:
         row_id = event.widget.identify_row(event.y)
         if not row_id:
@@ -1930,12 +1980,14 @@ class TempoWindow:
         return "break"
 
     def sort_by_chroma_similarity(self) -> None:
+        self.similarity_mode_var.set(SIMILARITY_CHROMA)
         self.set_similarity_target()
-        self.sort_by_column("chroma_similarity")
+        self.sort_by_column("similarity")
 
     def sort_by_chroma_tempo_similarity(self) -> None:
+        self.similarity_mode_var.set(SIMILARITY_CHROMA_TEMPO)
         self.set_similarity_target()
-        self.sort_by_column("chroma_tempo_similarity")
+        self.sort_by_column("similarity")
 
     def selected_target_rows(self) -> list[AnalysisRow]:
         rows = []
@@ -1992,14 +2044,26 @@ class TempoWindow:
         pair = self.canonical_match_pair(first_uid, second_uid)
         if pair is None or score not in (1, 2):
             return False
+        is_new_pair = pair not in self.match_links
         self.match_links[pair] = score
+        if is_new_pair:
+            self.match_count_by_uid[pair[0]] = self.match_count_by_uid.get(pair[0], 0) + 1
+            self.match_count_by_uid[pair[1]] = self.match_count_by_uid.get(pair[1], 0) + 1
         return True
 
     def remove_match(self, first_uid: int, second_uid: int) -> bool:
         pair = self.canonical_match_pair(first_uid, second_uid)
         if pair is None:
             return False
-        return self.match_links.pop(pair, None) is not None
+        removed = self.match_links.pop(pair, None) is not None
+        if removed:
+            for uid in pair:
+                next_count = self.match_count_by_uid.get(uid, 0) - 1
+                if next_count > 0:
+                    self.match_count_by_uid[uid] = next_count
+                else:
+                    self.match_count_by_uid.pop(uid, None)
+        return removed
 
     def matches_for(self, row_uid: int | None) -> list[tuple[int, int]]:
         if row_uid is None:
@@ -2012,6 +2076,68 @@ class TempoWindow:
                 matches.append((first_uid, score))
         return sorted(matches)
 
+    def rebuild_match_counts(self) -> None:
+        counts: dict[int, int] = {}
+        for (first_uid, second_uid), score in self.match_links.items():
+            if score not in (1, 2):
+                continue
+            counts[first_uid] = counts.get(first_uid, 0) + 1
+            counts[second_uid] = counts.get(second_uid, 0) + 1
+        self.match_count_by_uid = counts
+
+    def match_count_for(self, row_uid: int | None) -> int:
+        return 0 if row_uid is None else self.match_count_by_uid.get(row_uid, 0)
+
+    def selected_match_pairs(self) -> list[tuple[int, int]]:
+        uids: list[int] = []
+        for row_id in self.table.selection():
+            row = self.row_by_id(row_id)
+            if row is not None and row.row_uid is not None:
+                uids.append(row.row_uid)
+        pairs = []
+        for first_uid, second_uid in itertools.combinations(dict.fromkeys(uids), 2):
+            pair = self.canonical_match_pair(first_uid, second_uid)
+            if pair is not None:
+                pairs.append(pair)
+        return pairs
+
+    def selected_match_state(self) -> int | str | None:
+        pairs = self.selected_match_pairs()
+        if not pairs:
+            return None
+        states = {self.match_links.get(pair, 0) for pair in pairs}
+        if len(states) == 1:
+            return states.pop()
+        return "hybrid"
+
+    def update_match_cycle_button(self) -> None:
+        state = self.selected_match_state()
+        labels = {
+            None: "Match: --",
+            0: "Match: no",
+            1: "Match: match",
+            2: "Match: super",
+            "hybrid": "Match: hybrid",
+        }
+        self.match_cycle_var.set(labels[state])
+        self.match_cycle_button.configure(state="normal" if state is not None else "disabled")
+
+    def cycle_selected_match_state(self) -> None:
+        pairs = self.selected_match_pairs()
+        if not pairs:
+            self.update_match_cycle_button()
+            return
+
+        state = self.selected_match_state()
+        next_state = 1 if state in (None, 0, "hybrid") else 2 if state == 1 else 0
+        for first_uid, second_uid in pairs:
+            if next_state == 0:
+                self.remove_match(first_uid, second_uid)
+            else:
+                self.set_match(first_uid, second_uid, next_state)
+        self.refresh_table()
+        self.update_match_cycle_button()
+
     def prune_match_links(self) -> None:
         valid_uids = {row.row_uid for row in self.rows if row.row_uid is not None}
         self.match_links = {
@@ -2019,9 +2145,10 @@ class TempoWindow:
             for pair, score in self.match_links.items()
             if pair[0] in valid_uids and pair[1] in valid_uids and score in (1, 2)
         }
+        self.rebuild_match_counts()
 
     def row_id(self, row: AnalysisRow) -> str:
-        row_id = str(row.path.resolve())
+        row_id = str(row.path if row.path.is_absolute() else Path.cwd() / row.path)
         if row.part_start_seconds is not None or row.part_end_seconds is not None:
             start = 0.0 if row.part_start_seconds is None else row.part_start_seconds
             end = -1.0 if row.part_end_seconds is None else row.part_end_seconds
@@ -2386,7 +2513,76 @@ class TempoWindow:
 
         return max(0.0, min(100.0, similarity * 100.0))
 
-    def sort_key(self, row: AnalysisRow):
+    def similarity_mode(self) -> str:
+        mode = self.similarity_mode_var.get()
+        return mode if mode in SIMILARITY_MODES else SIMILARITY_BASE_BPM
+
+    def cyclic_chroma_distance_bins(self, first_bin: float, second_bin: float) -> float:
+        distance = abs((first_bin - second_bin) % CHROMA_BINS)
+        return min(distance, CHROMA_BINS - distance)
+
+    def shifted_base_distance_bins(self, row: AnalysisRow, target: AnalysisRow) -> float | None:
+        if row.base_chroma_bin is None or target.base_chroma_bin is None:
+            return None
+
+        row_tempo = self.row_tempo_for_matching(row)
+        target_tempo = self.row_tempo_for_matching(target)
+        if row_tempo is None or target_tempo is None:
+            return None
+
+        playback_rate = target_tempo / row_tempo
+        if playback_rate <= 0:
+            return None
+
+        pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
+        shifted_base = (row.base_chroma_bin + pitch_shift_bins) % CHROMA_BINS
+        return self.cyclic_chroma_distance_bins(shifted_base, target.base_chroma_bin)
+
+    def base_bpm_distance_for_targets(self, row: AnalysisRow, targets: list[AnalysisRow] | None = None) -> float | None:
+        if targets is None:
+            targets = self.current_similarity_target_rows()
+        distances = [
+            distance
+            for target in targets
+            if (distance := self.shifted_base_distance_bins(row, target)) is not None
+        ]
+        return min(distances) if distances else None
+
+    def base_bpm_is_close(self, row: AnalysisRow, targets: list[AnalysisRow] | None = None) -> bool:
+        distance = self.base_bpm_distance_for_targets(row, targets)
+        return distance is not None and distance < (CHROMA_BINS / 12)
+
+    def base_bpm_category(self, row: AnalysisRow, targets: list[AnalysisRow]) -> tuple[int, str]:
+        distance = self.base_bpm_distance_for_targets(row, targets)
+        if distance is None:
+            return 1, "unsure"
+        if distance < (CHROMA_BINS / 12):
+            return 2, "close"
+        return 0, "far"
+
+    def similarity_score_for_row(self, row: AnalysisRow) -> float | None:
+        mode = self.similarity_mode()
+        if mode == SIMILARITY_CHROMA:
+            return row.chroma_similarity
+        if mode == SIMILARITY_CHROMA_TEMPO:
+            return row.chroma_tempo_similarity
+        return row.chroma_tempo_similarity if row.chroma_tempo_similarity is not None else row.chroma_similarity
+
+    def similarity_text_for_row(self, row: AnalysisRow) -> str:
+        score = self.similarity_score_for_row(row)
+        if score is None:
+            return ""
+        if self.similarity_mode() == SIMILARITY_BASE_BPM:
+            if not self.similarity_target_ids:
+                return f"{score:.1f}"
+            targets = self.current_similarity_target_rows()
+            if not targets:
+                return f"{score:.1f}"
+            _rank, label = self.base_bpm_category(row, targets)
+            return f"{label} {score:.1f}"
+        return f"{score:.1f}"
+
+    def sort_key(self, row: AnalysisRow, similarity_targets: list[AnalysisRow] | None = None):
         missing_number = float("-inf") if self.sort_descending else float("inf")
 
         if self.sort_column == "filename":
@@ -2394,7 +2590,7 @@ class TempoWindow:
         if self.sort_column == "part":
             return (row.path.name.lower(), self.row_part_number(row))
         if self.sort_column == "matches":
-            return len(self.matches_for(row.row_uid))
+            return self.match_count_for(row.row_uid)
         if self.sort_column == "markers":
             return self.row_marker_count(row)
         if self.sort_column == "tempo":
@@ -2402,10 +2598,21 @@ class TempoWindow:
             return tempo if tempo is not None else missing_number
         if self.sort_column == "uncertainty":
             return row.uncertainty_bpm if row.uncertainty_bpm is not None else missing_number
-        if self.sort_column == "chroma_similarity":
-            return row.chroma_similarity if row.chroma_similarity is not None else missing_number
-        if self.sort_column == "chroma_tempo_similarity":
-            return row.chroma_tempo_similarity if row.chroma_tempo_similarity is not None else missing_number
+        if self.sort_column in {"similarity", "chroma_similarity", "chroma_tempo_similarity"}:
+            if self.similarity_mode() == SIMILARITY_BASE_BPM:
+                score = self.similarity_score_for_row(row)
+                if not self.similarity_target_ids:
+                    return score if score is not None else missing_number
+                targets = similarity_targets if similarity_targets is not None else self.current_similarity_target_rows()
+                if not targets:
+                    return score if score is not None else missing_number
+                rank, _label = self.base_bpm_category(row, targets)
+                return (
+                    rank,
+                    score if score is not None else missing_number,
+                )
+            score = self.similarity_score_for_row(row)
+            return score if score is not None else missing_number
         if self.sort_column == "chroma":
             return simple_chroma_peaks(row.chroma).lower()
         if self.sort_column == "artist":
@@ -2420,6 +2627,15 @@ class TempoWindow:
     def sorted_rows(self) -> list[AnalysisRow]:
         if self.sort_column is None:
             return list(self.rows)
+
+        if self.sort_column in {"similarity", "chroma_similarity", "chroma_tempo_similarity"}:
+            if self.similarity_mode() == SIMILARITY_BASE_BPM and self.similarity_target_ids:
+                targets = self.current_similarity_target_rows()
+                return sorted(
+                    self.rows,
+                    key=lambda row: self.sort_key(row, similarity_targets=targets),
+                    reverse=self.sort_descending,
+                )
 
         return sorted(self.rows, key=self.sort_key, reverse=self.sort_descending)
 
@@ -2443,8 +2659,9 @@ class TempoWindow:
         selected_ids = set(self.table.selection())
         self.clear_tables()
         self.update_row_part_numbers()
+        self.rebuild_match_counts()
 
-        for row in self.sorted_rows():
+        for row in self.filtered_sorted_rows():
             row_id = self.row_id(row)
             self.play_table.insert("", "end", iid=row_id, values=("Play",))
             tags = ("similarity_target",) if row_id in self.similarity_target_ids else ()
@@ -2454,6 +2671,35 @@ class TempoWindow:
         restored_selection = [row_id for row_id in selected_ids if row_id in existing_ids]
         if restored_selection:
             self.table.selection_set(restored_selection)
+
+    def filtered_sorted_rows(self) -> list[AnalysisRow]:
+        return [row for row in self.sorted_rows() if self.row_matches_search(row)]
+
+    def row_matches_search(self, row: AnalysisRow) -> bool:
+        query = self.search_text_var.get().strip().casefold()
+        if not query:
+            return True
+
+        field = self.search_field_var.get()
+        values = self.row_search_values(row)
+        if field not in values:
+            return any(query in value.casefold() for value in values.values())
+        return query in values[field].casefold()
+
+    def row_search_values(self, row: AnalysisRow) -> dict[str, str]:
+        effective_tempo = self.row_tempo_for_matching(row)
+        return {
+            "Filename": f"{row.path.name} {row.path}",
+            "Artist": row.artist,
+            "Title": row.title,
+            "Album": row.album,
+            "Tempo": "" if effective_tempo is None else f"{effective_tempo:.2f}",
+            "Similarity": self.similarity_text_for_row(row),
+            "Chroma": simple_chroma_peaks(row.chroma),
+            "Marks": self.row_marker_summary(row),
+            "Matches": str(self.match_count_for(row.row_uid)) if row.row_uid is not None else "",
+            "Part": str(self.row_part_number(row)),
+        }
 
     def clear_tables(self) -> None:
         for table in (self.play_table, self.table):
@@ -2470,10 +2716,7 @@ class TempoWindow:
             tempo_text = f"{effective_tempo:.2f}"
 
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
-        chroma_similarity_text = "" if row.chroma_similarity is None else f"{row.chroma_similarity:.1f}"
-        chroma_tempo_similarity_text = (
-            "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.1f}"
-        )
+        similarity_text = self.similarity_text_for_row(row)
         chroma_text = simple_chroma_peaks(row.chroma)
 
         if row.error and row.bpm is None and row.chroma is None:
@@ -2482,12 +2725,11 @@ class TempoWindow:
         return (
             self.row_display_name(row),
             str(self.row_part_number(row)),
-            str(len(self.matches_for(row.row_uid))) if row.row_uid is not None else "",
+            str(self.match_count_for(row.row_uid)) if row.row_uid is not None else "",
             self.row_marker_summary(row),
             tempo_text,
             uncertainty_text,
-            chroma_similarity_text,
-            chroma_tempo_similarity_text,
+            similarity_text,
             chroma_text,
             row.artist,
             row.title,
@@ -2534,7 +2776,7 @@ class TempoWindow:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.split_button.configure(state="normal" if self.table.selection() else "disabled")
-        self.chromagram_button.configure(state="normal" if self.table.selection() else "disabled")
+        self.update_match_cycle_button()
         self.update_selected_detected_tempo()
         self.update_waveform_selection()
         self.update_selected_edit_fields()
@@ -2608,6 +2850,18 @@ class TempoWindow:
 
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
+
+    def select_waveform_row(self, slot: WaveformSlot, add: bool = False) -> None:
+        if not add:
+            self.table.selection_set(slot.row_id)
+        else:
+            self.table.selection_add(slot.row_id)
+        self.table.see(slot.row_id)
+        self.handle_table_selection()
+
+    def select_waveform_row_from_event(self, slot: WaveformSlot, event: tk.Event) -> str:
+        self.select_waveform_row(slot, add=bool(event.state & 0x0004) or self.ctrl_pressed)
+        return "break"
 
     def update_selected_detected_tempo(self) -> None:
         selected_ids = list(self.table.selection())
@@ -2704,19 +2958,26 @@ class TempoWindow:
 
             controls = ttk.Frame(frame)
             controls.pack(side="left", padx=(0, 8))
+            top_controls = ttk.Frame(controls)
+            top_controls.pack(anchor="w")
+            bottom_controls = ttk.Frame(controls)
+            bottom_controls.pack(anchor="w", pady=(2, 0))
 
             slot.button = ttk.Button(
-                controls,
+                top_controls,
                 text="Pause" if slot.is_playing else "Play",
                 width=7,
                 command=lambda slot=slot: self.toggle_waveform_playback(slot),
             )
             slot.button.pack(side="left")
             slot.button.bind("<Button-3>", lambda event, slot=slot: self.start_waveform_stinger_from_event(slot))
-            ttk.Button(controls, text="< Beat", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, -1)).pack(side="left", padx=(4, 0))
-            ttk.Button(controls, text="Beat >", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, 1)).pack(side="left", padx=(4, 0))
+            select_button = ttk.Button(top_controls, text="Select", width=7)
+            select_button.pack(side="left", padx=(4, 0))
+            select_button.bind("<Button-1>", lambda event, slot=slot: self.select_waveform_row_from_event(slot, event))
+            ttk.Button(top_controls, text="< Beat", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, -1)).pack(side="left", padx=(4, 0))
+            ttk.Button(top_controls, text="Beat >", width=7, command=lambda slot=slot: self.seek_waveform_by_beats(slot, 1)).pack(side="left", padx=(4, 0))
             slot.tempo_multiplier_var = tk.DoubleVar(value=slot.tempo_multiplier)
-            speed_frame = ttk.Frame(controls)
+            speed_frame = ttk.Frame(top_controls)
             speed_frame.pack(side="left", padx=(4, 0))
             slot.tempo_multiplier_label = ttk.Label(speed_frame, text=f"x{slot.tempo_multiplier:.2f}", width=5)
             slot.tempo_multiplier_label.pack(side="left")
@@ -2731,9 +2992,21 @@ class TempoWindow:
             )
             tempo_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_tempo_multiplier(slot))
             tempo_scale.pack(side="left")
+            ttk.Button(
+                top_controls,
+                text="Beat",
+                width=6,
+                command=lambda slot=slot: self.set_slot_downbeat(slot),
+            ).pack(side="left", padx=(4, 0))
+            ttk.Button(
+                top_controls,
+                text="Fit BPM",
+                width=7,
+                command=lambda slot=slot: self.fit_slot_bpm_from_user_beats(slot),
+            ).pack(side="left", padx=(4, 0))
             slot.volume_var = tk.DoubleVar(value=slot.volume)
-            volume_frame = ttk.Frame(controls)
-            volume_frame.pack(side="left", padx=(4, 0))
+            volume_frame = ttk.Frame(bottom_controls)
+            volume_frame.pack(side="left")
             slot.volume_label = ttk.Label(volume_frame, text=f"{slot.volume:.0%}", width=5)
             slot.volume_label.pack(side="left")
             volume_scale = ttk.Scale(
@@ -2749,48 +3022,36 @@ class TempoWindow:
             volume_scale.pack(side="left")
             slot.original_tempo_var = tk.BooleanVar(value=slot.use_original_tempo)
             ttk.Checkbutton(
-                controls,
+                bottom_controls,
                 text="Orig",
                 variable=slot.original_tempo_var,
                 command=lambda slot=slot: self.set_waveform_original_tempo(slot),
             ).pack(side="left", padx=(4, 0))
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
-                controls,
+                bottom_controls,
                 text="Keep",
                 variable=slot.keep_var,
                 command=lambda slot=slot: self.set_waveform_keep(slot),
             ).pack(side="left", padx=(4, 0))
             slot.loop_var = tk.BooleanVar(value=slot.loop)
             ttk.Checkbutton(
-                controls,
+                bottom_controls,
                 text="Loop",
                 variable=slot.loop_var,
                 command=lambda slot=slot: self.set_waveform_loop(slot),
             ).pack(side="left", padx=(4, 0))
             ttk.Button(
-                controls,
-                text="Beat",
-                width=6,
-                command=lambda slot=slot: self.set_slot_downbeat(slot),
-            ).pack(side="left", padx=(4, 0))
-            ttk.Button(
-                controls,
+                bottom_controls,
                 text="Cue",
                 width=5,
                 command=lambda slot=slot: self.set_slot_cue_point(slot),
             ).pack(side="left", padx=(4, 0))
             ttk.Button(
-                controls,
+                bottom_controls,
                 text="Loop",
                 width=5,
                 command=lambda slot=slot: self.set_slot_loop_point(slot),
-            ).pack(side="left", padx=(4, 0))
-            ttk.Button(
-                controls,
-                text="Fit BPM",
-                width=7,
-                command=lambda slot=slot: self.fit_slot_bpm_from_user_beats(slot),
             ).pack(side="left", padx=(4, 0))
 
             chroma_canvas = tk.Canvas(
@@ -4164,13 +4425,24 @@ class TempoWindow:
         self.is_analyzing = False
         analyzed_count = len(self.rows)
         issue_count = sum(1 for row in self.rows if row.error)
-        self.export_button.configure(state="normal" if self.rows else "disabled")
-        self.export_json_button.configure(state="normal" if self.rows else "disabled")
+        self.set_export_state("normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
-        self.pairs_button.configure(state="normal" if self.rows else "disabled")
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.result.configure(text=f"Finished {analyzed_count} files ({issue_count} with issues)")
+
+    def export_selected_mode(self) -> None:
+        mode = self.export_mode_var.get()
+        actions = {
+            EXPORT_CSV: self.export_csv,
+            EXPORT_JSON: self.export_json,
+            EXPORT_CHROMAGRAM: self.export_selected_chromagram,
+            EXPORT_MAP: self.export_html_map,
+            EXPORT_GRAPH_SVG: self.export_graph_svg,
+            EXPORT_GRAPHVIZ: self.export_graphviz,
+            EXPORT_CLOSEST_PAIRS: self.export_closest_pairs,
+        }
+        actions.get(mode, self.export_csv)()
 
     def export_csv(self) -> None:
         if not self.rows:
@@ -4412,6 +4684,374 @@ class TempoWindow:
                 messagebox.showerror("Chromatch", f"Could not export chromagram:\n{exc}")
             return False
         return True
+
+    def dot_quote(self, value: object) -> str:
+        return json.dumps(str(value), ensure_ascii=False)
+
+    def xml_text(self, value: object) -> str:
+        text = str(value)
+        return "".join(
+            character
+            if character in "\t\n\r" or 0x20 <= ord(character) <= 0xD7FF or 0xE000 <= ord(character) <= 0xFFFD
+            else " "
+            for character in text
+        )
+
+    def svg_text(self, value: object) -> str:
+        return html.escape(self.xml_text(value), quote=False)
+
+    def graphviz_node_id(self, row: AnalysisRow, index: int) -> str:
+        return f"row_{row.row_uid}" if row.row_uid is not None else f"row_index_{index}"
+
+    def graphviz_label_for_row(self, row: AnalysisRow) -> str:
+        title = " - ".join(part for part in (row.artist, row.title) if part).strip()
+        if not title:
+            title = self.row_display_name(row)
+        tempo = self.row_tempo_for_matching(row)
+        details = []
+        if tempo is not None:
+            details.append(f"{tempo:.2f} BPM")
+        if row.base_chroma_bin is not None:
+            details.append(f"base {row.base_chroma_bin}")
+        return title if not details else f"{title}\\n{', '.join(details)}"
+
+    def graphviz_text_for_rows(self, rows: list[AnalysisRow]) -> str:
+        row_indexes = {id(row): index for index, row in enumerate(rows)}
+        uid_to_node = {
+            row.row_uid: self.graphviz_node_id(row, row_indexes[id(row)])
+            for row in rows
+            if row.row_uid is not None
+        }
+        lines = [
+            "graph chromatch {",
+            "  graph [overlap=false, splines=true];",
+            "  node [shape=box, style=rounded, fontname=\"Segoe UI\"];",
+            "  edge [fontname=\"Segoe UI\"];",
+        ]
+        for row in rows:
+            node_id = self.graphviz_node_id(row, row_indexes[id(row)])
+            lines.append(f"  {node_id} [label={self.dot_quote(self.graphviz_label_for_row(row))}];")
+
+        for (first_uid, second_uid), score in sorted(self.match_links.items()):
+            first_node = uid_to_node.get(first_uid)
+            second_node = uid_to_node.get(second_uid)
+            if first_node is None or second_node is None:
+                continue
+            attributes = 'label="match"'
+            if score == 2:
+                attributes = 'label="super", color="#b00020", penwidth=2'
+            lines.append(f"  {first_node} -- {second_node} [{attributes}];")
+
+        lines.append("}")
+        return "\n".join(lines) + "\n"
+
+    def export_graphviz(self) -> None:
+        rows = self.filtered_sorted_rows()
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows to export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".dot",
+            filetypes=(("Graphviz DOT files", "*.dot"), ("All files", "*.*")),
+            initialfile="chromatch-graph.dot",
+        )
+        if not filename:
+            return
+
+        try:
+            Path(filename).write_text(self.graphviz_text_for_rows(rows), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export Graphviz graph:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported Graphviz graph: {Path(filename).name}")
+
+    def graph_svg_label_lines_for_row(self, row: AnalysisRow) -> list[str]:
+        lines = []
+        if row.artist:
+            lines.append(row.artist)
+        if row.title:
+            lines.append(row.title)
+        if not lines:
+            lines.append(self.row_display_name(row))
+        return lines[:2]
+
+    def graph_svg_text_for_rows(self, rows: list[AnalysisRow]) -> str:
+        if not rows:
+            return '<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" viewBox="0 0 0 0"></svg>\n'
+
+        cell_width = 210
+        cell_height = 112
+        margin = 70
+        node_width = 150
+        node_height = 46
+        positions: dict[int, tuple[float, float]] = {}
+        ordered_rows = sorted(
+            rows,
+            key=lambda item: (
+                self.row_tempo_for_matching(item) is None,
+                self.row_tempo_for_matching(item) or 0.0,
+                self.map_base_bin_for_row(item) is None,
+                self.map_base_bin_for_row(item) or 0.0,
+                self.row_display_name(item).lower(),
+            ),
+        )
+
+        connections: dict[int, set[int]] = {}
+        for (first_uid, second_uid), score in self.match_links.items():
+            if score not in (1, 2):
+                continue
+            connections.setdefault(first_uid, set()).add(second_uid)
+            connections.setdefault(second_uid, set()).add(first_uid)
+
+        placed_rows: list[AnalysisRow] = []
+        placed_uids: set[int] = set()
+        pending = list(ordered_rows)
+        while pending:
+            seed = max(
+                pending,
+                key=lambda row: (
+                    len(connections.get(row.row_uid or -1, set())),
+                    self.row_display_name(row).lower(),
+                ),
+            )
+            component = [seed]
+            pending.remove(seed)
+            if seed.row_uid is not None:
+                placed_uids.add(seed.row_uid)
+            index = 0
+            while index < len(component):
+                current = component[index]
+                neighbor_uids = connections.get(current.row_uid or -1, set())
+                neighbors = [
+                    row
+                    for row in pending
+                    if row.row_uid is not None and row.row_uid in neighbor_uids
+                ]
+                neighbors.sort(
+                    key=lambda row: (
+                        -len(connections.get(row.row_uid or -1, set())),
+                        self.row_tempo_for_matching(row) or 0.0,
+                        self.row_display_name(row).lower(),
+                    )
+                )
+                for neighbor in neighbors:
+                    pending.remove(neighbor)
+                    component.append(neighbor)
+                    placed_uids.add(neighbor.row_uid)
+                index += 1
+            placed_rows.extend(component)
+
+        columns = max(1, round(math.sqrt(len(placed_rows))))
+        row_count = math.ceil(len(placed_rows) / columns)
+        width = margin * 2 + columns * cell_width
+        height = margin * 2 + row_count * cell_height
+        layout_indexes = {id(row): index for index, row in enumerate(placed_rows)}
+
+        for row in placed_rows:
+            index = layout_indexes[id(row)]
+            column = index % columns
+            line = index // columns
+            stagger = cell_width * 0.24 if line % 2 and columns > 1 else 0.0
+            x = margin + column * cell_width + cell_width / 2 + stagger
+            if x > width - margin:
+                x -= cell_width * 0.48
+            y = margin + line * cell_height + cell_height / 2
+            if row.row_uid is not None:
+                positions[row.row_uid] = (x, y)
+
+        edge_elements = []
+        for (first_uid, second_uid), score in sorted(self.match_links.items()):
+            first = positions.get(first_uid)
+            second = positions.get(second_uid)
+            if first is None or second is None:
+                continue
+            color = "#b00020" if score == 2 else "#111111"
+            stroke_width = 2.5 if score == 2 else 1.4
+            edge_elements.append(
+                f'<line x1="{first[0]:.1f}" y1="{first[1]:.1f}" '
+                f'x2="{second[0]:.1f}" y2="{second[1]:.1f}" '
+                f'stroke="{color}" stroke-width="{stroke_width:.1f}" opacity="0.72" />'
+            )
+
+        node_elements = []
+        for row in placed_rows:
+            if row.row_uid is not None:
+                x, y = positions[row.row_uid]
+            else:
+                index = layout_indexes[id(row)]
+                line = index // columns
+                stagger = cell_width * 0.24 if line % 2 and columns > 1 else 0.0
+                x = margin + (index % columns) * cell_width + cell_width / 2 + stagger
+                if x > width - margin:
+                    x -= cell_width * 0.48
+                y = margin + (index // columns) * cell_height + cell_height / 2
+            lines = self.graph_svg_label_lines_for_row(row)
+            tspans = []
+            first_y = y - 6 if len(lines) > 1 else y + 4
+            for line_index, line in enumerate(lines):
+                dy = 0 if line_index == 0 else 15
+                tspans.append(
+                    f'<tspan x="{x:.1f}" y="{first_y + dy:.1f}">{self.svg_text(line)}</tspan>'
+                )
+            node_elements.append(
+                f'<g class="node"><rect x="{x - node_width / 2:.1f}" y="{y - node_height / 2:.1f}" '
+                f'width="{node_width}" height="{node_height}" rx="4" />'
+                f'<text x="{x:.1f}" text-anchor="middle">{"".join(tspans)}</text></g>'
+            )
+
+        return f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">
+<style>
+.node rect {{ fill: #ffffff; stroke: #333333; stroke-width: 1; }}
+.node text {{ font-family: Segoe UI, Arial, sans-serif; font-size: 12px; fill: #111111; }}
+</style>
+<rect width="100%" height="100%" fill="#ffffff" />
+{''.join(edge_elements)}
+{''.join(node_elements)}
+</svg>
+"""
+
+    def export_graph_svg(self) -> None:
+        rows = self.filtered_sorted_rows()
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows to export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".svg",
+            filetypes=(("SVG files", "*.svg"), ("All files", "*.*")),
+            initialfile="chromatch-graph.svg",
+        )
+        if not filename:
+            return
+
+        try:
+            Path(filename).write_text(self.graph_svg_text_for_rows(rows), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export SVG graph:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported SVG graph: {Path(filename).name}")
+
+    def map_base_bin_for_row(self, row: AnalysisRow) -> float | None:
+        if row.base_chroma_bin is not None:
+            return float(row.base_chroma_bin % CHROMA_BINS)
+        if row.chroma is not None:
+            return float(np.argmax(row.chroma.histogram))
+        return None
+
+    def map_base_bpm_bin_for_row(self, row: AnalysisRow) -> float | None:
+        base_bin = self.map_base_bin_for_row(row)
+        tempo = self.row_tempo_for_matching(row)
+        if base_bin is None or tempo is None or tempo <= 0:
+            return None
+        return (base_bin - CHROMA_BINS * math.log2(tempo)) % CHROMA_BINS
+
+    def html_map_text_for_rows(self, rows: list[AnalysisRow]) -> str:
+        points = [
+            (row, tempo, base_bin, base_bpm_bin)
+            for row in rows
+            if (tempo := self.row_tempo_for_matching(row)) is not None
+            and (base_bin := self.map_base_bin_for_row(row)) is not None
+            and (base_bpm_bin := self.map_base_bpm_bin_for_row(row)) is not None
+        ]
+        width = 14400
+        height = 1600
+        margin = 110
+        tempos = [tempo for _row, tempo, _base_bin, _base_bpm_bin in points]
+        min_tempo = min(tempos) if tempos else 0.0
+        max_tempo = max(tempos) if tempos else 1.0
+        tempo_span = max(1.0, max_tempo - min_tempo)
+        tick_start = math.floor(min_tempo / 10.0) * 10
+        tick_end = math.ceil(max_tempo / 10.0) * 10
+        tick_elements = []
+        tick = tick_start
+        while tick <= tick_end:
+            if min_tempo <= tick <= max_tempo or tick in (tick_start, tick_end):
+                x = margin + ((tick - min_tempo) / tempo_span) * (width - margin * 2)
+                x = max(margin, min(width - margin, x))
+                tick_elements.append(
+                    f'<line class="tick" x1="{x:.1f}" y1="{height - margin}" x2="{x:.1f}" y2="{height - margin + 8}" />'
+                    f'<text class="tick-label" x="{x:.1f}" y="{height - margin + 28}" text-anchor="middle">{tick:.0f}</text>'
+                )
+            tick += 10
+
+        point_elements = []
+        for row, tempo, base_bin, base_bpm_bin in points:
+            x = margin + ((tempo - min_tempo) / tempo_span) * (width - margin * 2)
+            y = height - margin - (base_bpm_bin / CHROMA_BINS) * (height - margin * 2)
+            label_lines = [part for part in (row.artist, row.title) if part]
+            if not label_lines:
+                label_lines = [self.row_display_name(row)]
+            label = " - ".join(label_lines)
+            title = f"{label} | {tempo:.2f} BPM | base {base_bin:.1f} | Base/BPM {base_bpm_bin:.1f}"
+            tspans = []
+            for line_index, line in enumerate(label_lines[:2]):
+                tspans.append(
+                    f'<tspan x="{x + 6:.1f}" y="{y - 8 + line_index * 13:.1f}">{self.svg_text(line)}</tspan>'
+                )
+            point_elements.append(
+                f'<g class="track"><title>{self.svg_text(title)}</title>'
+                f'<circle cx="{x:.1f}" cy="{y:.1f}" r="4" />'
+                f'<text>{"".join(tspans)}</text></g>'
+            )
+
+        return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Chromatch tempo/base map</title>
+<style>
+body {{ font-family: Segoe UI, Arial, sans-serif; margin: 24px; background: #f7f4ef; color: #1f1f1f; }}
+svg {{ background: #fff; border: 1px solid #c9c1b8; }}
+.track circle {{ fill: #2f6f8f; opacity: 0.78; }}
+.track text {{ font-size: 11px; fill: #333; }}
+.axis {{ stroke: #777; stroke-width: 1; }}
+.tick {{ stroke: #999; stroke-width: 1; }}
+.tick-label {{ font-size: 12px; fill: #444; }}
+.axis-label {{ font-size: 14px; font-weight: 600; fill: #222; }}
+</style>
+</head>
+<body>
+<h1>Chromatch tempo/base map</h1>
+<p>{len(points)} tracks with tempo and base data. Horizontal axis: tempo. Vertical axis: Base/BPM.</p>
+<svg viewBox="0 0 {width} {height}" width="{width}" height="{height}" role="img">
+<line class="axis" x1="{margin}" y1="{height - margin}" x2="{width - margin}" y2="{height - margin}" />
+<line class="axis" x1="{margin}" y1="{margin}" x2="{margin}" y2="{height - margin}" />
+{''.join(tick_elements)}
+<text x="{margin}" y="{height - 20}">{min_tempo:.1f} BPM</text>
+<text x="{width - margin - 80}" y="{height - 20}">{max_tempo:.1f} BPM</text>
+<text class="axis-label" x="{width / 2:.1f}" y="{height - 36}" text-anchor="middle">Tempo (BPM)</text>
+<text class="axis-label" x="30" y="{height / 2:.1f}" transform="rotate(-90 30 {height / 2:.1f})" text-anchor="middle">Base/BPM</text>
+{''.join(point_elements)}
+</svg>
+</body>
+</html>
+"""
+
+    def export_html_map(self) -> None:
+        rows = self.filtered_sorted_rows()
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows to export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".html",
+            filetypes=(("HTML files", "*.html"), ("All files", "*.*")),
+            initialfile="chromatch-map.html",
+        )
+        if not filename:
+            return
+
+        try:
+            Path(filename).write_text(self.html_map_text_for_rows(rows), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export HTML map:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported HTML map: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
         candidates = [

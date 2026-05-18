@@ -4,12 +4,6 @@ to review :
 next tasks :
 
 then :
-- "search" field (filters results that contain text in any field or in specified filed (dropdown selection of all/what field))
-- make the interface more compact
-- have a "base/bpm sim" column in addition to the "chroma/bpm sim" and/or a combined one (close base filter, then chroma)
-- interface to manually define matches (how?)
-- handle case where tempo is tapped over a modified (because of pitch change) tempo (I should explain this better)
-- integrate features from the old tool into the new one (read list first)
 
 tasks for later :
 - automix
@@ -37,3 +31,11 @@ tasks for later :
 - auto beat detection could still be better, maybe refine this kind of detection on proven files
 - zoomed waveform resolution could be even better probably
 - sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
+- activating beat sync could immediatly resync everything even already playing
+- tempo gap filter like with the old tool
+- somehow it seems event the beats taken from the traktor markers appear slightly shifted (eg investigate phase.portrait.mp3)
+- handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
+- have a "show matches only" filter
+- option to export only selected tracks
+- make graphviz graph better
+- use the "base/bpm + chroma" mode for "closest pairs" export

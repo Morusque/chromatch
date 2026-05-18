@@ -1,5 +1,7 @@
 import unittest
 import tempfile
+import xml.etree.ElementTree as ET
+import re
 from pathlib import Path
 
 import numpy as np
@@ -196,6 +198,21 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(120.0, slot.row.tapped_bpm)
         self.assertEqual("120.00", self.app.target_tempo_var.get())
 
+    def test_tapping_slowed_track_stores_original_tempo(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, tempo_multiplier=0.5)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.tapped_tempo_var.set("60")
+
+        self.app.apply_tapped_tempo()
+
+        self.assertEqual(120.0, slot.row.tapped_bpm)
+        self.assertEqual("120.00", self.app.target_tempo_var.get())
+
     def test_applied_tapped_tempo_keeps_unloaded_rows_unmodified_by_slot_speed(self):
         loaded = self.make_row("loaded.wav", bpm=100.0)
         selected = self.make_row("selected.wav", bpm=100.0)
@@ -237,6 +254,50 @@ class ChromatchRegressionTests(unittest.TestCase):
         similarity = self.app.calculate_pair_chroma_tempo_similarity(first, second)
         self.assertLess(similarity, 1.0)
 
+    def test_table_uses_single_similarity_column(self):
+        columns = tuple(self.app.table.cget("columns"))
+
+        self.assertIn("similarity", columns)
+        self.assertNotIn("chroma_similarity", columns)
+        self.assertNotIn("chroma_tempo_similarity", columns)
+
+    def test_base_bpm_similarity_mode_groups_close_base_first(self):
+        target = chromatch.replace(self.make_chroma_row("target.wav", 120, 0), row_uid=1, base_chroma_bin=100)
+        close = chromatch.replace(self.make_chroma_row("close.wav", 120, 0), row_uid=2, base_chroma_bin=110)
+        unsure = chromatch.replace(self.make_chroma_row("unsure.wav", 120, 0), row_uid=4, base_chroma_bin=None)
+        far = chromatch.replace(self.make_chroma_row("far.wav", 120, 0), row_uid=3, base_chroma_bin=140)
+        self.app.rows = [target, close, unsure, far]
+        self.app.similarity_target_ids = {self.app.row_id(target)}
+        self.app.update_similarity_scores([target])
+        close = self.app.rows[1]
+        unsure = self.app.rows[2]
+        far = self.app.rows[3]
+        self.app.similarity_mode_var.set(chromatch.SIMILARITY_BASE_BPM)
+        self.app.sort_column = "similarity"
+        self.app.sort_descending = True
+
+        self.assertTrue(self.app.base_bpm_is_close(close))
+        self.assertFalse(self.app.base_bpm_is_close(far))
+        self.assertGreater(self.app.sort_key(close), self.app.sort_key(unsure))
+        self.assertGreater(self.app.sort_key(unsure), self.app.sort_key(far))
+        self.assertTrue(self.app.similarity_text_for_row(close).startswith("close "))
+        self.assertTrue(self.app.similarity_text_for_row(unsure).startswith("unsure "))
+        self.assertTrue(self.app.similarity_text_for_row(far).startswith("far "))
+
+    def test_base_bpm_similarity_mode_does_not_scan_targets_when_none_are_active(self):
+        row = chromatch.replace(
+            self.make_row("track.wav"),
+            chroma_similarity=42.0,
+            chroma_tempo_similarity=55.0,
+            base_chroma_bin=100,
+        )
+        self.app.rows = [row]
+        self.app.similarity_target_ids = set()
+        self.app.similarity_mode_var.set(chromatch.SIMILARITY_BASE_BPM)
+        self.app.current_similarity_target_rows = lambda: self.fail("target rows should not be scanned")
+
+        self.assertEqual("55.0", self.app.similarity_text_for_row(row))
+
     def test_flat_chroma_profile_does_not_match_everything(self):
         target = np.zeros(chromatch.CHROMA_BINS, dtype=np.float32)
         target[0] = 1.0
@@ -262,6 +323,30 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("1", values[2])
         self.assertEqual("B2 C1 L1", values[3])
+
+    def test_search_filter_matches_any_field_and_keeps_play_table_in_sync(self):
+        first = chromatch.replace(self.make_row("first.wav"), artist="Alice", title="Quiet track")
+        second = chromatch.replace(self.make_row("second.wav"), artist="Bob", title="Needle song")
+        self.app.rows = [first, second]
+        self.app.search_text_var.set("needle")
+        self.app.search_field_var.set("All")
+
+        self.app.refresh_table()
+
+        visible_ids = self.app.table.get_children()
+        self.assertEqual((self.app.row_id(second),), visible_ids)
+        self.assertEqual(visible_ids, self.app.play_table.get_children())
+
+    def test_search_filter_can_target_specific_field(self):
+        first = chromatch.replace(self.make_row("first.wav"), artist="Needle", title="Quiet track")
+        second = chromatch.replace(self.make_row("second.wav"), artist="Bob", title="Needle song")
+        self.app.rows = [first, second]
+        self.app.search_text_var.set("needle")
+        self.app.search_field_var.set("Title")
+
+        self.app.refresh_table()
+
+        self.assertEqual((self.app.row_id(second),), self.app.table.get_children())
 
     def test_evolving_chromagram_renderer_exports_image(self):
         sample_rate = 8_000
@@ -404,7 +489,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("", values[3])
         self.assertEqual("123.03 (A)", values[4])
         self.assertNotIn("BPM", values[4])
-        self.assertEqual(3, len(values[8].split()))
+        self.assertEqual(3, len(values[7].split()))
 
     def test_part_rows_have_range_ids_and_part_numbers(self):
         row = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
@@ -650,6 +735,8 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual({(10, 20): 1}, self.app.match_links)
         self.assertEqual([(20, 1)], self.app.matches_for(10))
+        self.assertEqual(1, self.app.match_count_for(10))
+        self.assertEqual(1, self.app.match_count_for(20))
 
     def test_json_roundtrip_preserves_rows_cues_and_matches(self):
         first = chromatch.replace(
@@ -671,6 +758,216 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual([10, 20], [row.row_uid for row in self.app.rows])
         self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), self.app.rows[0].cue_points)
         self.assertEqual({(10, 20): 2}, self.app.match_links)
+
+    def test_graphviz_export_text_contains_rows_and_matches(self):
+        first = chromatch.replace(
+            self.make_row("first.wav", bpm=120.0),
+            row_uid=10,
+            artist="Alice",
+            title="One",
+            base_chroma_bin=40,
+        )
+        second = chromatch.replace(
+            self.make_row("second.wav", bpm=121.0),
+            row_uid=20,
+            artist="Bob",
+            title="Two",
+            base_chroma_bin=43,
+        )
+        self.app.rows = [first, second]
+        self.app.set_match(10, 20, 2)
+
+        contents = self.app.graphviz_text_for_rows([first, second])
+
+        self.assertIn("graph chromatch", contents)
+        self.assertIn("Alice - One", contents)
+        self.assertIn("row_10 -- row_20", contents)
+        self.assertIn('label="super"', contents)
+
+    def test_graph_svg_export_text_contains_simple_nodes_and_unlabeled_edges(self):
+        first = chromatch.replace(
+            self.make_row("first.wav", bpm=120.0),
+            row_uid=10,
+            artist="Alice",
+            title="One",
+            base_chroma_bin=40,
+        )
+        second = chromatch.replace(
+            self.make_row("second.wav", bpm=121.0),
+            row_uid=20,
+            artist="Bob",
+            title="Two",
+            base_chroma_bin=43,
+        )
+        self.app.rows = [first, second]
+        self.app.set_match(10, 20, 1)
+
+        contents = self.app.graph_svg_text_for_rows([first, second])
+
+        ET.fromstring(contents)
+        self.assertIn("<svg", contents)
+        self.assertIn(">Alice<", contents)
+        self.assertIn(">One<", contents)
+        self.assertIn('stroke="#111111"', contents)
+        self.assertNotIn(">match<", contents)
+        self.assertNotIn(">super<", contents)
+
+    def test_graph_svg_export_uses_red_for_super_matches(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        self.app.set_match(10, 20, 2)
+
+        contents = self.app.graph_svg_text_for_rows([first, second])
+
+        ET.fromstring(contents)
+        self.assertIn('stroke="#b00020"', contents)
+
+    def test_graph_svg_export_places_connected_nodes_near_each_other(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10, title="First")
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20, title="Second")
+        third = chromatch.replace(self.make_row("third.wav", bpm=122.0), row_uid=30, title="Third")
+        self.app.set_match(10, 30, 1)
+
+        contents = self.app.graph_svg_text_for_rows([first, second, third])
+
+        y_by_label = {
+            label: float(y)
+            for y, label in re.findall(r'<tspan x="[^"]+" y="([^"]+)">([^<]+)</tspan>', contents)
+        }
+        self.assertEqual(y_by_label["First"], y_by_label["Third"])
+        self.assertNotEqual(y_by_label["First"], y_by_label["Second"])
+
+    def test_graph_svg_export_removes_invalid_xml_characters(self):
+        row = chromatch.replace(
+            self.make_row("bad.wav", bpm=120.0),
+            row_uid=10,
+            artist="Bad\x01Artist",
+            title="Title & More",
+        )
+
+        contents = self.app.graph_svg_text_for_rows([row])
+
+        ET.fromstring(contents)
+        self.assertIn("Bad Artist", contents)
+        self.assertIn("Title &amp; More", contents)
+
+    def test_html_map_export_text_contains_wide_svg_points_and_split_labels(self):
+        row = chromatch.replace(
+            self.make_chroma_row("track.wav", 120.0, 80),
+            artist="Alice",
+            title="Map Track",
+            base_chroma_bin=42,
+        )
+
+        contents = self.app.html_map_text_for_rows([row])
+
+        self.assertIn("<svg", contents)
+        self.assertIn('width="14400"', contents)
+        self.assertIn("Tempo (BPM)", contents)
+        self.assertIn("Base/BPM", contents)
+        self.assertIn(">Alice<", contents)
+        self.assertIn(">Map Track<", contents)
+        self.assertIn("120.00 BPM", contents)
+
+    def test_html_map_base_bpm_position_matches_after_pitching_to_same_tempo(self):
+        first = chromatch.replace(self.make_chroma_row("first.wav", 120.0, 80), base_chroma_bin=100)
+        shifted_tempo = 120.0 * (2 ** (1 / 12))
+        second = chromatch.replace(self.make_chroma_row("second.wav", shifted_tempo, 90), base_chroma_bin=120)
+
+        self.assertAlmostEqual(
+            self.app.map_base_bpm_bin_for_row(first),
+            self.app.map_base_bpm_bin_for_row(second),
+            places=6,
+        )
+
+    def test_html_map_export_includes_regular_bpm_ticks(self):
+        first = chromatch.replace(self.make_chroma_row("first.wav", 95.0, 80), base_chroma_bin=42)
+        second = chromatch.replace(self.make_chroma_row("second.wav", 126.0, 90), base_chroma_bin=52)
+
+        contents = self.app.html_map_text_for_rows([first, second])
+
+        self.assertIn(">100<", contents)
+        self.assertIn(">110<", contents)
+        self.assertIn(">120<", contents)
+
+    def test_export_selected_mode_dispatches_dropdown_choice(self):
+        called = []
+        self.app.export_mode_var.set(chromatch.EXPORT_GRAPH_SVG)
+        self.app.export_graph_svg = lambda: called.append("svg")
+
+        self.app.export_selected_mode()
+
+        self.assertEqual(["svg"], called)
+
+    def test_match_cycle_button_cycles_selected_pairs(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        self.app.table.selection_set((self.app.row_id(first), self.app.row_id(second)))
+
+        self.assertEqual(0, self.app.selected_match_state())
+        self.app.cycle_selected_match_state()
+        self.assertEqual({(10, 20): 1}, self.app.match_links)
+        self.assertEqual(1, self.app.selected_match_state())
+        self.app.cycle_selected_match_state()
+        self.assertEqual({(10, 20): 2}, self.app.match_links)
+        self.app.cycle_selected_match_state()
+        self.assertEqual({}, self.app.match_links)
+
+    def test_match_cycle_button_reports_hybrid_selection(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav", bpm=122.0), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.set_match(10, 20, 1)
+        self.app.set_match(10, 30, 2)
+        self.app.refresh_table()
+        self.app.table.selection_set(
+            (self.app.row_id(first), self.app.row_id(second), self.app.row_id(third))
+        )
+
+        self.assertEqual("hybrid", self.app.selected_match_state())
+        self.app.update_match_cycle_button()
+        self.assertEqual("Match: hybrid", self.app.match_cycle_var.get())
+
+    def test_select_waveform_row_adds_or_replaces_table_selection(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        first_slot = chromatch.WaveformSlot(row_id=self.app.row_id(first), row=first, kept=True)
+        second_slot = chromatch.WaveformSlot(row_id=self.app.row_id(second), row=second, kept=True)
+        self.app.waveform_slots = [first_slot, second_slot]
+
+        self.app.select_waveform_row(first_slot, add=False)
+        self.assertEqual((self.app.row_id(first),), self.app.table.selection())
+        self.app.select_waveform_row(second_slot, add=True)
+        self.assertEqual(
+            {self.app.row_id(first), self.app.row_id(second)},
+            set(self.app.table.selection()),
+        )
+
+    def test_ctrl_select_waveform_row_adds_to_table_selection(self):
+        class Event:
+            state = 0x0004
+
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        first_slot = chromatch.WaveformSlot(row_id=self.app.row_id(first), row=first, kept=True)
+        second_slot = chromatch.WaveformSlot(row_id=self.app.row_id(second), row=second, kept=True)
+        self.app.waveform_slots = [first_slot, second_slot]
+
+        self.app.select_waveform_row(first_slot, add=False)
+        result = self.app.select_waveform_row_from_event(second_slot, Event())
+
+        self.assertEqual("break", result)
+        self.assertEqual(
+            {self.app.row_id(first), self.app.row_id(second)},
+            set(self.app.table.selection()),
+        )
 
     def test_update_data_writes_json_when_loaded_from_json(self):
         row = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10)

@@ -77,6 +77,7 @@ SIMILARITY_CHROMA_TEMPO = "Chroma/tempo"
 SIMILARITY_BASE_BPM = "Base/BPM + chroma"
 SIMILARITY_MODES = (SIMILARITY_BASE_BPM, SIMILARITY_CHROMA_TEMPO, SIMILARITY_CHROMA)
 SEARCH_FIELDS = ("All", "Filename", "Artist", "Title", "Album", "Tempo", "Similarity", "Chroma", "Marks", "Matches", "Part")
+BASE_BPM_CLOSE_DISTANCE_BINS = CHROMA_BINS / 24
 EXPORT_CSV = "CSV"
 EXPORT_JSON = "JSON"
 EXPORT_CHROMAGRAM = "Chromagram"
@@ -1037,6 +1038,29 @@ def detect_beat_anchor_seconds(
     return offset + beat_seconds
 
 
+def refine_beat_anchor_from_file(
+    path: Path,
+    beat_seconds: float,
+    search_before_seconds: float = 0.12,
+    search_after_seconds: float = 0.04,
+) -> float:
+    start_seconds = max(0.0, beat_seconds - search_before_seconds)
+    end_seconds = beat_seconds + search_after_seconds
+    audio, sample_rate = load_audio_mono(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    local_anchor = beat_seconds - start_seconds
+    refined = refine_beat_anchor_to_transient(
+        audio,
+        sample_rate,
+        local_anchor,
+        search_before_seconds=min(search_before_seconds, local_anchor),
+        search_after_seconds=search_after_seconds,
+    )
+    refined_seconds = round(start_seconds + refined, 6)
+    if abs(refined_seconds - beat_seconds) > search_before_seconds:
+        return beat_seconds
+    return refined_seconds
+
+
 
 def estimate_tempo_with_librosa(
     path: Path,
@@ -1233,6 +1257,8 @@ class TempoWindow:
         self.search_field_var = tk.StringVar(value="All")
         self.match_cycle_var = tk.StringVar(value="Match: --")
         self.export_mode_var = tk.StringVar(value=EXPORT_CSV)
+        self.show_matches_only_var = tk.BooleanVar(value=False)
+        self.export_selected_only_var = tk.BooleanVar(value=False)
         self.match_count_by_uid: dict[int, int] = {}
         self.row_part_numbers: dict[str, int] = {}
         self.tap_times: list[float] = []
@@ -1322,6 +1348,7 @@ class TempoWindow:
         self.search_entry = ttk.Entry(primary_actions, textvariable=self.search_text_var, width=22)
         self.search_entry.pack(side="left")
         self.search_entry.bind("<KeyRelease>", self.update_table_filter)
+        ttk.Button(primary_actions, text="X", width=3, command=self.clear_search).pack(side="left", padx=(4, 0))
         self.search_field_combo = ttk.Combobox(
             primary_actions,
             textvariable=self.search_field_var,
@@ -1331,6 +1358,12 @@ class TempoWindow:
         )
         self.search_field_combo.pack(side="left", padx=(4, 0))
         self.search_field_combo.bind("<<ComboboxSelected>>", self.update_table_filter)
+        ttk.Checkbutton(
+            primary_actions,
+            text="Matches only",
+            variable=self.show_matches_only_var,
+            command=self.update_table_filter,
+        ).pack(side="left", padx=(8, 0))
 
         self.similarity_button = ttk.Button(
             primary_actions,
@@ -1390,6 +1423,11 @@ class TempoWindow:
             width=16,
         )
         self.export_mode_combo.pack(side="right", padx=(8, 0))
+        ttk.Checkbutton(
+            secondary_actions,
+            text="Selected only",
+            variable=self.export_selected_only_var,
+        ).pack(side="right", padx=(8, 0))
 
         tap_frame = ttk.Frame(main)
         tap_frame.pack(fill="x", pady=(10, 0))
@@ -1482,6 +1520,10 @@ class TempoWindow:
         ).pack(side="left", padx=(8, 0))
         self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
         self.play_all_button.pack(side="left", padx=(16, 0))
+        self.stop_all_button = ttk.Button(controls, text="Stop all", command=self.stop_all_waveforms)
+        self.stop_all_button.pack(side="left", padx=(8, 0))
+        self.select_playing_button = ttk.Button(controls, text="Sel playing", command=self.select_playing_waveforms)
+        self.select_playing_button.pack(side="left", padx=(8, 0))
         ttk.Label(controls, text="Beat step").pack(side="left", padx=(12, 4))
         self.beat_jump_spinbox = ttk.Spinbox(
             controls,
@@ -1575,6 +1617,10 @@ class TempoWindow:
         horizontal_scrollbar.grid(row=1, column=1, sticky="ew")
         self.table.bind("<<TreeviewSelect>>", self.handle_table_selection)
         self.table.bind("<Button-3>", self.handle_target_right_click)
+        self.table.bind("<Control-a>", self.select_all_table_rows)
+        self.table.bind("<Control-A>", self.select_all_table_rows)
+        self.play_table.bind("<Control-a>", self.select_all_table_rows)
+        self.play_table.bind("<Control-A>", self.select_all_table_rows)
         self.update_sort_headings()
 
     def scroll_tables(self, *args) -> None:
@@ -1808,7 +1854,55 @@ class TempoWindow:
             self.load_data_path(paths[0])
             return
 
-        self.start_analysis(paths)
+        self.add_unanalyzed_files(paths)
+
+    def add_unanalyzed_files(self, paths: list[Path]) -> None:
+        audio_files = collect_audio_files(paths)
+        if not audio_files:
+            messagebox.showerror("Chromatch", "No supported audio files were found.")
+            return
+
+        known_ids = {str(Path(row.path).resolve()) for row in self.rows}
+        added_rows = []
+        for path in audio_files:
+            resolved = str(path.resolve())
+            if resolved in known_ids:
+                continue
+            artist, title, album = read_audio_tags(path)
+            row = AnalysisRow(
+                row_uid=self.next_row_uid(),
+                path=path,
+                artist=artist,
+                title=title,
+                album=album,
+                bpm=None,
+                uncertainty_bpm=None,
+                confidence=None,
+                tapped_bpm=None,
+                chroma=None,
+                chroma_similarity=None,
+                chroma_tempo_similarity=None,
+                method="",
+                detail="",
+                error="",
+            )
+            self.rows.append(row)
+            added_rows.append(row)
+            known_ids.add(resolved)
+
+        if not added_rows:
+            self.result.configure(text="Dropped files are already in the list.")
+            return
+
+        self.refresh_table()
+        selected_ids = [self.row_id(row) for row in added_rows]
+        self.table.selection_set(selected_ids)
+        self.table.see(selected_ids[-1])
+        self.handle_table_selection()
+        self.set_export_state("normal")
+        self.update_csv_button.configure(state="normal")
+        plural = "s" if len(added_rows) != 1 else ""
+        self.result.configure(text=f"Added {len(added_rows)} dropped track{plural}; use Re-analyze selected when ready.")
 
     def remove_selected_rows(self) -> None:
         selected_ids = set(self.table.selection())
@@ -1960,6 +2054,16 @@ class TempoWindow:
 
     def update_table_filter(self, _event=None) -> None:
         self.refresh_table()
+
+    def clear_search(self) -> None:
+        self.search_text_var.set("")
+        self.refresh_table()
+
+    def select_all_table_rows(self, _event=None) -> str:
+        ids = self.table.get_children()
+        if ids:
+            self.table.selection_set(ids)
+        return "break"
 
     def handle_target_right_click(self, event) -> str:
         row_id = event.widget.identify_row(event.y)
@@ -2271,6 +2375,41 @@ class TempoWindow:
         self.rows = updated_rows
         self.sync_waveform_rows()
 
+    def refine_traktor_beat_anchor_for_row(self, row_id: str, row: AnalysisRow) -> AnalysisRow:
+        if row.beat_anchor_seconds is None or "traktor" not in row.beat_anchor_source.lower():
+            return row
+        if "refined" in row.beat_anchor_source.lower():
+            return row
+
+        try:
+            refined = refine_beat_anchor_from_file(row.path, row.beat_anchor_seconds)
+        except Exception:
+            return row
+        if abs(refined - row.beat_anchor_seconds) < 0.005:
+            return row
+
+        old_anchor = row.beat_anchor_seconds
+        updated_rows = []
+        updated_row = row
+        for existing in self.rows:
+            if self.row_id(existing) != row_id:
+                updated_rows.append(existing)
+                continue
+            beats = tuple(
+                refined if abs(beat - old_anchor) < 0.002 else beat
+                for beat in existing.user_beat_seconds
+            )
+            updated_row = replace(
+                existing,
+                beat_anchor_seconds=refined,
+                beat_anchor_source="traktor-refined",
+                user_beat_seconds=tuple(sorted(set(round(beat, 6) for beat in beats))),
+            )
+            updated_rows.append(updated_row)
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+        return updated_row
+
     def remove_nearest_row_user_beat(self, row_id: str, seconds: float, max_distance_seconds: float) -> bool:
         changed = False
         updated_rows = []
@@ -2550,15 +2689,23 @@ class TempoWindow:
 
     def base_bpm_is_close(self, row: AnalysisRow, targets: list[AnalysisRow] | None = None) -> bool:
         distance = self.base_bpm_distance_for_targets(row, targets)
-        return distance is not None and distance < (CHROMA_BINS / 12)
+        return distance is not None and distance < BASE_BPM_CLOSE_DISTANCE_BINS
 
     def base_bpm_category(self, row: AnalysisRow, targets: list[AnalysisRow]) -> tuple[int, str]:
         distance = self.base_bpm_distance_for_targets(row, targets)
         if distance is None:
             return 1, "unsure"
-        if distance < (CHROMA_BINS / 12):
+        if distance < BASE_BPM_CLOSE_DISTANCE_BINS:
             return 2, "close"
         return 0, "far"
+
+    def base_bpm_pair_category(self, first: AnalysisRow, second: AnalysisRow) -> tuple[int, str, float | None]:
+        distance = self.shifted_base_distance_bins(first, second)
+        if distance is None:
+            return 1, "unsure", None
+        if distance < BASE_BPM_CLOSE_DISTANCE_BINS:
+            return 2, "close", distance
+        return 0, "far", distance
 
     def similarity_score_for_row(self, row: AnalysisRow) -> float | None:
         mode = self.similarity_mode()
@@ -2657,11 +2804,16 @@ class TempoWindow:
 
     def refresh_table(self) -> None:
         selected_ids = set(self.table.selection())
+        selected_match_uids = {
+            row.row_uid
+            for row in self.rows
+            if self.row_id(row) in selected_ids and row.row_uid is not None
+        }
         self.clear_tables()
         self.update_row_part_numbers()
         self.rebuild_match_counts()
 
-        for row in self.filtered_sorted_rows():
+        for row in self.filtered_sorted_rows(selected_match_uids):
             row_id = self.row_id(row)
             self.play_table.insert("", "end", iid=row_id, values=("Play",))
             tags = ("similarity_target",) if row_id in self.similarity_target_ids else ()
@@ -2672,10 +2824,28 @@ class TempoWindow:
         if restored_selection:
             self.table.selection_set(restored_selection)
 
-    def filtered_sorted_rows(self) -> list[AnalysisRow]:
-        return [row for row in self.sorted_rows() if self.row_matches_search(row)]
+    def filtered_sorted_rows(self, selected_match_uids: set[int] | None = None) -> list[AnalysisRow]:
+        return [row for row in self.sorted_rows() if self.row_matches_search(row, selected_match_uids)]
 
-    def row_matches_search(self, row: AnalysisRow) -> bool:
+    def row_matches_search(self, row: AnalysisRow, selected_match_uids: set[int] | None = None) -> bool:
+        if self.show_matches_only_var.get():
+            selected_uids = selected_match_uids
+            if selected_uids is None:
+                selected_uids = {
+                    selected.row_uid
+                    for row_id in self.table.selection()
+                    if (selected := self.row_by_id(row_id)) is not None and selected.row_uid is not None
+                }
+            if not selected_uids or row.row_uid in selected_uids:
+                return False
+            matched_uids = {
+                other_uid
+                for selected_uid in selected_uids
+                for other_uid, _score in self.matches_for(selected_uid)
+            }
+            if row.row_uid not in matched_uids:
+                return False
+
         query = self.search_text_var.get().strip().casefold()
         if not query:
             return True
@@ -2800,6 +2970,9 @@ class TempoWindow:
             return
 
         downbeat_seconds = row.beat_anchor_seconds
+        if downbeat_seconds is not None:
+            row = self.refine_traktor_beat_anchor_for_row(row_id, row)
+            downbeat_seconds = row.beat_anchor_seconds
         if downbeat_seconds is None:
             try:
                 downbeat_seconds = detect_beat_anchor_seconds(
@@ -3899,6 +4072,21 @@ class TempoWindow:
         playing = sum(1 for slot in self.waveform_slots if slot.is_playing)
         self.result.configure(text=f"Playing {playing} displayed track(s).")
 
+    def stop_all_waveforms(self) -> None:
+        for slot in list(self.waveform_slots):
+            if slot.is_playing:
+                self.stop_waveform(slot)
+        self.result.configure(text="Stopped all displayed tracks.")
+
+    def select_playing_waveforms(self) -> None:
+        playing_ids = [slot.row_id for slot in self.waveform_slots if slot.is_playing and self.table.exists(slot.row_id)]
+        if not playing_ids:
+            messagebox.showinfo("Chromatch", "No displayed tracks are currently playing.")
+            return
+        self.table.selection_set(playing_ids)
+        self.table.see(playing_ids[-1])
+        self.handle_table_selection()
+
     def ensure_sounddevice_available(self) -> bool:
         global sd, SOUNDDEVICE_IMPORT_ERROR
 
@@ -4444,8 +4632,23 @@ class TempoWindow:
         }
         actions.get(mode, self.export_csv)()
 
+    def selected_export_rows(self) -> list[AnalysisRow]:
+        selected_ids = set(self.table.selection())
+        return [row for row in self.rows if self.row_id(row) in selected_ids]
+
+    def export_rows_for_scope(self) -> list[AnalysisRow]:
+        if not self.export_selected_only_var.get():
+            return self.filtered_sorted_rows()
+        rows = self.selected_export_rows()
+        if not rows:
+            messagebox.showinfo("Chromatch", "Select one or more tracks to export.")
+        return rows
+
     def export_csv(self) -> None:
         if not self.rows:
+            return
+        rows = self.export_rows_for_scope()
+        if not rows:
             return
 
         filename = filedialog.asksaveasfilename(
@@ -4458,17 +4661,21 @@ class TempoWindow:
 
         path = Path(filename)
         try:
-            self.write_csv_path(path)
+            self.write_csv_path(path, rows, write_sidecar=False)
         except OSError as exc:
             messagebox.showerror("Chromatch", f"Could not export CSV:\n{exc}")
             return
 
-        self.current_csv_path = path
-        self.update_csv_button.configure(state="normal")
+        if not self.export_selected_only_var.get():
+            self.current_csv_path = path
+            self.update_csv_button.configure(state="normal")
         self.result.configure(text=f"Exported CSV: {path.name}")
 
     def export_json(self) -> None:
         if not self.rows:
+            return
+        rows = self.export_rows_for_scope()
+        if not rows:
             return
 
         filename = filedialog.asksaveasfilename(
@@ -4481,13 +4688,14 @@ class TempoWindow:
 
         path = Path(filename)
         try:
-            self.write_json_path(path)
+            self.write_json_path(path, rows)
         except OSError as exc:
             messagebox.showerror("Chromatch", f"Could not export JSON:\n{exc}")
             return
 
-        self.current_csv_path = path
-        self.update_csv_button.configure(state="normal")
+        if not self.export_selected_only_var.get():
+            self.current_csv_path = path
+            self.update_csv_button.configure(state="normal")
         self.result.configure(text=f"Exported JSON: {path.name}")
 
     def update_csv(self) -> None:
@@ -4540,8 +4748,9 @@ class TempoWindow:
             "error": row.error,
         }
 
-    def write_csv_path(self, path: Path) -> None:
+    def write_csv_path(self, path: Path, rows: list[AnalysisRow] | None = None, write_sidecar: bool = True) -> None:
         self.ensure_row_uids()
+        export_rows = self.rows if rows is None else rows
         fieldnames = [
             "row_uid",
             "filepath",
@@ -4574,28 +4783,36 @@ class TempoWindow:
         with open(path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
-            for row in self.rows:
+            for row in export_rows:
                 writer.writerow(self.row_export_record(row))
-        self.write_matches_path(matches_sidecar_path(path))
+        if write_sidecar:
+            self.write_matches_path(matches_sidecar_path(path), export_rows)
 
-    def write_matches_path(self, path: Path) -> None:
+    def write_matches_path(self, path: Path, rows: list[AnalysisRow] | None = None) -> None:
         self.prune_match_links()
+        valid_uids = None
+        if rows is not None:
+            valid_uids = {row.row_uid for row in rows if row.row_uid is not None}
         payload = [
             {"a": first_uid, "b": second_uid, "score": score}
             for (first_uid, second_uid), score in sorted(self.match_links.items())
+            if valid_uids is None or (first_uid in valid_uids and second_uid in valid_uids)
         ]
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
-    def write_json_path(self, path: Path) -> None:
+    def write_json_path(self, path: Path, rows: list[AnalysisRow] | None = None) -> None:
         self.ensure_row_uids()
         self.prune_match_links()
+        export_rows = self.rows if rows is None else rows
+        valid_uids = {row.row_uid for row in export_rows if row.row_uid is not None}
         payload = {
             "format": "chromatch-analysis",
             "version": 1,
-            "rows": [self.row_export_record(row) for row in self.rows],
+            "rows": [self.row_export_record(row) for row in export_rows],
             "matches": [
                 {"a": first_uid, "b": second_uid, "score": score}
                 for (first_uid, second_uid), score in sorted(self.match_links.items())
+                if first_uid in valid_uids and second_uid in valid_uids
             ],
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -4746,7 +4963,7 @@ class TempoWindow:
         return "\n".join(lines) + "\n"
 
     def export_graphviz(self) -> None:
-        rows = self.filtered_sorted_rows()
+        rows = self.export_rows_for_scope()
         if not rows:
             messagebox.showinfo("Chromatch", "No rows to export.")
             return
@@ -4914,7 +5131,7 @@ class TempoWindow:
 """
 
     def export_graph_svg(self) -> None:
-        rows = self.filtered_sorted_rows()
+        rows = self.export_rows_for_scope()
         if not rows:
             messagebox.showinfo("Chromatch", "No rows to export.")
             return
@@ -5032,7 +5249,7 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
 """
 
     def export_html_map(self) -> None:
-        rows = self.filtered_sorted_rows()
+        rows = self.export_rows_for_scope()
         if not rows:
             messagebox.showinfo("Chromatch", "No rows to export.")
             return
@@ -5054,9 +5271,12 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
         self.result.configure(text=f"Exported HTML map: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
+        source_rows = self.export_rows_for_scope()
+        if not source_rows:
+            return
         candidates = [
             row
-            for row in self.rows
+            for row in source_rows
             if row.chroma is not None and self.row_tempo_for_matching(row) is not None
         ]
         if len(candidates) < 2:
@@ -5081,9 +5301,22 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
                 first_tempo = self.row_tempo_for_matching(first)
                 second_tempo = self.row_tempo_for_matching(second)
                 tempo_ratio = second_tempo / first_tempo if first_tempo and second_tempo else None
-                pairs.append((similarity, first, second, first_tempo, second_tempo, tempo_ratio))
+                base_rank, base_label, base_distance = self.base_bpm_pair_category(first, second)
+                pairs.append(
+                    (
+                        base_rank,
+                        similarity,
+                        base_label,
+                        base_distance,
+                        first,
+                        second,
+                        first_tempo,
+                        second_tempo,
+                        tempo_ratio,
+                    )
+                )
 
-        pairs.sort(key=lambda item: item[0], reverse=True)
+        pairs.sort(key=lambda item: (item[0], item[1]), reverse=True)
 
         try:
             with open(filename, "w", newline="", encoding="utf-8") as csv_file:
@@ -5091,6 +5324,8 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
                 writer.writerow(
                     [
                         "rank",
+                        "base_bpm_category",
+                        "base_bpm_distance_bins",
                         "chroma_tempo_similarity_0_100",
                         "tempo_ratio_b_over_a",
                         "tempo_a_bpm",
@@ -5101,10 +5336,22 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
                         "filepath_b",
                     ]
                 )
-                for rank, (similarity, first, second, first_tempo, second_tempo, tempo_ratio) in enumerate(pairs, 1):
+                for rank, (
+                    _base_rank,
+                    similarity,
+                    base_label,
+                    base_distance,
+                    first,
+                    second,
+                    first_tempo,
+                    second_tempo,
+                    tempo_ratio,
+                ) in enumerate(pairs, 1):
                     writer.writerow(
                         [
                             rank,
+                            base_label,
+                            "" if base_distance is None else f"{base_distance:.2f}",
                             f"{similarity:.2f}",
                             "" if tempo_ratio is None else f"{tempo_ratio:.6f}",
                             "" if first_tempo is None else f"{first_tempo:.2f}",

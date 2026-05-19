@@ -263,9 +263,9 @@ class ChromatchRegressionTests(unittest.TestCase):
 
     def test_base_bpm_similarity_mode_groups_close_base_first(self):
         target = chromatch.replace(self.make_chroma_row("target.wav", 120, 0), row_uid=1, base_chroma_bin=100)
-        close = chromatch.replace(self.make_chroma_row("close.wav", 120, 0), row_uid=2, base_chroma_bin=110)
+        close = chromatch.replace(self.make_chroma_row("close.wav", 120, 0), row_uid=2, base_chroma_bin=109)
         unsure = chromatch.replace(self.make_chroma_row("unsure.wav", 120, 0), row_uid=4, base_chroma_bin=None)
-        far = chromatch.replace(self.make_chroma_row("far.wav", 120, 0), row_uid=3, base_chroma_bin=140)
+        far = chromatch.replace(self.make_chroma_row("far.wav", 120, 0), row_uid=3, base_chroma_bin=111)
         self.app.rows = [target, close, unsure, far]
         self.app.similarity_target_ids = {self.app.row_id(target)}
         self.app.update_similarity_scores([target])
@@ -283,6 +283,15 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertTrue(self.app.similarity_text_for_row(close).startswith("close "))
         self.assertTrue(self.app.similarity_text_for_row(unsure).startswith("unsure "))
         self.assertTrue(self.app.similarity_text_for_row(far).startswith("far "))
+
+    def test_base_bpm_close_threshold_is_half_a_semitone(self):
+        target = chromatch.replace(self.make_row("target.wav", bpm=120), base_chroma_bin=100)
+        close = chromatch.replace(self.make_row("close.wav", bpm=120), base_chroma_bin=109)
+        far = chromatch.replace(self.make_row("far.wav", bpm=120), base_chroma_bin=111)
+
+        self.assertLess(self.app.shifted_base_distance_bins(close, target), chromatch.BASE_BPM_CLOSE_DISTANCE_BINS)
+        self.assertTrue(self.app.base_bpm_is_close(close, [target]))
+        self.assertFalse(self.app.base_bpm_is_close(far, [target]))
 
     def test_base_bpm_similarity_mode_does_not_scan_targets_when_none_are_active(self):
         row = chromatch.replace(
@@ -347,6 +356,56 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.refresh_table()
 
         self.assertEqual((self.app.row_id(second),), self.app.table.get_children())
+
+    def test_clear_search_restores_filtered_table(self):
+        first = chromatch.replace(self.make_row("first.wav"), artist="Alice")
+        second = chromatch.replace(self.make_row("second.wav"), artist="Bob")
+        self.app.rows = [first, second]
+        self.app.search_text_var.set("alice")
+        self.app.refresh_table()
+
+        self.app.clear_search()
+
+        self.assertEqual("", self.app.search_text_var.get())
+        self.assertEqual({self.app.row_id(first), self.app.row_id(second)}, set(self.app.table.get_children()))
+
+    def test_matches_only_filter_keeps_rows_matching_selected_tracks(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav"), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.set_match(10, 20, 1)
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(first))
+        self.app.show_matches_only_var.set(True)
+
+        self.app.refresh_table()
+
+        self.assertEqual((self.app.row_id(second),), self.app.table.get_children())
+
+    def test_matches_only_filter_without_selection_hides_all_rows(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        self.app.rows = [first, second]
+        self.app.set_match(10, 20, 1)
+        self.app.show_matches_only_var.set(True)
+
+        self.app.refresh_table()
+
+        self.assertEqual((), self.app.table.get_children())
+
+    def test_ctrl_a_selects_all_visible_rows(self):
+        first = chromatch.replace(self.make_row("first.wav"), artist="Alice")
+        second = chromatch.replace(self.make_row("second.wav"), artist="Bob")
+        hidden = chromatch.replace(self.make_row("hidden.wav"), artist="Carol")
+        self.app.rows = [first, second, hidden]
+        self.app.search_text_var.set("i")
+        self.app.refresh_table()
+
+        result = self.app.select_all_table_rows()
+
+        self.assertEqual("break", result)
+        self.assertEqual(set(self.app.table.get_children()), set(self.app.table.selection()))
 
     def test_evolving_chromagram_renderer_exports_image(self):
         sample_rate = 8_000
@@ -899,6 +958,53 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual(["svg"], called)
 
+    def test_closest_pairs_export_sorts_by_base_bpm_category_before_similarity(self):
+        first = chromatch.replace(self.make_chroma_row("first.wav", 120.0, 0), base_chroma_bin=100)
+        close_low_similarity = chromatch.replace(
+            self.make_chroma_row("close.wav", 120.0, 60),
+            base_chroma_bin=105,
+        )
+        far_high_similarity = chromatch.replace(
+            self.make_chroma_row("far.wav", 120.0, 0),
+            base_chroma_bin=140,
+        )
+        self.app.rows = [first, close_low_similarity, far_high_similarity]
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "pairs.csv"
+            original_save = chromatch.filedialog.asksaveasfilename
+            chromatch.filedialog.asksaveasfilename = lambda **_kwargs: str(path)
+            try:
+                self.app.export_closest_pairs()
+            finally:
+                chromatch.filedialog.asksaveasfilename = original_save
+            with path.open(encoding="utf-8") as csv_file:
+                rows = list(chromatch.csv.DictReader(csv_file))
+
+        self.assertEqual("close", rows[0]["base_bpm_category"])
+        self.assertEqual("close.wav", rows[0]["filename_b"])
+
+    def test_traktor_beat_anchor_refines_to_nearest_transient_and_updates_imported_beat(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            beat_anchor_seconds=0.052,
+            beat_anchor_source="traktor",
+            user_beat_seconds=(0.052,),
+        )
+        self.app.rows = [row]
+        audio = np.zeros(8_000, dtype=np.float32)
+        audio[0:120] = np.linspace(0.0, 1.0, 120)
+        original_load = chromatch.load_audio_mono
+        chromatch.load_audio_mono = lambda *_args, **_kwargs: (audio, 8_000)
+        try:
+            updated = self.app.refine_traktor_beat_anchor_for_row(self.app.row_id(row), row)
+        finally:
+            chromatch.load_audio_mono = original_load
+
+        self.assertEqual("traktor-refined", updated.beat_anchor_source)
+        self.assertLess(updated.beat_anchor_seconds, 0.01)
+        self.assertEqual((updated.beat_anchor_seconds,), updated.user_beat_seconds)
+
     def test_match_cycle_button_cycles_selected_pairs(self):
         first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
         second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
@@ -981,6 +1087,73 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("chromatch-analysis", payload["format"])
         self.assertEqual("10", payload["rows"][0]["row_uid"])
+
+    def test_selected_only_json_export_writes_selected_rows_and_internal_matches(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav", bpm=122.0), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.set_match(10, 20, 1)
+        self.app.set_match(10, 30, 2)
+        self.app.refresh_table()
+        self.app.table.selection_set((self.app.row_id(first), self.app.row_id(second)))
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "selected.json"
+            self.app.write_json_path(path, self.app.selected_export_rows())
+            payload = chromatch.json.loads(path.read_text(encoding="utf-8"))
+
+        self.assertEqual(["10", "20"], [row["row_uid"] for row in payload["rows"]])
+        self.assertEqual([{"a": 10, "b": 20, "score": 1}], payload["matches"])
+
+    def test_selected_only_csv_export_writes_selected_rows_and_sidecar_matches(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav", bpm=122.0), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.set_match(10, 20, 1)
+        self.app.set_match(10, 30, 2)
+        self.app.refresh_table()
+        self.app.table.selection_set((self.app.row_id(first), self.app.row_id(second)))
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "selected.csv"
+            self.app.write_csv_path(path, self.app.selected_export_rows())
+            with path.open(encoding="utf-8") as csv_file:
+                rows = list(chromatch.csv.DictReader(csv_file))
+            matches = chromatch.json.loads(chromatch.matches_sidecar_path(path).read_text(encoding="utf-8"))
+
+        self.assertEqual(["10", "20"], [row["row_uid"] for row in rows])
+        self.assertEqual([{"a": 10, "b": 20, "score": 1}], matches)
+
+    def test_export_csv_does_not_write_json_sidecar(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10)
+        self.app.rows = [row]
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            original_save = chromatch.filedialog.asksaveasfilename
+            chromatch.filedialog.asksaveasfilename = lambda **_kwargs: str(path)
+            try:
+                self.app.export_csv()
+            finally:
+                chromatch.filedialog.asksaveasfilename = original_save
+
+            self.assertTrue(path.exists())
+            self.assertFalse(chromatch.matches_sidecar_path(path).exists())
+
+    def test_dropped_audio_files_are_added_without_starting_analysis(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "drop.wav"
+            chromatch.sf.write(path, np.zeros(8_000, dtype=np.float32), 8_000)
+
+            self.app.add_unanalyzed_files([path])
+
+        self.assertEqual(1, len(self.app.rows))
+        self.assertEqual("drop.wav", self.app.rows[0].path.name)
+        self.assertIsNone(self.app.rows[0].bpm)
+        self.assertEqual([], self.app.analysis_queue)
+        self.assertFalse(self.app.is_analyzing)
 
     def test_mixer_uses_fixed_track_gain_without_active_count_scaling(self):
         class DummyApp:
@@ -2002,6 +2175,31 @@ class ChromatchRegressionTests(unittest.TestCase):
             synced = self.app.synced_source_seconds_for_slot(slot, 10.7)
 
         self.assertAlmostEqual(10.75, synced)
+
+    def test_stop_all_waveforms_stops_displayed_playing_slots(self):
+        first = chromatch.WaveformSlot(row_id="first", row=self.make_row("first.wav"), is_playing=True)
+        second = chromatch.WaveformSlot(row_id="second", row=self.make_row("second.wav"), is_playing=True)
+        self.app.waveform_slots = [first, second]
+
+        self.app.stop_all_waveforms()
+
+        self.assertFalse(first.is_playing)
+        self.assertFalse(second.is_playing)
+
+    def test_select_playing_waveforms_selects_visible_playing_rows(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav"), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.refresh_table()
+        first_slot = chromatch.WaveformSlot(row_id=self.app.row_id(first), row=first, is_playing=True, kept=True)
+        second_slot = chromatch.WaveformSlot(row_id=self.app.row_id(second), row=second, is_playing=False, kept=True)
+        third_slot = chromatch.WaveformSlot(row_id=self.app.row_id(third), row=third, is_playing=True, kept=True)
+        self.app.waveform_slots = [first_slot, second_slot, third_slot]
+
+        self.app.select_playing_waveforms()
+
+        self.assertEqual({self.app.row_id(first), self.app.row_id(third)}, set(self.app.table.selection()))
 
     def test_set_downbeat_uses_current_playhead_and_draws_beats(self):
         row = self.make_row(bpm=120)

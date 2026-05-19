@@ -2,40 +2,38 @@
 to review :
 
 next tasks :
-
-then :
+- "show matches only" should also show the track tracks are matching with as well as tracks currently loaded in the display zone
 
 tasks for later :
-- automix
-- export as traktor/mixxx file
-- inverse associate with eq profile
-- mixing tools (eg DJ-style filter)
-- limit tempo differences when searching for similar tracks or weight it
 - some tracks (eg "02 - Le Chien...") are still cropped when loaded to the display (might be due to the file itself though)
-- playback is better now, still has some occasional glitch when another track starts while some already play
-- detect when bars and audio get out of sync and resync them over the course of the track
-- handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
-- analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
-- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
-- detect cue points for structure parts and loops
-- handle variations in tempo and chroma (throughout a track)
-- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
+- zoomed waveform resolution could be even better probably
+- activating beat sync could immediatly resync everything even already playing
+- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
+- playback is better now, still has some occasional glitch when another track starts while some already play, or while loading another track
+- tempo gap filter like with the old tool (limit tempo differences when searching for similar tracks (or weight it, to be tested later))
 - actually loop loops if some per-track loop checkbox enabled
+- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
+- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
+- dropping a track takes some processing time, why?
+- mixing tools (eg DJ-style filter)
+- tempo glide when auto-changing
+- make graphviz graph better
+- export as traktor/mixxx file
+- automix
+
+check this :
+- manually track and reencode files not parsed correctly
+
+maybe at some point :
 - option to relink track with file
 - option to keep absolute and/or relative url of files
-- export Graphviz graphs
-- manually track and reencode files not parsed correctly
-- allow ctrl+A on the list
-- don't alanyse track on drop, wait for the user to ask for analysis?
-- auto beat detection could still be better, maybe refine this kind of detection on proven files
-- zoomed waveform resolution could be even better probably
-- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
-- activating beat sync could immediatly resync everything even already playing
-- tempo gap filter like with the old tool
-- somehow it seems event the beats taken from the traktor markers appear slightly shifted (eg investigate phase.portrait.mp3)
+- detect when bars and audio get out of sync and resync them over the course of the track
 - handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
-- have a "show matches only" filter
-- option to export only selected tracks
-- make graphviz graph better
-- use the "base/bpm + chroma" mode for "closest pairs" export
+- analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
+- auto beat detection could still be better, maybe refine this kind of detection on proven files
+- handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
+- detect cue points for structure parts and loops
+- handle variations in tempo and chroma (throughout a track)
+- inverse associate with eq profile
+

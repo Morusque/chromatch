@@ -384,6 +384,11 @@ def matches_sidecar_path(csv_path: Path) -> Path:
 
 
 def encode_array(values: np.ndarray) -> str:
+    array = np.asarray(values)
+    if array.size and np.all(np.isfinite(array)) and float(np.min(array)) >= 0.0 and float(np.max(array)) <= 1.0:
+        quantized = np.rint(np.asarray(array, dtype=np.float64) * 65535.0).astype(np.uint16)
+        return "u16:" + base64.b64encode(quantized.tobytes()).decode("ascii")
+
     raw = np.asarray(values, dtype=np.float32).tobytes()
     return "f32:" + base64.b64encode(raw).decode("ascii")
 
@@ -393,6 +398,10 @@ def decode_array(value: str | None) -> np.ndarray | None:
         return None
 
     try:
+        if value.startswith("u16:"):
+            raw = base64.b64decode(value[4:].encode("ascii"))
+            return (np.frombuffer(raw, dtype=np.uint16).astype(np.float32) / 65535.0).copy()
+
         if value.startswith("f32:"):
             raw = base64.b64decode(value[4:].encode("ascii"))
             return np.frombuffer(raw, dtype=np.float32).copy()
@@ -1309,7 +1318,10 @@ class TempoWindow:
         self.analysis_queue: list[AnalysisTask] = []
         self.analysis_paths: set[str] = set()
         self.result_queue: queue.Queue = queue.Queue()
+        self.tag_result_queue: queue.Queue = queue.Queue()
         self.queue_lock = threading.Lock()
+        self.is_reading_tags = False
+        self.active_tag_workers = 0
         self.sort_column: str | None = None
         self.sort_descending = False
         self.similarity_target_ids: set[str] = set()
@@ -1333,6 +1345,7 @@ class TempoWindow:
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
+        self.tempo_glide_seconds_var = tk.StringVar(value="0")
         self.beat_jump_var = tk.StringVar(value="4")
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
@@ -1344,6 +1357,12 @@ class TempoWindow:
         self.waveform_update_active = False
         self.mixer_sample_rate = 44_100
         self.playback_target_tempo: float | None = None
+        self.playback_effective_target_tempo: float | None = None
+        self.playback_tempo_glide_start: float | None = None
+        self.playback_tempo_glide_end: float | None = None
+        self.playback_tempo_glide_remaining_samples = 0
+        self.playback_tempo_glide_total_samples = 0
+        self.playback_tempo_glide_seconds = 0.0
         self.playback_ignore_target_tempo = False
         self.metronome_enabled = False
         self.beat_sync_enabled = False
@@ -1556,6 +1575,12 @@ class TempoWindow:
         )
         self.target_tempo_slider.bind("<Double-Button-1>", self.reset_target_tempo_slider)
         self.target_tempo_slider.pack(side="left", padx=(0, 16))
+        ttk.Label(controls, text="Glide").pack(side="left", padx=(0, 4))
+        self.tempo_glide_entry = ttk.Entry(controls, textvariable=self.tempo_glide_seconds_var, width=6)
+        self.tempo_glide_entry.pack(side="left", padx=(0, 4))
+        self.tempo_glide_entry.bind("<KeyRelease>", self.update_playback_settings_from_ui)
+        self.tempo_glide_entry.bind("<FocusOut>", self.update_playback_settings_from_ui)
+        ttk.Label(controls, text="s").pack(side="left", padx=(0, 16))
         ttk.Checkbutton(
             controls,
             text="Auto",
@@ -1930,13 +1955,12 @@ class TempoWindow:
             resolved = str(path.resolve())
             if resolved in known_ids:
                 continue
-            artist, title, album = read_audio_tags(path)
             row = AnalysisRow(
                 row_uid=self.next_row_uid(),
                 path=path,
-                artist=artist,
-                title=title,
-                album=album,
+                artist="",
+                title="",
+                album="",
                 bpm=None,
                 uncertainty_bpm=None,
                 confidence=None,
@@ -1965,6 +1989,85 @@ class TempoWindow:
         self.update_csv_button.configure(state="normal")
         plural = "s" if len(added_rows) != 1 else ""
         self.result.configure(text=f"Added {len(added_rows)} dropped track{plural}; use Re-analyze selected when ready.")
+        self.start_tag_refresh_for_rows(added_rows)
+
+    def start_tag_refresh_for_rows(self, rows: list[AnalysisRow]) -> None:
+        tasks = [(self.row_id(row), row.path) for row in rows if not (row.artist and row.title and row.album)]
+        if not tasks:
+            return
+
+        self.active_tag_workers += 1
+        if not self.is_reading_tags:
+            self.is_reading_tags = True
+            self.root.after(50, self.process_tag_results)
+        worker = threading.Thread(target=self._read_tags_in_background, args=(tasks,), daemon=True)
+        worker.start()
+
+    def _read_tags_in_background(self, tasks: list[tuple[str, Path]]) -> None:
+        total = len(tasks)
+        try:
+            for processed, (row_id, path) in enumerate(tasks, start=1):
+                try:
+                    artist, title, album = read_audio_tags(path)
+                except Exception:
+                    artist, title, album = "", "", ""
+                self.tag_result_queue.put(("tags", row_id, artist, title, album, processed, total))
+        finally:
+            self.tag_result_queue.put(("done", total))
+
+    def process_tag_results(self) -> None:
+        updated = False
+        done_count = 0
+        while True:
+            try:
+                message = self.tag_result_queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = message[0]
+            if kind == "tags":
+                _, row_id, artist, title, album, _processed, _total = message
+                updated = self.apply_row_tag_update(row_id, artist, title, album) or updated
+            elif kind == "done":
+                _, total = message
+                done_count += total
+                self.active_tag_workers = max(0, self.active_tag_workers - 1)
+
+        if updated:
+            self.refresh_table()
+
+        if done_count and self.active_tag_workers == 0:
+            self.is_reading_tags = False
+            self.result.configure(text=f"Updated tags for {done_count} dropped tracks")
+        if self.is_reading_tags:
+            self.root.after(50, self.process_tag_results)
+
+    def apply_row_tag_update(self, row_id: str, artist: str, title: str, album: str) -> bool:
+        updated_rows = []
+        changed = False
+        updated_row = None
+        for row in self.rows:
+            if self.row_id(row) == row_id:
+                next_row = replace(
+                    row,
+                    artist=row.artist or artist,
+                    title=row.title or title,
+                    album=row.album or album,
+                )
+                changed = changed or next_row != row
+                updated_row = next_row
+                updated_rows.append(next_row)
+            else:
+                updated_rows.append(row)
+
+        if not changed:
+            return False
+
+        self.rows = updated_rows
+        for slot in self.waveform_slots:
+            if slot.row_id == row_id and updated_row is not None:
+                slot.row = updated_row
+        return True
 
     def remove_selected_rows(self) -> None:
         selected_ids = set(self.table.selection())
@@ -2619,6 +2722,65 @@ class TempoWindow:
     def target_tempo(self) -> float | None:
         return parse_optional_float(self.target_tempo_var.get())
 
+    def tempo_glide_seconds(self) -> float:
+        try:
+            return max(0.0, float(self.tempo_glide_seconds_var.get()))
+        except (TypeError, ValueError, tk.TclError):
+            return 0.0
+
+    def effective_playback_target_tempo(self) -> float | None:
+        return self.playback_effective_target_tempo if self.playback_effective_target_tempo is not None else self.playback_target_tempo
+
+    def set_playback_target_tempo_locked(self, tempo: float | None) -> None:
+        glide_seconds = self.tempo_glide_seconds()
+        previous_tempo = self.effective_playback_target_tempo()
+        self.playback_target_tempo = tempo
+        self.playback_tempo_glide_seconds = glide_seconds
+
+        if (
+            tempo is None
+            or previous_tempo is None
+            or previous_tempo <= 0
+            or tempo <= 0
+            or glide_seconds <= 0
+            or abs(previous_tempo - tempo) < 1e-9
+        ):
+            self.playback_effective_target_tempo = tempo
+            self.playback_tempo_glide_start = None
+            self.playback_tempo_glide_end = None
+            self.playback_tempo_glide_remaining_samples = 0
+            self.playback_tempo_glide_total_samples = 0
+            return
+
+        total_samples = max(1, int(round(glide_seconds * self.mixer_sample_rate)))
+        self.playback_effective_target_tempo = previous_tempo
+        self.playback_tempo_glide_start = previous_tempo
+        self.playback_tempo_glide_end = tempo
+        self.playback_tempo_glide_remaining_samples = total_samples
+        self.playback_tempo_glide_total_samples = total_samples
+
+    def advance_playback_tempo_glide_locked(self, frames: int) -> None:
+        if self.playback_tempo_glide_remaining_samples <= 0:
+            return
+
+        start = self.playback_tempo_glide_start
+        end = self.playback_tempo_glide_end
+        total = self.playback_tempo_glide_total_samples
+        if start is None or end is None or total <= 0:
+            self.playback_effective_target_tempo = self.playback_target_tempo
+            self.playback_tempo_glide_remaining_samples = 0
+            return
+
+        remaining = max(0, self.playback_tempo_glide_remaining_samples - frames)
+        completed = 1.0 - (remaining / total)
+        self.playback_effective_target_tempo = start + (end - start) * completed
+        self.playback_tempo_glide_remaining_samples = remaining
+        if remaining == 0:
+            self.playback_effective_target_tempo = end
+            self.playback_tempo_glide_start = None
+            self.playback_tempo_glide_end = None
+            self.playback_tempo_glide_total_samples = 0
+
     def update_playback_target_tempo(self, _event=None) -> None:
         tempo = self.target_tempo()
         if tempo is not None:
@@ -2626,7 +2788,7 @@ class TempoWindow:
             self.target_tempo_slider_var.set(max(60.0, min(260.0, tempo)))
             self.suppress_target_slider_callback = False
         with self.mixer_lock:
-            self.playback_target_tempo = tempo
+            self.set_playback_target_tempo_locked(tempo)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
 
@@ -2639,7 +2801,7 @@ class TempoWindow:
         self.auto_target_tempo_var.set(False)
         self.target_tempo_var.set(f"{tempo:.1f}")
         with self.mixer_lock:
-            self.playback_target_tempo = tempo
+            self.set_playback_target_tempo_locked(tempo)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
         self.draw_all_waveforms()
@@ -2649,16 +2811,19 @@ class TempoWindow:
         self.target_tempo_var.set("120.0")
         self.target_tempo_slider_var.set(120.0)
         with self.mixer_lock:
-            self.playback_target_tempo = 120.0
+            self.set_playback_target_tempo_locked(120.0)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
         self.draw_all_waveforms()
 
     def update_playback_settings_from_ui(self) -> None:
         with self.mixer_lock:
-            self.playback_target_tempo = self.target_tempo()
+            was_beat_sync_enabled = self.beat_sync_enabled
+            self.set_playback_target_tempo_locked(self.target_tempo())
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
+            if self.beat_sync_enabled and not was_beat_sync_enabled:
+                self.sync_playing_slots_to_master_beat()
         self.draw_all_waveforms()
 
     def calculate_chroma_tempo_similarity(self, row: AnalysisRow, targets: list[AnalysisRow]) -> float | None:
@@ -4122,14 +4287,14 @@ class TempoWindow:
         if self.playback_ignore_target_tempo or slot.use_original_tempo:
             return slot.tempo_multiplier
 
-        target_tempo = self.playback_target_tempo
+        target_tempo = self.effective_playback_target_tempo()
         row_tempo = self.row_tempo_for_matching(slot.row)
         if target_tempo is None or row_tempo is None:
             return slot.tempo_multiplier
         return (target_tempo / row_tempo) * slot.tempo_multiplier
 
     def metronome_beat_phase(self) -> float:
-        tempo = self.playback_target_tempo
+        tempo = self.effective_playback_target_tempo()
         if tempo is None or tempo <= 0:
             return 0.0
 
@@ -4173,6 +4338,11 @@ class TempoWindow:
         slot.playhead = synced_seconds / slot.duration
         if slot.audio is not None:
             slot.position_samples = self.slot_position_samples_for_playhead(slot)
+
+    def sync_playing_slots_to_master_beat(self) -> None:
+        for slot in self.waveform_slots:
+            if slot.is_playing:
+                self.sync_slot_to_master_beat(slot)
 
     def play_chroma_preview(self, chroma_bin: float) -> None:
         if not self.ensure_sounddevice_available():
@@ -4275,8 +4445,10 @@ class TempoWindow:
 
         try:
             self.update_playback_target_tempo()
+            self.ensure_slot_audio_loaded(slot)
             with self.mixer_lock:
-                self.ensure_slot_audio_loaded(slot)
+                if slot.audio is None or slot.sample_rate <= 0:
+                    return
 
                 self.sync_slot_to_master_beat(slot)
                 slot.stinger_remaining_samples = None
@@ -4300,11 +4472,15 @@ class TempoWindow:
             return
 
         audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
-        slot.audio = audio
-        slot.sample_rate = sample_rate
-        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
-        slot.audio_peak = peak if peak > 0 else 1.0
-        slot.position_samples = self.slot_position_samples_for_playhead(slot)
+        with self.mixer_lock:
+            if slot.audio is not None:
+                return
+            slot.audio = audio
+            slot.sample_rate = sample_rate
+            slot.audio_loading = False
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+            slot.audio_peak = peak if peak > 0 else 1.0
+            slot.position_samples = self.slot_position_samples_for_playhead(slot)
 
     def start_waveform_stinger(self, slot: WaveformSlot) -> None:
         if not self.ensure_sounddevice_available():
@@ -4317,8 +4493,8 @@ class TempoWindow:
 
         try:
             self.update_playback_target_tempo()
+            self.ensure_slot_audio_loaded(slot)
             with self.mixer_lock:
-                self.ensure_slot_audio_loaded(slot)
                 if slot.audio is None or slot.sample_rate <= 0:
                     return
 
@@ -4385,6 +4561,9 @@ class TempoWindow:
         output = np.zeros((frames, 2), dtype=np.float32)
 
         with self.mixer_lock:
+            advance_tempo_glide = getattr(self, "advance_playback_tempo_glide_locked", None)
+            if advance_tempo_glide is not None:
+                advance_tempo_glide(frames)
             slots = list(self.waveform_slots)
             for slot in slots:
                 if not slot.is_playing or slot.audio is None:
@@ -4435,14 +4614,20 @@ class TempoWindow:
                     if slot.position_samples >= max_index:
                         slot.is_playing = False
 
-            if getattr(self, "metronome_enabled", False):
-                tempo = getattr(self, "playback_target_tempo", None)
+            metronome_enabled = getattr(self, "metronome_enabled", False)
+            if metronome_enabled or getattr(self, "beat_sync_enabled", False):
+                tempo = (
+                    self.effective_playback_target_tempo()
+                    if hasattr(self, "effective_playback_target_tempo")
+                    else getattr(self, "playback_target_tempo", None)
+                )
                 if tempo is not None and tempo > 0:
                     samples_per_beat = self.mixer_sample_rate * 60.0 / tempo
-                    positions = self.metronome_position_samples + np.arange(frames)
+                    metronome_position = getattr(self, "metronome_position_samples", 0.0)
+                    positions = metronome_position + np.arange(frames)
                     beat_offsets = np.mod(positions, samples_per_beat)
                     click_mask = beat_offsets < 900
-                    if np.any(click_mask):
+                    if metronome_enabled and np.any(click_mask):
                         click_offsets = beat_offsets[click_mask]
                         envelope = np.exp(-click_offsets / 180.0)
                         tone = np.sin(2.0 * np.pi * 1600.0 * (click_offsets / self.mixer_sample_rate))

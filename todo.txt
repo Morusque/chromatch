@@ -2,30 +2,25 @@
 to review :
 
 next tasks :
-- activating beat sync could immediatly resync everything even already playing
+- tempo gap filter like with the old tool (limit tempo differences when searching for similar tracks (or weight it, to be tested later))
+- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
+- mixing tools (eg a DJ-style filter)
+- actually loop loops if some per-track loop checkbox enabled
 
 tasks for later :
-- sometimes tracks that are beat synced (but started in specific ways) have their vertical bars not align, which isn't supposed to happen
-- playback is better now, still has some occasional glitch when another track starts while some already play, or while loading another track
-- tempo gap filter like with the old tool (limit tempo differences when searching for similar tracks (or weight it, to be tested later))
-- actually loop loops if some per-track loop checkbox enabled
-- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
 - find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
-- dropping a track takes some processing time, why?
-- do the chroma histograms really require that much data as saved profiles?
-- mixing tools (eg DJ-style filter)
-- tempo glide when auto-changing
 - make graphviz graph better
 - export as traktor/mixxx file
 - automix
 
 check this :
+- copy warning messages and report them
 
 maybe at some point :
 - option to relink track with file
 - option to keep absolute and/or relative url of files
-- detect when bars and audio get out of sync and resync them over the course of the track
+- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantité is a good example of this)
 - handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
 - analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
 - auto beat detection could still be better, maybe refine this kind of detection on proven files
@@ -34,3 +29,5 @@ maybe at some point :
 - handle variations in tempo and chroma (throughout a track)
 - inverse associate with eq profile
 - some audio files still need re-encoding or something
+- still occasional playback glitches
+- dropping a track takes some processing time, why?

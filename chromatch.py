@@ -68,6 +68,8 @@ CHROMA_MIN_FREQ = 20
 CHROMA_MAX_FREQ = 10_000
 CHROMA_ATTENUATION_EXPONENT = 0.5
 CHROMA_SMOOTHING = 0.2
+ZOOM_WAVEFORM_PIXELS_PER_SECOND = 2_400
+ZOOM_WAVEFORM_MAX_WIDTH = 720_000
 PLAYBACK_TRACK_GAIN = 0.45
 METRONOME_CLICK_GAIN = 0.22
 CHROMA_PREVIEW_GAIN = 0.18
@@ -182,6 +184,8 @@ class WaveformSlot:
     original_tempo_var: tk.BooleanVar | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
+    audio_loading: bool = False
+    audio_peak: float = 1.0
     sample_rate: int = 0
     duration: float = 0.0
     position_samples: float = 0.0
@@ -882,32 +886,90 @@ def simple_chroma_peaks(chroma: ChromaEstimate | None) -> str:
     return " ".join(NOTE_NAMES[index] for index in strongest_notes)
 
 
+def audio_file_duration(path: Path) -> float | None:
+    try:
+        duration = float(sf.info(path).duration)
+    except Exception:
+        return None
+    return duration if np.isfinite(duration) and duration > 0 else None
+
+
+def waveform_peaks_for_duration(
+    mono: np.ndarray,
+    sample_rate: int,
+    width: int,
+    display_duration: float,
+    normalize: bool = True,
+) -> np.ndarray:
+    decoded_duration = len(mono) / sample_rate if sample_rate > 0 else 0.0
+    if mono.size == 0:
+        return np.zeros(width, dtype=np.float32)
+
+    if display_duration > decoded_duration * 1.01 and decoded_duration > 0:
+        decoded_width = max(1, min(width, int(math.ceil(width * decoded_duration / display_duration))))
+    else:
+        decoded_width = width
+
+    if mono.size <= decoded_width:
+        positions = np.linspace(0, mono.size - 1, decoded_width)
+        peaks = np.abs(np.interp(positions, np.arange(mono.size), mono))
+    else:
+        edges = np.linspace(0, mono.size, decoded_width + 1).astype(int)
+        absolute = np.abs(mono)
+        starts = edges[:-1]
+        ends = np.maximum(starts + 1, edges[1:])
+        peaks = np.maximum.reduceat(absolute, starts)
+        peaks = np.maximum(peaks, absolute[ends - 1])
+
+    peak = np.max(peaks)
+    if normalize and peak > 0:
+        peaks = peaks / peak
+    if decoded_width < width:
+        padded = np.zeros(width, dtype=np.float32)
+        padded[:decoded_width] = peaks
+        peaks = padded
+    return peaks.astype(np.float32)
+
+
 def waveform_overview(path: Path, width: int = 900) -> tuple[np.ndarray, float]:
     audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
     mono = audio.mean(axis=1)
-    duration = len(mono) / sample_rate if sample_rate > 0 else 0.0
-    if mono.size == 0:
-        return np.zeros(width, dtype=np.float32), duration
-
-    if mono.size <= width:
-        positions = np.linspace(0, mono.size - 1, width)
-        peaks = np.abs(np.interp(positions, np.arange(mono.size), mono))
-    else:
-        edges = np.linspace(0, mono.size, width + 1).astype(int)
-        peaks = np.empty(width, dtype=np.float32)
-        absolute = np.abs(mono)
-        for index in range(width):
-            start = edges[index]
-            end = max(start + 1, edges[index + 1])
-            peaks[index] = np.max(absolute[start:end])
-
-    peak = np.max(peaks)
-    if peak > 0:
-        peaks = peaks / peak
+    decoded_duration = len(mono) / sample_rate if sample_rate > 0 else 0.0
+    duration = max(decoded_duration, audio_file_duration(path) or 0.0)
+    peaks = waveform_peaks_for_duration(mono, sample_rate, width, duration)
     return peaks.astype(np.float32), duration
 
 
-def zoom_waveform_width(duration: float, pixels_per_second: int = 720, max_width: int = 240_000) -> int:
+def audio_window_waveform_peaks(
+    audio: np.ndarray,
+    sample_rate: int,
+    start_seconds: float,
+    end_seconds: float,
+    width: int,
+    normalize_peak: float | None = None,
+) -> np.ndarray:
+    if sample_rate <= 0 or width <= 0 or end_seconds <= start_seconds or audio.size == 0:
+        return np.zeros(max(0, width), dtype=np.float32)
+
+    start_sample = max(0, int(math.floor(start_seconds * sample_rate)))
+    end_sample = min(len(audio), int(math.ceil(end_seconds * sample_rate)))
+    if end_sample <= start_sample:
+        return np.zeros(width, dtype=np.float32)
+
+    segment = audio[start_sample:end_sample]
+    if segment.ndim > 1:
+        segment = segment.mean(axis=1)
+    peaks = waveform_peaks_for_duration(segment, sample_rate, width, end_seconds - start_seconds, normalize=False)
+    if normalize_peak is not None and normalize_peak > 0:
+        peaks = peaks / normalize_peak
+    return np.clip(peaks, 0.0, 1.0).astype(np.float32)
+
+
+def zoom_waveform_width(
+    duration: float,
+    pixels_per_second: int = ZOOM_WAVEFORM_PIXELS_PER_SECOND,
+    max_width: int = ZOOM_WAVEFORM_MAX_WIDTH,
+) -> int:
     if duration <= 0:
         return 900
 
@@ -2804,16 +2866,21 @@ class TempoWindow:
 
     def refresh_table(self) -> None:
         selected_ids = set(self.table.selection())
-        selected_match_uids = {
+        match_context_uids = {
             row.row_uid
             for row in self.rows
             if self.row_id(row) in selected_ids and row.row_uid is not None
         }
+        match_context_uids.update(
+            slot.row.row_uid
+            for slot in self.waveform_slots
+            if slot.row.row_uid is not None
+        )
         self.clear_tables()
         self.update_row_part_numbers()
         self.rebuild_match_counts()
 
-        for row in self.filtered_sorted_rows(selected_match_uids):
+        for row in self.filtered_sorted_rows(match_context_uids):
             row_id = self.row_id(row)
             self.play_table.insert("", "end", iid=row_id, values=("Play",))
             tags = ("similarity_target",) if row_id in self.similarity_target_ids else ()
@@ -2836,14 +2903,20 @@ class TempoWindow:
                     for row_id in self.table.selection()
                     if (selected := self.row_by_id(row_id)) is not None and selected.row_uid is not None
                 }
-            if not selected_uids or row.row_uid in selected_uids:
+                selected_uids.update(
+                    slot.row.row_uid
+                    for slot in self.waveform_slots
+                    if slot.row.row_uid is not None
+                )
+            if not selected_uids or row.row_uid is None:
                 return False
             matched_uids = {
                 other_uid
                 for selected_uid in selected_uids
                 for other_uid, _score in self.matches_for(selected_uid)
             }
-            if row.row_uid not in matched_uids:
+            visible_uids = set(selected_uids) | matched_uids
+            if row.row_uid not in visible_uids:
                 return False
 
         query = self.search_text_var.get().strip().casefold()
@@ -2998,7 +3071,41 @@ class TempoWindow:
         )
         self.waveform_slots.append(slot)
         self.render_waveforms()
+        self.load_slot_audio_for_precise_zoom(slot)
         self.update_target_tempo_from_waveforms()
+
+    def load_slot_audio_for_precise_zoom(self, slot: WaveformSlot) -> None:
+        with self.mixer_lock:
+            if slot.audio is not None or slot.audio_loading:
+                return
+            slot.audio_loading = True
+
+        def worker() -> None:
+            audio = None
+            sample_rate = 0
+            try:
+                audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
+            except Exception:
+                pass
+
+            def complete(redraw: bool = True) -> None:
+                with self.mixer_lock:
+                    slot.audio_loading = False
+                    if audio is not None and slot.audio is None:
+                        slot.audio = audio
+                        slot.sample_rate = sample_rate
+                        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+                        slot.audio_peak = peak if peak > 0 else 1.0
+                        slot.position_samples = self.slot_position_samples_for_playhead(slot)
+                if redraw and slot in self.waveform_slots:
+                    self.draw_zoomed_waveform(slot)
+
+            try:
+                self.root.after(0, complete)
+            except RuntimeError:
+                complete(redraw=False)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def update_waveform_selection(self) -> None:
         selected_ids = list(self.table.selection())
@@ -3314,7 +3421,7 @@ class TempoWindow:
 
         center = slot.playhead * slot.duration
         zoom_seconds = self.zoom_seconds_for_slot(slot)
-        half_width = min(slot.duration, max(0.05, zoom_seconds)) / 2
+        half_width = min(slot.duration, max(0.02, zoom_seconds)) / 2
         start = max(0.0, center - half_width)
         end = min(slot.duration, center + half_width)
         if end - start < zoom_seconds and slot.duration > zoom_seconds:
@@ -3330,7 +3437,7 @@ class TempoWindow:
 
         if playback_rate <= 0:
             playback_rate = 1.0
-        return max(0.05, min(60.0, self.zoom_seconds * playback_rate))
+        return max(0.02, min(60.0, self.zoom_seconds * playback_rate))
 
     def slot_beat_seconds(self, slot: WaveformSlot) -> float | None:
         tempo = self.row_tempo_for_matching(slot.row)
@@ -3386,20 +3493,38 @@ class TempoWindow:
         mid = height // 2
         canvas.delete("all")
 
-        display_waveform = slot.zoom_waveform if slot.zoom_waveform.size else slot.waveform
-        if display_waveform.size == 0 or slot.duration <= 0:
+        if slot.duration <= 0:
             canvas.create_text(width // 2, height // 2, text="no zoom", fill="#777777")
             return
 
         start_seconds, end_seconds = self.zoom_window_seconds(slot)
         window_duration = max(1e-6, end_seconds - start_seconds)
-        start_index = max(0, int((start_seconds / slot.duration) * (display_waveform.size - 1)))
-        end_index = min(display_waveform.size - 1, int((end_seconds / slot.duration) * (display_waveform.size - 1)))
-        if end_index <= start_index:
-            end_index = min(display_waveform.size - 1, start_index + 1)
+        with self.mixer_lock:
+            audio = slot.audio
+            sample_rate = slot.sample_rate
+            audio_peak = slot.audio_peak
+        if audio is not None:
+            shown = audio_window_waveform_peaks(
+                audio,
+                sample_rate,
+                start_seconds,
+                end_seconds,
+                width,
+                normalize_peak=audio_peak,
+            )
+        else:
+            display_waveform = slot.zoom_waveform if slot.zoom_waveform.size else slot.waveform
+            if display_waveform.size == 0:
+                canvas.create_text(width // 2, height // 2, text="no zoom", fill="#777777")
+                return
 
-        indices = np.linspace(start_index, end_index, width).astype(int)
-        shown = display_waveform[indices]
+            start_index = max(0, int((start_seconds / slot.duration) * (display_waveform.size - 1)))
+            end_index = min(display_waveform.size - 1, int((end_seconds / slot.duration) * (display_waveform.size - 1)))
+            if end_index <= start_index:
+                end_index = min(display_waveform.size - 1, start_index + 1)
+
+            indices = np.linspace(start_index, end_index, width).astype(int)
+            shown = display_waveform[indices]
         for x, value in enumerate(shown):
             y = int(value * (height * 0.42))
             canvas.create_line(x, mid - y, x, mid + y, fill="#2f5568")
@@ -3558,7 +3683,7 @@ class TempoWindow:
         with self.mixer_lock:
             slot.playhead = max(0.0, min(1.0, x / width))
             if slot.audio is not None:
-                slot.position_samples = slot.playhead * len(slot.audio)
+                slot.position_samples = self.slot_position_samples_for_playhead(slot)
             if slot.is_playing:
                 self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
@@ -3576,7 +3701,7 @@ class TempoWindow:
         with self.mixer_lock:
             slot.playhead = max(0.0, min(1.0, seek_seconds / slot.duration))
             if slot.audio is not None:
-                slot.position_samples = slot.playhead * len(slot.audio)
+                slot.position_samples = self.slot_position_samples_for_playhead(slot)
             if slot.is_playing:
                 self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
@@ -3604,7 +3729,7 @@ class TempoWindow:
         with self.mixer_lock:
             slot.playhead = next_seconds / slot.duration
             if slot.audio is not None:
-                slot.position_samples = slot.playhead * len(slot.audio)
+                slot.position_samples = self.slot_position_samples_for_playhead(slot)
             if slot.is_playing:
                 self.sync_slot_to_master_beat(slot)
         slot.zoom_drag_last_x = x
@@ -3617,7 +3742,7 @@ class TempoWindow:
 
     def zoom_waveform_view(self, slot: WaveformSlot, delta: int) -> None:
         factor = 0.8 if delta > 0 else 1.25
-        self.zoom_seconds = max(0.05, min(60.0, self.zoom_seconds * factor))
+        self.zoom_seconds = max(0.02, min(60.0, self.zoom_seconds * factor))
         for candidate in self.waveform_slots:
             candidate.zoom_seconds = self.zoom_seconds
         self.draw_all_zoomed_waveforms()
@@ -3925,7 +4050,7 @@ class TempoWindow:
             next_seconds = max(0.0, min(slot.duration, current_seconds + beat_seconds * beat_count))
             slot.playhead = next_seconds / slot.duration
             if slot.audio is not None:
-                slot.position_samples = slot.playhead * len(slot.audio)
+                slot.position_samples = self.slot_position_samples_for_playhead(slot)
             if slot.is_playing:
                 self.sync_slot_to_master_beat(slot)
         self.draw_waveform(slot)
@@ -4025,6 +4150,20 @@ class TempoWindow:
         synced_seconds = anchor + (beat_number + target_phase) * beat_seconds
         return max(0.0, min(slot.duration, synced_seconds))
 
+    def slot_position_samples_for_playhead(self, slot: WaveformSlot) -> float:
+        if slot.audio is None:
+            return 0.0
+        if slot.sample_rate > 0 and slot.duration > 0:
+            return slot.playhead * slot.duration * slot.sample_rate
+        return slot.playhead * len(slot.audio)
+
+    def slot_playhead_for_position_samples(self, slot: WaveformSlot) -> float:
+        if slot.audio is None:
+            return slot.playhead
+        if slot.sample_rate > 0 and slot.duration > 0:
+            return max(0.0, min(1.0, slot.position_samples / (slot.duration * slot.sample_rate)))
+        return max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
+
     def sync_slot_to_master_beat(self, slot: WaveformSlot) -> None:
         if not self.beat_sync_enabled or slot.duration <= 0:
             return
@@ -4033,7 +4172,7 @@ class TempoWindow:
         synced_seconds = self.synced_source_seconds_for_slot(slot, current_seconds)
         slot.playhead = synced_seconds / slot.duration
         if slot.audio is not None:
-            slot.position_samples = slot.playhead * len(slot.audio)
+            slot.position_samples = self.slot_position_samples_for_playhead(slot)
 
     def play_chroma_preview(self, chroma_bin: float) -> None:
         if not self.ensure_sounddevice_available():
@@ -4163,7 +4302,9 @@ class TempoWindow:
         audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
         slot.audio = audio
         slot.sample_rate = sample_rate
-        slot.position_samples = slot.playhead * len(audio)
+        peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+        slot.audio_peak = peak if peak > 0 else 1.0
+        slot.position_samples = self.slot_position_samples_for_playhead(slot)
 
     def start_waveform_stinger(self, slot: WaveformSlot) -> None:
         if not self.ensure_sounddevice_available():
@@ -4182,7 +4323,7 @@ class TempoWindow:
                     return
 
                 restore_playhead = slot.playhead
-                restore_position = restore_playhead * len(slot.audio)
+                restore_position = self.slot_position_samples_for_playhead(slot)
                 slot.position_samples = restore_position
                 slot.stinger_restore_position_samples = restore_position
                 slot.stinger_restore_playhead = restore_playhead
@@ -4287,10 +4428,10 @@ class TempoWindow:
                         slot.is_playing = False
                 elif slot.loop and max_index > 0:
                     slot.position_samples = next_position % max_index
-                    slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
+                    slot.playhead = TempoWindow.slot_playhead_for_position_samples(self, slot)
                 else:
                     slot.position_samples = next_position
-                    slot.playhead = max(0.0, min(1.0, slot.position_samples / len(slot.audio)))
+                    slot.playhead = TempoWindow.slot_playhead_for_position_samples(self, slot)
                     if slot.position_samples >= max_index:
                         slot.is_playing = False
 

@@ -381,7 +381,20 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.app.refresh_table()
 
-        self.assertEqual((self.app.row_id(second),), self.app.table.get_children())
+        self.assertEqual((self.app.row_id(first), self.app.row_id(second)), self.app.table.get_children())
+
+    def test_matches_only_filter_keeps_displayed_tracks_and_their_matches(self):
+        first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav"), row_uid=20)
+        third = chromatch.replace(self.make_row("third.wav"), row_uid=30)
+        self.app.rows = [first, second, third]
+        self.app.waveform_slots = [chromatch.WaveformSlot(row_id=self.app.row_id(first), row=first)]
+        self.app.set_match(10, 20, 1)
+        self.app.show_matches_only_var.set(True)
+
+        self.app.refresh_table()
+
+        self.assertEqual((self.app.row_id(first), self.app.row_id(second)), self.app.table.get_children())
 
     def test_matches_only_filter_without_selection_hides_all_rows(self):
         first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
@@ -477,17 +490,81 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(100 / sample_rate, duration)
         self.assertGreater(peaks[-1], 0.9)
 
+    def test_waveform_overview_leaves_undecoded_tail_empty(self):
+        sample_rate = 10
+        audio = np.ones(20, dtype=np.float32)
+
+        peaks = chromatch.waveform_peaks_for_duration(audio, sample_rate, width=100, display_duration=10.0)
+
+        self.assertGreater(peaks[19], 0.9)
+        self.assertEqual(0.0, peaks[20])
+        self.assertEqual(0.0, peaks[-1])
+
     def test_zoom_waveform_width_scales_with_track_duration(self):
-        self.assertEqual(900, chromatch.zoom_waveform_width(1.0))
-        self.assertEqual(14_400, chromatch.zoom_waveform_width(20.0))
-        self.assertEqual(240_000, chromatch.zoom_waveform_width(1_000.0))
+        self.assertEqual(2_400, chromatch.zoom_waveform_width(1.0))
+        self.assertEqual(48_000, chromatch.zoom_waveform_width(20.0))
+        self.assertEqual(720_000, chromatch.zoom_waveform_width(1_000.0))
+
+    def test_waveform_peaks_keep_bin_edge_transients(self):
+        sample_rate = 100
+        audio = np.zeros(100, dtype=np.float32)
+        audio[19] = 1.0
+        audio[20] = 0.8
+
+        peaks = chromatch.waveform_peaks_for_duration(audio, sample_rate, width=5, display_duration=1.0)
+
+        self.assertGreater(peaks[0], 0.9)
+        self.assertGreater(peaks[1], 0.7)
+
+    def test_audio_window_waveform_peaks_use_visible_audio_samples(self):
+        sample_rate = 100
+        audio = np.zeros((100, 2), dtype=np.float32)
+        audio[50] = 1.0
+
+        peaks = chromatch.audio_window_waveform_peaks(
+            audio,
+            sample_rate,
+            0.45,
+            0.55,
+            width=10,
+            normalize_peak=1.0,
+        )
+
+        self.assertEqual(10, peaks.size)
+        self.assertGreater(float(np.max(peaks)), 0.9)
+
+    def test_audio_window_waveform_peaks_use_fixed_track_scale(self):
+        sample_rate = 100
+        audio = np.zeros((100, 2), dtype=np.float32)
+        audio[10] = 0.25
+        audio[50] = 1.0
+
+        quiet = chromatch.audio_window_waveform_peaks(
+            audio,
+            sample_rate,
+            0.05,
+            0.15,
+            width=10,
+            normalize_peak=1.0,
+        )
+        loud = chromatch.audio_window_waveform_peaks(
+            audio,
+            sample_rate,
+            0.45,
+            0.55,
+            width=10,
+            normalize_peak=1.0,
+        )
+
+        self.assertLess(float(np.max(quiet)), 0.3)
+        self.assertGreater(float(np.max(loud)), 0.9)
 
     def test_zoom_seconds_allows_tighter_minimum(self):
         row = self.make_row(bpm=120)
         slot = chromatch.WaveformSlot(row_id="track", row=row, duration=10.0)
         self.app.zoom_seconds = 0.01
 
-        self.assertAlmostEqual(0.05, self.app.zoom_seconds_for_slot(slot))
+        self.assertAlmostEqual(0.02, self.app.zoom_seconds_for_slot(slot))
 
     def test_transient_token_times_detects_distinct_attacks(self):
         waveform = np.zeros(1000, dtype=np.float32)
@@ -1335,6 +1412,32 @@ class ChromatchRegressionTests(unittest.TestCase):
         ]
         self.assertGreater(len(line_items), 0)
 
+    def test_zoomed_waveform_prefers_loaded_audio_over_detail_cache(self):
+        row = self.make_row(bpm=120)
+        audio = np.zeros((100, 2), dtype=np.float32)
+        audio[50] = 1.0
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5,
+            duration=1.0,
+            waveform=np.zeros(10, dtype=np.float32),
+            zoom_waveform=np.zeros(100, dtype=np.float32),
+            audio=audio,
+            sample_rate=100,
+        )
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=10, height=54)
+
+        self.app.draw_zoomed_waveform(slot)
+
+        waveform_lines = [
+            slot.zoom_canvas.coords(item)
+            for item in slot.zoom_canvas.find_all()
+            if slot.zoom_canvas.type(item) == "line"
+            and slot.zoom_canvas.itemcget(item, "fill") == "#2f5568"
+        ]
+        self.assertTrue(any(coords[1] != coords[3] for coords in waveform_lines))
+
     def test_zoomed_waveform_draws_cues_and_loops(self):
         row = chromatch.replace(
             self.make_row(bpm=120),
@@ -1837,6 +1940,21 @@ class ChromatchRegressionTests(unittest.TestCase):
         beat_seconds = 60.0 / 120.0
         self.assertAlmostEqual(0.25, (slot.playhead * slot.duration % beat_seconds) / beat_seconds)
         self.assertAlmostEqual(slot.playhead * len(slot.audio), slot.position_samples)
+
+    def test_loaded_audio_position_uses_display_duration_seconds(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.2,
+            duration=10.0,
+            audio=np.zeros((20, 2), dtype=np.float32),
+            sample_rate=10,
+        )
+
+        self.assertAlmostEqual(20.0, self.app.slot_position_samples_for_playhead(slot))
+        slot.position_samples = 10.0
+        self.assertAlmostEqual(0.1, self.app.slot_playhead_for_position_samples(slot))
 
     def test_per_track_tempo_multiplier_slider_value_updates_playback_rate(self):
         row = self.make_row(bpm=100)

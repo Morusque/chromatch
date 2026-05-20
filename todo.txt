@@ -2,13 +2,12 @@
 to review :
 
 next tasks :
-- tempo gap filter like with the old tool (limit tempo differences when searching for similar tracks (or weight it, to be tested later))
 - there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
 - mixing tools (eg a DJ-style filter)
 - actually loop loops if some per-track loop checkbox enabled
+- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
 
 tasks for later :
-- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
 - make graphviz graph better
 - export as traktor/mixxx file
@@ -31,3 +30,4 @@ maybe at some point :
 - some audio files still need re-encoding or something
 - still occasional playback glitches
 - dropping a track takes some processing time, why?
+- reorganize the UI in sections that make sense

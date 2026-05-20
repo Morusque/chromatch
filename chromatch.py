@@ -1327,6 +1327,7 @@ class TempoWindow:
         self.similarity_target_ids: set[str] = set()
         self.table_headings: dict[str, str] = {}
         self.similarity_mode_var = tk.StringVar(value=SIMILARITY_BASE_BPM)
+        self.similarity_tempo_gap_var = tk.StringVar(value="")
         self.search_text_var = tk.StringVar(value="")
         self.search_field_var = tk.StringVar(value="All")
         self.match_cycle_var = tk.StringVar(value="Match: --")
@@ -1463,6 +1464,16 @@ class TempoWindow:
         )
         self.similarity_mode_combo.pack(side="left")
         self.similarity_mode_combo.bind("<<ComboboxSelected>>", self.set_similarity_mode)
+        ttk.Label(primary_actions, text="Tempo gap").pack(side="left", padx=(8, 4))
+        self.similarity_tempo_gap_entry = ttk.Entry(
+            primary_actions,
+            textvariable=self.similarity_tempo_gap_var,
+            width=6,
+        )
+        self.similarity_tempo_gap_entry.pack(side="left")
+        self.similarity_tempo_gap_entry.bind("<KeyRelease>", self.update_similarity_tempo_gap)
+        self.similarity_tempo_gap_entry.bind("<FocusOut>", self.update_similarity_tempo_gap)
+        ttk.Label(primary_actions, text="BPM").pack(side="left", padx=(4, 0))
 
         self.split_button = ttk.Button(
             secondary_actions,
@@ -2217,6 +2228,17 @@ class TempoWindow:
         self.update_sort_headings()
         self.refresh_table()
 
+    def similarity_tempo_gap_bpm(self) -> float | None:
+        gap = parse_optional_float(self.similarity_tempo_gap_var.get())
+        if gap is None or gap <= 0:
+            return None
+        return gap
+
+    def update_similarity_tempo_gap(self, _event=None) -> None:
+        if self.current_similarity_target_rows() or self.table.selection():
+            self.update_similarity_scores()
+        self.refresh_table()
+
     def update_table_filter(self, _event=None) -> None:
         self.refresh_table()
 
@@ -2691,8 +2713,12 @@ class TempoWindow:
 
         updated_rows = []
         for row in self.rows:
-            chroma_similarity = self.calculate_chroma_similarity(row, combined_histogram)
-            chroma_tempo_similarity = self.calculate_chroma_tempo_similarity(row, targets)
+            if self.row_matches_similarity_tempo_gap(row, targets):
+                chroma_similarity = self.calculate_chroma_similarity(row, combined_histogram)
+                chroma_tempo_similarity = self.calculate_chroma_tempo_similarity(row, targets)
+            else:
+                chroma_similarity = None
+                chroma_tempo_similarity = None
             updated_rows.append(
                 replace(
                     row,
@@ -2718,6 +2744,35 @@ class TempoWindow:
             return None
 
         return tempo
+
+    def row_matches_similarity_tempo_gap(
+        self,
+        row: AnalysisRow,
+        targets: list[AnalysisRow] | None = None,
+    ) -> bool:
+        gap = self.similarity_tempo_gap_bpm()
+        if gap is None:
+            return True
+
+        if targets is None:
+            targets = self.current_similarity_target_rows()
+        target_tempos = [
+            tempo
+            for target in targets
+            if (tempo := self.row_tempo_for_matching(target)) is not None
+        ]
+        if not target_tempos:
+            target_tempo = self.target_tempo()
+            if target_tempo is not None and target_tempo > 0:
+                target_tempos = [target_tempo]
+        if not target_tempos:
+            return True
+
+        row_tempo = self.row_tempo_for_matching(row)
+        if row_tempo is None:
+            return False
+
+        return any(abs(row_tempo - target_tempo) <= gap for target_tempo in target_tempos)
 
     def target_tempo(self) -> float | None:
         return parse_optional_float(self.target_tempo_var.get())
@@ -3083,6 +3138,9 @@ class TempoWindow:
             visible_uids = set(selected_uids) | matched_uids
             if row.row_uid not in visible_uids:
                 return False
+
+        if not self.row_matches_similarity_tempo_gap(row):
+            return False
 
         query = self.search_text_var.get().strip().casefold()
         if not query:

@@ -353,6 +353,53 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("55.0", self.app.similarity_text_for_row(row))
 
+    def test_similarity_tempo_gap_hides_rows_outside_target_range(self):
+        target = self.make_chroma_row("target.wav", 120, 0)
+        near = self.make_chroma_row("near.wav", 124, 0)
+        far = self.make_chroma_row("far.wav", 140, 0)
+        self.app.rows = [target, near, far]
+        self.app.similarity_target_ids = {self.app.row_id(target)}
+        self.app.similarity_tempo_gap_var.set("5")
+
+        self.app.update_similarity_scores([target])
+        self.app.refresh_table()
+
+        visible = set(self.app.table.get_children())
+        self.assertIn(self.app.row_id(target), visible)
+        self.assertIn(self.app.row_id(near), visible)
+        self.assertNotIn(self.app.row_id(far), visible)
+
+    def test_similarity_tempo_gap_clears_scores_outside_target_range(self):
+        target = self.make_chroma_row("target.wav", 120, 0)
+        near = self.make_chroma_row("near.wav", 124, 0)
+        far = self.make_chroma_row("far.wav", 140, 0)
+        self.app.rows = [target, near, far]
+        self.app.similarity_tempo_gap_var.set("5")
+
+        self.app.update_similarity_scores([target])
+
+        updated_far = next(row for row in self.app.rows if row.path.name == "far.wav")
+        updated_near = next(row for row in self.app.rows if row.path.name == "near.wav")
+        self.assertIsNone(updated_far.chroma_similarity)
+        self.assertIsNone(updated_far.chroma_tempo_similarity)
+        self.assertIsNotNone(updated_near.chroma_similarity)
+        self.assertIsNotNone(updated_near.chroma_tempo_similarity)
+
+    def test_similarity_tempo_gap_filters_table_against_target_tempo_without_similarity_target(self):
+        near = self.make_row("near.wav", bpm=124)
+        far = self.make_row("far.wav", bpm=140)
+        missing = self.make_row("missing.wav", bpm=None)
+        self.app.rows = [near, far, missing]
+        self.app.target_tempo_var.set("120")
+        self.app.similarity_tempo_gap_var.set("5")
+
+        self.app.refresh_table()
+
+        visible = set(self.app.table.get_children())
+        self.assertIn(self.app.row_id(near), visible)
+        self.assertNotIn(self.app.row_id(far), visible)
+        self.assertNotIn(self.app.row_id(missing), visible)
+
     def test_flat_chroma_profile_does_not_match_everything(self):
         target = np.zeros(chromatch.CHROMA_BINS, dtype=np.float32)
         target[0] = 1.0

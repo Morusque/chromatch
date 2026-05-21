@@ -2,15 +2,12 @@
 to review :
 
 next tasks :
-- there should be a way to quantize cues and loops to closest beat or not (maybe checkbox, on by default)
-- mixing tools (eg a DJ-style filter)
-- actually loop loops if some per-track loop checkbox enabled
 - find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
-
-tasks for later :
 - figure out how "base" could (or could not) be calculated and aim for an automatic base detection
 - make graphviz graph better
 - export as traktor/mixxx file
+
+tasks for later :
 - automix
 
 check this :

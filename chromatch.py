@@ -162,6 +162,7 @@ class WaveformSlot:
     row: AnalysisRow
     tempo_multiplier: float = 1.0
     volume: float = 1.0
+    filter_amount: float = 0.0
     use_original_tempo: bool = False
     kept: bool = False
     loop: bool = False
@@ -181,6 +182,8 @@ class WaveformSlot:
     tempo_multiplier_label: ttk.Label | None = None
     volume_var: tk.DoubleVar | None = None
     volume_label: ttk.Label | None = None
+    filter_var: tk.DoubleVar | None = None
+    filter_label: ttk.Label | None = None
     original_tempo_var: tk.BooleanVar | None = None
     stream: object | None = None
     audio: np.ndarray | None = None
@@ -195,6 +198,9 @@ class WaveformSlot:
     waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     zoom_waveform: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     transient_tokens: tuple[float, ...] = ()
+    filter_low_state: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
+    filter_high_input_state: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
+    filter_high_output_state: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
 
 
 def fold_bpm(bpm: float) -> float:
@@ -887,6 +893,52 @@ def circular_shift(values: np.ndarray, shift_bins: float) -> np.ndarray:
     return values[lower] * (1.0 - fraction) + values[upper] * fraction
 
 
+def dj_filter_cutoff_hz(amount: float) -> float:
+    amount = max(-1.0, min(1.0, float(amount)))
+    depth = abs(amount)
+    if depth <= 1e-6:
+        return 20_000.0
+    if amount < 0:
+        return float(20_000.0 * ((250.0 / 20_000.0) ** depth))
+    return float(20.0 * ((5_000.0 / 20.0) ** depth))
+
+
+def apply_dj_filter_block(
+    samples: np.ndarray,
+    sample_rate: int,
+    amount: float,
+    low_state: np.ndarray,
+    high_input_state: np.ndarray,
+    high_output_state: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    amount = max(-1.0, min(1.0, float(amount)))
+    if abs(amount) <= 1e-6 or samples.size == 0 or sample_rate <= 0:
+        return samples, low_state, high_input_state, high_output_state
+
+    cutoff = dj_filter_cutoff_hz(amount)
+    dt = 1.0 / sample_rate
+    rc = 1.0 / (2.0 * math.pi * cutoff)
+    output = np.empty_like(samples)
+
+    if amount < 0:
+        alpha = dt / (rc + dt)
+        state = low_state.astype(np.float32, copy=True)
+        for index, frame in enumerate(samples):
+            state = state + alpha * (frame - state)
+            output[index] = state
+        return output, state, high_input_state, high_output_state
+
+    alpha = rc / (rc + dt)
+    previous_input = high_input_state.astype(np.float32, copy=True)
+    previous_output = high_output_state.astype(np.float32, copy=True)
+    for index, frame in enumerate(samples):
+        filtered = alpha * (previous_output + frame - previous_input)
+        output[index] = filtered
+        previous_input = frame
+        previous_output = filtered
+    return output, low_state, previous_input, previous_output
+
+
 def simple_chroma_peaks(chroma: ChromaEstimate | None) -> str:
     if chroma is None:
         return ""
@@ -1348,6 +1400,7 @@ class TempoWindow:
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
         self.tempo_glide_seconds_var = tk.StringVar(value="0")
         self.beat_jump_var = tk.StringVar(value="4")
+        self.quantize_cues_var = tk.BooleanVar(value=True)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.metronome_enabled_var = tk.BooleanVar(value=False)
@@ -1630,6 +1683,11 @@ class TempoWindow:
             textvariable=self.beat_jump_var,
         )
         self.beat_jump_spinbox.pack(side="left")
+        ttk.Checkbutton(
+            controls,
+            text="Quantize cues",
+            variable=self.quantize_cues_var,
+        ).pack(side="left", padx=(8, 0))
 
         self.waveform_container = ttk.Frame(panel)
         self.waveform_container.pack(fill="x", pady=(8, 0))
@@ -2762,11 +2820,41 @@ class TempoWindow:
             if (tempo := self.row_tempo_for_matching(target)) is not None
         ]
         if not target_tempos:
-            target_tempo = self.target_tempo()
-            if target_tempo is not None and target_tempo > 0:
-                target_tempos = [target_tempo]
-        if not target_tempos:
             return True
+
+        row_tempo = self.row_tempo_for_matching(row)
+        if row_tempo is None:
+            return False
+
+        return any(abs(row_tempo - target_tempo) <= gap for target_tempo in target_tempos)
+
+    def row_matches_tempo_gap_filter(
+        self,
+        row: AnalysisRow,
+        context_ids: set[str] | None = None,
+        target_tempos: list[float] | None = None,
+    ) -> bool:
+        gap = self.similarity_tempo_gap_bpm()
+        if gap is None:
+            return True
+
+        if context_ids is not None and self.row_id(row) in context_ids:
+            return True
+
+        if target_tempos is None:
+            selected_rows = [
+                selected
+                for row_id in self.table.selection()
+                if (selected := self.row_by_id(row_id)) is not None
+            ]
+            target_tempos = [
+                tempo
+                for selected in selected_rows
+                if (tempo := self.row_tempo_for_matching(selected)) is not None
+            ]
+
+        if not target_tempos:
+            return False
 
         row_tempo = self.row_tempo_for_matching(row)
         if row_tempo is None:
@@ -3096,11 +3184,18 @@ class TempoWindow:
             for slot in self.waveform_slots
             if slot.row.row_uid is not None
         )
+        tempo_gap_context_ids = set(selected_ids)
+        tempo_gap_context_ids.update(slot.row_id for slot in self.waveform_slots)
+        tempo_gap_target_tempos = [
+            tempo
+            for row in self.rows
+            if self.row_id(row) in selected_ids and (tempo := self.row_tempo_for_matching(row)) is not None
+        ]
         self.clear_tables()
         self.update_row_part_numbers()
         self.rebuild_match_counts()
 
-        for row in self.filtered_sorted_rows(match_context_uids):
+        for row in self.filtered_sorted_rows(match_context_uids, tempo_gap_context_ids, tempo_gap_target_tempos):
             row_id = self.row_id(row)
             self.play_table.insert("", "end", iid=row_id, values=("Play",))
             tags = ("similarity_target",) if row_id in self.similarity_target_ids else ()
@@ -3111,10 +3206,25 @@ class TempoWindow:
         if restored_selection:
             self.table.selection_set(restored_selection)
 
-    def filtered_sorted_rows(self, selected_match_uids: set[int] | None = None) -> list[AnalysisRow]:
-        return [row for row in self.sorted_rows() if self.row_matches_search(row, selected_match_uids)]
+    def filtered_sorted_rows(
+        self,
+        selected_match_uids: set[int] | None = None,
+        tempo_gap_context_ids: set[str] | None = None,
+        tempo_gap_target_tempos: list[float] | None = None,
+    ) -> list[AnalysisRow]:
+        return [
+            row
+            for row in self.sorted_rows()
+            if self.row_matches_search(row, selected_match_uids, tempo_gap_context_ids, tempo_gap_target_tempos)
+        ]
 
-    def row_matches_search(self, row: AnalysisRow, selected_match_uids: set[int] | None = None) -> bool:
+    def row_matches_search(
+        self,
+        row: AnalysisRow,
+        selected_match_uids: set[int] | None = None,
+        tempo_gap_context_ids: set[str] | None = None,
+        tempo_gap_target_tempos: list[float] | None = None,
+    ) -> bool:
         if self.show_matches_only_var.get():
             selected_uids = selected_match_uids
             if selected_uids is None:
@@ -3139,7 +3249,7 @@ class TempoWindow:
             if row.row_uid not in visible_uids:
                 return False
 
-        if not self.row_matches_similarity_tempo_gap(row):
+        if not self.row_matches_tempo_gap_filter(row, tempo_gap_context_ids, tempo_gap_target_tempos):
             return False
 
         query = self.search_text_var.get().strip().casefold()
@@ -3523,6 +3633,22 @@ class TempoWindow:
             )
             volume_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_volume(slot))
             volume_scale.pack(side="left")
+            slot.filter_var = tk.DoubleVar(value=slot.filter_amount)
+            filter_frame = ttk.Frame(bottom_controls)
+            filter_frame.pack(side="left", padx=(4, 0))
+            slot.filter_label = ttk.Label(filter_frame, text=self.filter_label_text(slot.filter_amount), width=7)
+            slot.filter_label.pack(side="left")
+            filter_scale = ttk.Scale(
+                filter_frame,
+                from_=-1.0,
+                to=1.0,
+                orient="horizontal",
+                length=90,
+                variable=slot.filter_var,
+                command=lambda value, slot=slot: self.set_slot_filter(slot, value),
+            )
+            filter_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_filter(slot))
+            filter_scale.pack(side="left")
             slot.original_tempo_var = tk.BooleanVar(value=slot.use_original_tempo)
             ttk.Checkbutton(
                 bottom_controls,
@@ -3677,6 +3803,23 @@ class TempoWindow:
         if anchors:
             return max(anchors)
         return self.slot_beat_anchor_seconds(slot)
+
+    def quantized_cue_seconds(self, slot: WaveformSlot, seconds: float) -> float:
+        try:
+            should_quantize = bool(self.quantize_cues_var.get())
+        except tk.TclError:
+            should_quantize = True
+        if not should_quantize:
+            return max(0.0, min(slot.duration, seconds))
+
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or beat_seconds <= 0:
+            return max(0.0, min(slot.duration, seconds))
+
+        anchor = self.slot_resync_anchor_seconds(slot, seconds)
+        beat_number = round((seconds - anchor) / beat_seconds)
+        quantized = anchor + beat_number * beat_seconds
+        return max(0.0, min(slot.duration, round(quantized, 6)))
 
     def resynced_beat_line_times(self, slot: WaveformSlot, start_seconds: float, end_seconds: float) -> list[float]:
         beat_seconds = self.slot_beat_seconds(slot)
@@ -3989,7 +4132,7 @@ class TempoWindow:
         if slot.duration <= 0:
             return
 
-        seconds = slot.playhead * slot.duration
+        seconds = self.quantized_cue_seconds(slot, slot.playhead * slot.duration)
         self.add_row_cue_point(slot.row_id, seconds)
         self.refresh_table()
         self.draw_zoomed_waveform(slot)
@@ -3999,9 +4142,12 @@ class TempoWindow:
         if slot.duration <= 0:
             return
 
-        seconds = slot.playhead * slot.duration
+        seconds = self.quantized_cue_seconds(slot, slot.playhead * slot.duration)
         length_beats = self.beat_jump_count()
         self.add_row_cue_point(slot.row_id, seconds, length_beats)
+        slot.loop = True
+        if slot.loop_var is not None:
+            slot.loop_var.set(True)
         self.refresh_table()
         self.draw_zoomed_waveform(slot)
         self.result.configure(
@@ -4319,6 +4465,31 @@ class TempoWindow:
             slot.volume_var.set(1.0)
         self.set_slot_volume(slot, "1.0")
 
+    def filter_label_text(self, amount: float) -> str:
+        if abs(amount) < 0.005:
+            return "Filter"
+        prefix = "LP" if amount < 0 else "HP"
+        return f"{prefix} {abs(amount):.2f}"
+
+    def set_slot_filter(self, slot: WaveformSlot, value: str) -> None:
+        amount = max(-1.0, min(1.0, float(value)))
+        amount = round(amount, 3 if self.ctrl_pressed else 2)
+        with self.mixer_lock:
+            slot.filter_amount = amount
+            if abs(amount) <= 0.005:
+                slot.filter_low_state[:] = 0.0
+                slot.filter_high_input_state[:] = 0.0
+                slot.filter_high_output_state[:] = 0.0
+        if slot.filter_var is not None and abs(slot.filter_var.get() - amount) > 1e-9:
+            slot.filter_var.set(amount)
+        if slot.filter_label is not None:
+            slot.filter_label.configure(text=self.filter_label_text(amount))
+
+    def reset_slot_filter(self, slot: WaveformSlot) -> None:
+        if slot.filter_var is not None:
+            slot.filter_var.set(0.0)
+        self.set_slot_filter(slot, "0.0")
+
     def set_waveform_keep(self, slot: WaveformSlot) -> None:
         slot.kept = bool(slot.keep_var.get()) if slot.keep_var is not None else not slot.kept
         self.update_waveform_selection()
@@ -4372,6 +4543,30 @@ class TempoWindow:
         beat_number = round(((current_seconds - anchor) / beat_seconds) - target_phase)
         synced_seconds = anchor + (beat_number + target_phase) * beat_seconds
         return max(0.0, min(slot.duration, synced_seconds))
+
+    def slot_loop_bounds_samples(self, slot: WaveformSlot, position_samples: float) -> tuple[float, float] | None:
+        if not slot.loop or slot.sample_rate <= 0:
+            return None
+
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or beat_seconds <= 0:
+            return None
+
+        current_seconds = position_samples / slot.sample_rate
+        loop_bounds = []
+        for cue in slot.row.cue_points:
+            if cue.length_beats is None:
+                continue
+            start_seconds = max(0.0, cue.seconds)
+            end_seconds = start_seconds + cue.length_beats * beat_seconds
+            if end_seconds <= start_seconds:
+                continue
+            if start_seconds <= current_seconds < end_seconds:
+                loop_bounds.append((start_seconds * slot.sample_rate, end_seconds * slot.sample_rate))
+
+        if not loop_bounds:
+            return None
+        return min(loop_bounds, key=lambda bounds: bounds[1] - bounds[0])
 
     def slot_position_samples_for_playhead(self, slot: WaveformSlot) -> float:
         if slot.audio is None:
@@ -4631,7 +4826,15 @@ class TempoWindow:
                 stinger_remaining = slot.stinger_remaining_samples
                 positions = slot.position_samples + np.arange(frames) * (slot.sample_rate / self.mixer_sample_rate) * rate
                 max_index = len(slot.audio) - 1
-                if slot.loop and max_index > 0:
+                loop_bounds_for_slot = getattr(self, "slot_loop_bounds_samples", None)
+                loop_bounds = None if loop_bounds_for_slot is None else loop_bounds_for_slot(slot, slot.position_samples)
+                if loop_bounds is not None:
+                    loop_start, loop_end = loop_bounds
+                    loop_end = min(float(max_index), max(loop_start + 1.0, loop_end))
+                    loop_length = loop_end - loop_start
+                    sample_positions = loop_start + np.mod(positions - loop_start, loop_length)
+                    valid = np.ones(frames, dtype=bool)
+                elif slot.loop and max_index > 0:
                     sample_positions = np.mod(positions, max_index)
                     valid = np.ones(frames, dtype=bool)
                 else:
@@ -4647,7 +4850,22 @@ class TempoWindow:
                     mixed = slot.audio[lower] * (1.0 - fraction[:, None]) + slot.audio[upper] * fraction[:, None]
                     if mixed.shape[1] == 1:
                         mixed = np.repeat(mixed, 2, axis=1)
-                    output[valid] += mixed[:, :2] * PLAYBACK_TRACK_GAIN * slot.volume
+                    mixed = mixed[:, :2]
+                    if abs(slot.filter_amount) > 0.005:
+                        (
+                            mixed,
+                            slot.filter_low_state,
+                            slot.filter_high_input_state,
+                            slot.filter_high_output_state,
+                        ) = apply_dj_filter_block(
+                            mixed.astype(np.float32, copy=False),
+                            self.mixer_sample_rate,
+                            slot.filter_amount,
+                            slot.filter_low_state,
+                            slot.filter_high_input_state,
+                            slot.filter_high_output_state,
+                        )
+                    output[valid] += mixed * PLAYBACK_TRACK_GAIN * slot.volume
 
                 next_position = float(positions[-1] + (slot.sample_rate / self.mixer_sample_rate) * rate)
                 if stinger_remaining is not None:
@@ -4663,6 +4881,12 @@ class TempoWindow:
                         slot.stinger_restore_position_samples = None
                         slot.stinger_restore_playhead = None
                         slot.is_playing = False
+                elif loop_bounds is not None:
+                    loop_start, loop_end = loop_bounds
+                    loop_end = min(float(max_index), max(loop_start + 1.0, loop_end))
+                    loop_length = loop_end - loop_start
+                    slot.position_samples = loop_start + ((next_position - loop_start) % loop_length)
+                    slot.playhead = TempoWindow.slot_playhead_for_position_samples(self, slot)
                 elif slot.loop and max_index > 0:
                     slot.position_samples = next_position % max_index
                     slot.playhead = TempoWindow.slot_playhead_for_position_samples(self, slot)

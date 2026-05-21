@@ -358,10 +358,10 @@ class ChromatchRegressionTests(unittest.TestCase):
         near = self.make_chroma_row("near.wav", 124, 0)
         far = self.make_chroma_row("far.wav", 140, 0)
         self.app.rows = [target, near, far]
-        self.app.similarity_target_ids = {self.app.row_id(target)}
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(target))
         self.app.similarity_tempo_gap_var.set("5")
 
-        self.app.update_similarity_scores([target])
         self.app.refresh_table()
 
         visible = set(self.app.table.get_children())
@@ -385,20 +385,42 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIsNotNone(updated_near.chroma_similarity)
         self.assertIsNotNone(updated_near.chroma_tempo_similarity)
 
-    def test_similarity_tempo_gap_filters_table_against_target_tempo_without_similarity_target(self):
+    def test_similarity_tempo_gap_filters_table_against_selected_tempo(self):
+        selected = chromatch.replace(self.make_row("selected.wav", bpm=100), tapped_bpm=120)
         near = self.make_row("near.wav", bpm=124)
         far = self.make_row("far.wav", bpm=140)
         missing = self.make_row("missing.wav", bpm=None)
-        self.app.rows = [near, far, missing]
-        self.app.target_tempo_var.set("120")
+        self.app.rows = [selected, near, far, missing]
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(selected))
         self.app.similarity_tempo_gap_var.set("5")
 
         self.app.refresh_table()
 
         visible = set(self.app.table.get_children())
+        self.assertIn(self.app.row_id(selected), visible)
         self.assertIn(self.app.row_id(near), visible)
         self.assertNotIn(self.app.row_id(far), visible)
         self.assertNotIn(self.app.row_id(missing), visible)
+
+    def test_similarity_tempo_gap_keeps_displayed_tracks_visible(self):
+        selected = self.make_row("selected.wav", bpm=120)
+        displayed = self.make_row("displayed.wav", bpm=180)
+        hidden = self.make_row("hidden.wav", bpm=180)
+        self.app.rows = [selected, displayed, hidden]
+        self.app.waveform_slots = [
+            chromatch.WaveformSlot(row_id=self.app.row_id(displayed), row=displayed)
+        ]
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(selected))
+        self.app.similarity_tempo_gap_var.set("5")
+
+        self.app.refresh_table()
+
+        visible = set(self.app.table.get_children())
+        self.assertIn(self.app.row_id(selected), visible)
+        self.assertIn(self.app.row_id(displayed), visible)
+        self.assertNotIn(self.app.row_id(hidden), visible)
 
     def test_flat_chroma_profile_does_not_match_everything(self):
         target = np.zeros(chromatch.CHROMA_BINS, dtype=np.float32)
@@ -1367,6 +1389,60 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN * 0.25))
 
+    def test_per_track_highpass_filter_reduces_constant_signal(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+        row = self.make_row()
+        audio = np.ones((4096, 2), dtype=np.float32)
+        DummyApp.waveform_slots = [
+            chromatch.WaveformSlot(
+                row_id="a",
+                row=row,
+                is_playing=True,
+                audio=audio,
+                sample_rate=44_100,
+                filter_amount=1.0,
+            ),
+        ]
+        outdata = np.zeros((2048, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 2048, None, None)
+
+        self.assertLess(float(np.mean(np.abs(outdata[-512:]))), chromatch.PLAYBACK_TRACK_GAIN * 0.1)
+
+    def test_per_track_lowpass_filter_smooths_alternating_signal(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 44_100
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+        row = self.make_row()
+        alternating = np.tile(np.array([[1.0, 1.0], [-1.0, -1.0]], dtype=np.float32), (2048, 1))
+        DummyApp.waveform_slots = [
+            chromatch.WaveformSlot(
+                row_id="a",
+                row=row,
+                is_playing=True,
+                audio=alternating,
+                sample_rate=44_100,
+                filter_amount=-1.0,
+            ),
+        ]
+        outdata = np.zeros((2048, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 2048, None, None)
+
+        self.assertLess(float(np.std(outdata[:, 0])), chromatch.PLAYBACK_TRACK_GAIN * 0.35)
+
     def test_metronome_generates_click_without_tracks(self):
         class DummyApp:
             mixer_lock = chromatch.threading.RLock()
@@ -1449,6 +1525,84 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertTrue(slot.is_playing)
         self.assertLess(slot.position_samples, len(audio) - 1)
         self.assertTrue(np.allclose(outdata, chromatch.PLAYBACK_TRACK_GAIN))
+
+    def test_looping_track_waits_until_defined_loop_before_range_looping(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 10
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+            def slot_loop_bounds_samples(self, slot, position_samples):
+                return chromatch.TempoWindow.slot_loop_bounds_samples(self, slot, position_samples)
+
+            def slot_beat_seconds(self, slot):
+                tempo = self.row_tempo_for_matching(slot.row)
+                return None if tempo is None or tempo <= 0 else 60.0 / tempo
+
+            def row_tempo_for_matching(self, row):
+                return row.tapped_bpm if row.tapped_bpm is not None else row.bpm
+
+        row = chromatch.replace(self.make_row(bpm=60.0), cue_points=(chromatch.CuePoint(2.0, 2.0),))
+        audio = np.ones((100, 2), dtype=np.float32)
+        slot = chromatch.WaveformSlot(
+            row_id="loop",
+            row=row,
+            is_playing=True,
+            loop=True,
+            audio=audio,
+            sample_rate=10,
+            duration=10.0,
+            position_samples=15.0,
+        )
+        DummyApp.waveform_slots = [slot]
+        outdata = np.zeros((3, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 3, None, None)
+
+        self.assertAlmostEqual(18.0, slot.position_samples)
+
+    def test_looping_track_uses_defined_loop_after_playhead_enters_it(self):
+        class DummyApp:
+            mixer_lock = chromatch.threading.RLock()
+            mixer_sample_rate = 10
+            waveform_slots = []
+
+            def playback_rate_for_slot(self, slot):
+                return 1.0
+
+            def slot_loop_bounds_samples(self, slot, position_samples):
+                return chromatch.TempoWindow.slot_loop_bounds_samples(self, slot, position_samples)
+
+            def slot_beat_seconds(self, slot):
+                tempo = self.row_tempo_for_matching(slot.row)
+                return None if tempo is None or tempo <= 0 else 60.0 / tempo
+
+            def row_tempo_for_matching(self, row):
+                return row.tapped_bpm if row.tapped_bpm is not None else row.bpm
+
+        row = chromatch.replace(self.make_row(bpm=60.0), cue_points=(chromatch.CuePoint(2.0, 2.0),))
+        audio = np.ones((100, 2), dtype=np.float32)
+        slot = chromatch.WaveformSlot(
+            row_id="loop",
+            row=row,
+            is_playing=True,
+            loop=True,
+            audio=audio,
+            sample_rate=10,
+            duration=10.0,
+            position_samples=38.0,
+        )
+        DummyApp.waveform_slots = [slot]
+        outdata = np.zeros((5, 2), dtype=np.float32)
+
+        chromatch.TempoWindow.mixer_callback(DummyApp(), outdata, 5, None, None)
+
+        self.assertGreaterEqual(slot.position_samples, 20.0)
+        self.assertLess(slot.position_samples, 40.0)
+        self.assertAlmostEqual(23.0, slot.position_samples)
 
     def test_stinger_playback_restores_original_position_and_playhead(self):
         class DummyApp:
@@ -1784,10 +1938,62 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual((chromatch.CuePoint(25.0),), self.app.rows[0].cue_points)
 
+    def test_cue_button_quantizes_to_nearest_beat_by_default(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.252, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.set_slot_cue_point(slot)
+
+        self.assertEqual((chromatch.CuePoint(25.0),), self.app.rows[0].cue_points)
+
+    def test_cue_button_can_skip_quantization(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.252, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.quantize_cues_var.set(False)
+
+        self.app.set_slot_cue_point(slot)
+
+        self.assertEqual((chromatch.CuePoint(25.2),), self.app.rows[0].cue_points)
+
     def test_loop_button_adds_current_playhead_loop_with_beat_length(self):
         row = self.make_row("track.wav", bpm=120.0)
         row_id = self.app.row_id(row)
         slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.25, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.beat_jump_var.set("0.5")
+
+        self.app.set_slot_loop_point(slot)
+
+        self.assertEqual((chromatch.CuePoint(25.0, 0.5),), self.app.rows[0].cue_points)
+
+    def test_loop_button_enables_track_loop_checkbox(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.25, duration=100.0)
+        slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
+        slot.loop_var = chromatch.tk.BooleanVar(master=self.app.root, value=False)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        self.app.set_slot_loop_point(slot)
+
+        self.assertTrue(slot.loop)
+        self.assertTrue(slot.loop_var.get())
+
+    def test_loop_button_quantizes_to_nearest_beat_by_default(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, playhead=0.252, duration=100.0)
         slot.zoom_canvas = chromatch.tk.Canvas(self.app.root, width=200, height=54)
         self.app.rows = [row]
         self.app.waveform_slots = [slot]
@@ -2140,15 +2346,25 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.35, slot.volume)
 
+    def test_per_track_filter_slider_value_updates_slot_filter(self):
+        row = self.make_row()
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+
+        self.app.set_slot_filter(slot, "-0.35")
+
+        self.assertAlmostEqual(-0.35, slot.filter_amount)
+
     def test_double_click_reset_helpers_restore_slider_defaults(self):
         row = self.make_row()
-        slot = chromatch.WaveformSlot(row_id="track", row=row, tempo_multiplier=0.75, volume=0.35)
+        slot = chromatch.WaveformSlot(row_id="track", row=row, tempo_multiplier=0.75, volume=0.35, filter_amount=0.5)
 
         self.app.reset_slot_tempo_multiplier(slot)
         self.app.reset_slot_volume(slot)
+        self.app.reset_slot_filter(slot)
 
         self.assertAlmostEqual(1.0, slot.tempo_multiplier)
         self.assertAlmostEqual(1.0, slot.volume)
+        self.assertAlmostEqual(0.0, slot.filter_amount)
 
     def test_play_all_starts_displayed_tracks_without_stopping_active_ones(self):
         first = chromatch.WaveformSlot(row_id="first", row=self.make_row("first.wav"), is_playing=True)

@@ -2,13 +2,12 @@
 to review :
 
 next tasks :
-- find a way for the parts to be more linked together (eg just one line with something like "1/2" in the Part column and a "next part" button somewhere)
-- figure out how "base" could (or could not) be calculated and aim for an automatic base detection
+- figure out how "base" could (or could not) be calculated and aim for an automatic base detection (most bases in chromatch-analysis.json are reviewed and validaded, a few of them are defined over ambiguous tracks where another base could have chosen) see if there's a way to derive them from chroma or something else, maybe build a table comparing top peak, base, other features...
 - make graphviz graph better
 - export as traktor/mixxx file
+- automix
 
 tasks for later :
-- automix
 
 check this :
 - copy warning messages and report them

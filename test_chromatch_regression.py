@@ -307,6 +307,11 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertNotIn("chroma_similarity", columns)
         self.assertNotIn("chroma_tempo_similarity", columns)
 
+    def test_table_includes_base_column(self):
+        columns = tuple(self.app.table.cget("columns"))
+
+        self.assertIn("base", columns)
+
     def test_base_bpm_similarity_mode_groups_close_base_first(self):
         target = chromatch.replace(self.make_chroma_row("target.wav", 120, 0), row_uid=1, base_chroma_bin=100)
         close = chromatch.replace(self.make_chroma_row("close.wav", 120, 0), row_uid=2, base_chroma_bin=109)
@@ -338,6 +343,34 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertLess(self.app.shifted_base_distance_bins(close, target), chromatch.BASE_BPM_CLOSE_DISTANCE_BINS)
         self.assertTrue(self.app.base_bpm_is_close(close, [target]))
         self.assertFalse(self.app.base_bpm_is_close(far, [target]))
+
+    def test_base_column_uses_note_cent_display(self):
+        row = chromatch.replace(self.make_row("track.wav"), base_chroma_bin=5)
+
+        values = self.app.row_values(row)
+
+        self.assertEqual(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS), values[8])
+
+    def test_base_column_is_sortable_by_chroma_bin(self):
+        low = chromatch.replace(self.make_row("low.wav"), base_chroma_bin=5)
+        high = chromatch.replace(self.make_row("high.wav"), base_chroma_bin=80)
+        missing = self.make_row("missing.wav")
+        self.app.rows = [high, missing, low]
+        self.app.sort_column = "base"
+        self.app.sort_descending = False
+
+        self.assertEqual([low, high, missing], self.app.sorted_rows())
+
+    def test_base_column_is_searchable(self):
+        row = chromatch.replace(self.make_row("base.wav"), base_chroma_bin=5)
+        other = self.make_row("other.wav")
+        self.app.rows = [row, other]
+        self.app.search_text_var.set(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS))
+        self.app.search_field_var.set("Base")
+
+        self.app.refresh_table()
+
+        self.assertEqual((self.app.row_id(row),), self.app.table.get_children())
 
     def test_base_bpm_similarity_mode_does_not_scan_targets_when_none_are_active(self):
         row = chromatch.replace(
@@ -751,6 +784,119 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("track.wav", self.app.row_display_name(row))
         self.assertEqual(1, self.app.row_part_number(row))
         self.assertEqual(2, self.app.row_part_number(other))
+
+    def test_part_column_shows_current_and_total_parts(self):
+        row = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        other = chromatch.replace(self.make_row("track.wav"), part_start_seconds=20.0, part_end_seconds=30.0)
+        self.app.rows = [row, other]
+        self.app.refresh_table()
+
+        self.assertEqual("1/2", self.app.row_values(row)[1])
+        self.assertEqual("2/2", self.app.row_values(other)[1])
+        self.assertEqual("1/2", self.app.row_search_values(row)["Part"])
+        self.assertEqual((self.app.row_id(row),), self.app.table.get_children())
+
+    def test_part_index_rows_have_unique_ids_and_labels(self):
+        first = chromatch.replace(self.make_row("track.wav"), part_index=1)
+        second = chromatch.replace(self.make_row("track.wav"), part_index=2)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+
+        self.assertNotEqual(self.app.row_id(first), self.app.row_id(second))
+        self.assertEqual("1/2", self.app.row_values(first)[1])
+        self.assertEqual("2/2", self.app.row_values(second)[1])
+
+    def test_next_part_button_switches_single_table_line(self):
+        first = chromatch.replace(self.make_row("track.wav"), part_start_seconds=0.0, part_end_seconds=10.0)
+        second = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        other = self.make_row("other.wav")
+        self.app.rows = [first, other, second]
+        self.app.refresh_table()
+        first_id = self.app.row_id(first)
+        second_id = self.app.row_id(second)
+        self.app.table.selection_set(first_id)
+        self.app.add_waveform = lambda _row: None
+
+        self.app.select_next_part()
+
+        self.assertEqual((second_id,), self.app.table.selection())
+        self.assertIn(second_id, self.app.table.get_children())
+        self.assertNotIn(first_id, self.app.table.get_children())
+
+    def test_sorted_table_shows_best_part_for_sort_column(self):
+        weaker = chromatch.replace(
+            self.make_row("track.wav"),
+            chroma_similarity=20.0,
+            part_start_seconds=0.0,
+            part_end_seconds=10.0,
+        )
+        stronger = chromatch.replace(
+            self.make_row("track.wav"),
+            chroma_similarity=80.0,
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        other = chromatch.replace(self.make_row("other.wav"), chroma_similarity=50.0)
+        self.app.rows = [weaker, other, stronger]
+        self.app.similarity_mode_var.set(chromatch.SIMILARITY_CHROMA)
+        self.app.sort_column = "similarity"
+        self.app.sort_descending = True
+
+        self.app.refresh_table()
+
+        self.assertEqual(
+            (self.app.row_id(stronger), self.app.row_id(other)),
+            self.app.table.get_children(),
+        )
+        self.assertEqual("2/2", self.app.table.item(self.app.row_id(stronger), "values")[1])
+
+    def test_next_part_button_overrides_sorted_best_part(self):
+        weaker = chromatch.replace(
+            self.make_row("track.wav"),
+            chroma_similarity=20.0,
+            part_start_seconds=0.0,
+            part_end_seconds=10.0,
+        )
+        stronger = chromatch.replace(
+            self.make_row("track.wav"),
+            chroma_similarity=80.0,
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+        )
+        self.app.rows = [weaker, stronger]
+        self.app.similarity_mode_var.set(chromatch.SIMILARITY_CHROMA)
+        self.app.sort_column = "similarity"
+        self.app.sort_descending = True
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(stronger))
+        self.app.add_waveform = lambda _row: None
+
+        self.app.select_next_part()
+
+        self.assertEqual((self.app.row_id(weaker),), self.app.table.selection())
+        self.assertEqual((self.app.row_id(weaker),), self.app.table.get_children())
+
+    def test_sort_by_part_orders_by_total_then_current_part(self):
+        single = self.make_row("single.wav")
+        two_first = chromatch.replace(self.make_row("two.wav"), part_start_seconds=0.0, part_end_seconds=10.0)
+        two_second = chromatch.replace(self.make_row("two.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        three_first = chromatch.replace(self.make_row("three.wav"), part_start_seconds=0.0, part_end_seconds=10.0)
+        three_second = chromatch.replace(self.make_row("three.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        three_third = chromatch.replace(self.make_row("three.wav"), part_start_seconds=20.0, part_end_seconds=30.0)
+        self.app.rows = [three_third, two_second, three_first, single, two_first, three_second]
+        self.app.current_part_ids_by_group = {
+            str(Path("two.wav").resolve()): self.app.row_id(two_second),
+            str(Path("three.wav").resolve()): self.app.row_id(three_first),
+        }
+        self.app.sort_column = "part"
+        self.app.sort_descending = False
+
+        self.app.refresh_table()
+
+        self.assertEqual(
+            (self.app.row_id(single), self.app.row_id(two_second), self.app.row_id(three_first)),
+            self.app.table.get_children(),
+        )
 
     def test_single_selection_updates_tempo_and_part_fields(self):
         row = chromatch.replace(

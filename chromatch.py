@@ -78,7 +78,20 @@ SIMILARITY_CHROMA = "Chroma"
 SIMILARITY_CHROMA_TEMPO = "Chroma/tempo"
 SIMILARITY_BASE_BPM = "Base/BPM + chroma"
 SIMILARITY_MODES = (SIMILARITY_BASE_BPM, SIMILARITY_CHROMA_TEMPO, SIMILARITY_CHROMA)
-SEARCH_FIELDS = ("All", "Filename", "Artist", "Title", "Album", "Tempo", "Similarity", "Chroma", "Marks", "Matches", "Part")
+SEARCH_FIELDS = (
+    "All",
+    "Filename",
+    "Artist",
+    "Title",
+    "Album",
+    "Tempo",
+    "Similarity",
+    "Chroma",
+    "Base",
+    "Marks",
+    "Matches",
+    "Part",
+)
 BASE_BPM_CLOSE_DISTANCE_BINS = CHROMA_BINS / 24
 EXPORT_CSV = "CSV"
 EXPORT_JSON = "JSON"
@@ -139,6 +152,7 @@ class AnalysisRow:
     user_beat_seconds: tuple[float, ...] = ()
     part_start_seconds: float | None = None
     part_end_seconds: float | None = None
+    part_index: int | None = None
     cue_points: tuple["CuePoint", ...] = ()
 
 
@@ -1388,6 +1402,9 @@ class TempoWindow:
         self.export_selected_only_var = tk.BooleanVar(value=False)
         self.match_count_by_uid: dict[int, int] = {}
         self.row_part_numbers: dict[str, int] = {}
+        self.row_part_totals: dict[str, int] = {}
+        self.row_part_groups: dict[str, list[AnalysisRow]] = {}
+        self.current_part_ids_by_group: dict[str, str] = {}
         self.tap_times: list[float] = []
         self.current_tapped_bpm: float | None = None
         self.ctrl_pressed = False
@@ -1535,6 +1552,14 @@ class TempoWindow:
             state="disabled",
         )
         self.split_button.pack(side="left")
+
+        self.next_part_button = ttk.Button(
+            secondary_actions,
+            text="Next part",
+            command=self.select_next_part,
+            state="disabled",
+        )
+        self.next_part_button.pack(side="left", padx=(8, 0))
 
         self.match_cycle_button = ttk.Button(
             secondary_actions,
@@ -1723,6 +1748,7 @@ class TempoWindow:
             "uncertainty",
             "similarity",
             "chroma",
+            "base",
             "artist",
             "title",
             "album",
@@ -1737,6 +1763,7 @@ class TempoWindow:
             "uncertainty": "Uncertainty",
             "similarity": "Sim",
             "chroma": "Chroma peaks",
+            "base": "Base",
             "artist": "Artist",
             "title": "Title",
             "album": "Album",
@@ -1757,6 +1784,7 @@ class TempoWindow:
         self.table.column("uncertainty", width=120, anchor="center")
         self.table.column("similarity", width=105, anchor="center")
         self.table.column("chroma", width=95, anchor="center")
+        self.table.column("base", width=75, anchor="center", stretch=False)
         self.table.column("artist", width=150, anchor="w")
         self.table.column("title", width=180, anchor="w")
         self.table.column("album", width=150, anchor="w")
@@ -1997,6 +2025,7 @@ class TempoWindow:
             user_beat_seconds=decode_float_tuple(record.get("user_beat_seconds")),
             part_start_seconds=parse_optional_float(record.get("part_start_seconds")),
             part_end_seconds=parse_optional_float(record.get("part_end_seconds")),
+            part_index=parse_optional_int(record.get("part_index")),
             cue_points=decode_cue_points(record.get("cue_points_json")),
         )
 
@@ -2247,6 +2276,7 @@ class TempoWindow:
                 "similarity",
             }
 
+        self.current_part_ids_by_group.clear()
         self.update_sort_headings()
         self.refresh_table()
 
@@ -2502,6 +2532,8 @@ class TempoWindow:
             start = 0.0 if row.part_start_seconds is None else row.part_start_seconds
             end = -1.0 if row.part_end_seconds is None else row.part_end_seconds
             row_id = f"{row_id}#part={start:.6f}-{end:.6f}"
+        elif row.part_index is not None:
+            row_id = f"{row_id}#part={row.part_index}"
         return row_id
 
     def analysis_task_from_path(self, path: Path) -> AnalysisTask:
@@ -2534,10 +2566,13 @@ class TempoWindow:
         return duration
 
     def is_part_row(self, row: AnalysisRow) -> bool:
-        return row.part_start_seconds is not None or row.part_end_seconds is not None
+        return row.part_start_seconds is not None or row.part_end_seconds is not None or row.part_index is not None
 
     def row_display_name(self, row: AnalysisRow) -> str:
         return row.path.name
+
+    def row_part_group_key(self, row: AnalysisRow) -> str:
+        return str(row.path.resolve())
 
     def row_part_number(self, row: AnalysisRow) -> int:
         row_id = self.row_id(row)
@@ -2559,22 +2594,68 @@ class TempoWindow:
                 return index
         return 1
 
+    def row_part_total(self, row: AnalysisRow) -> int:
+        row_id = self.row_id(row)
+        cached = self.row_part_totals.get(row_id)
+        if cached is not None:
+            return cached
+        cached_group = self.row_part_groups.get(self.row_part_group_key(row))
+        if cached_group is not None:
+            return len(cached_group) or 1
+        return sum(1 for candidate in self.rows if candidate.path.resolve() == row.path.resolve()) or 1
+
+    def row_part_label(self, row: AnalysisRow) -> str:
+        number = self.row_part_number(row)
+        total = self.row_part_total(row)
+        if total <= 1:
+            return str(number)
+        return f"{number}/{total}"
+
+    def sorted_part_siblings(self, row: AnalysisRow) -> list[AnalysisRow]:
+        cached = self.row_part_groups.get(self.row_part_group_key(row))
+        if cached is not None:
+            return list(cached)
+        return sorted(
+            (candidate for candidate in self.rows if candidate.path.resolve() == row.path.resolve()),
+            key=self.row_part_sort_key,
+        )
+
+    def row_part_sort_key(self, row: AnalysisRow) -> tuple[float, float, float]:
+        explicit_part = row.part_index if row.part_index is not None else float("inf")
+        return (
+            explicit_part,
+            self.row_part_start(row),
+            self.row_part_end(row, float("inf")) or float("inf"),
+        )
+
     def update_row_part_numbers(self) -> None:
-        groups: dict[Path, list[AnalysisRow]] = {}
+        groups: dict[str, list[AnalysisRow]] = {}
         for row in self.rows:
-            groups.setdefault(row.path.resolve(), []).append(row)
+            groups.setdefault(self.row_part_group_key(row), []).append(row)
 
         part_numbers: dict[str, int] = {}
+        part_totals: dict[str, int] = {}
+        row_part_groups: dict[str, list[AnalysisRow]] = {}
         for siblings in groups.values():
             siblings.sort(
-                key=lambda candidate: (
-                    self.row_part_start(candidate),
-                    self.row_part_end(candidate, float("inf")) or float("inf"),
-                )
+                key=self.row_part_sort_key
             )
+            total = max(len(siblings), *(row.part_index or 0 for row in siblings))
             for index, row in enumerate(siblings, start=1):
-                part_numbers[self.row_id(row)] = index
+                row_id = self.row_id(row)
+                part_numbers[row_id] = row.part_index if row.part_index is not None else index
+                part_totals[row_id] = total
+            if siblings:
+                row_part_groups[self.row_part_group_key(siblings[0])] = list(siblings)
         self.row_part_numbers = part_numbers
+        self.row_part_totals = part_totals
+        self.row_part_groups = row_part_groups
+        valid_ids = {self.row_id(row) for row in self.rows}
+        self.current_part_ids_by_group = {
+            group_key: row_id
+            for group_key, row_id in self.current_part_ids_by_group.items()
+            if row_id in valid_ids and group_key in row_part_groups
+        }
 
     def sync_waveform_rows(self) -> None:
         rows_by_id = {self.row_id(row): row for row in self.rows}
@@ -3099,13 +3180,18 @@ class TempoWindow:
             return f"{label} {score:.1f}"
         return f"{score:.1f}"
 
+    def base_text_for_row(self, row: AnalysisRow) -> str:
+        if row.base_chroma_bin is None:
+            return ""
+        return chroma_bin_label(row.base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
+
     def sort_key(self, row: AnalysisRow, similarity_targets: list[AnalysisRow] | None = None):
         missing_number = float("-inf") if self.sort_descending else float("inf")
 
         if self.sort_column == "filename":
             return (row.path.name.lower(), self.row_part_start(row))
         if self.sort_column == "part":
-            return (row.path.name.lower(), self.row_part_number(row))
+            return (self.row_part_total(row), self.row_part_number(row), row.path.name.lower())
         if self.sort_column == "matches":
             return self.match_count_for(row.row_uid)
         if self.sort_column == "markers":
@@ -3132,6 +3218,8 @@ class TempoWindow:
             return score if score is not None else missing_number
         if self.sort_column == "chroma":
             return simple_chroma_peaks(row.chroma).lower()
+        if self.sort_column == "base":
+            return row.base_chroma_bin if row.base_chroma_bin is not None else missing_number
         if self.sort_column == "artist":
             return row.artist.lower()
         if self.sort_column == "title":
@@ -3155,6 +3243,59 @@ class TempoWindow:
                 )
 
         return sorted(self.rows, key=self.sort_key, reverse=self.sort_descending)
+
+    def best_group_row(
+        self,
+        rows: list[AnalysisRow],
+        similarity_targets: list[AnalysisRow] | None = None,
+    ) -> AnalysisRow:
+        if len(rows) == 1:
+            return rows[0]
+        group_key = self.row_part_group_key(rows[0])
+        current_id = self.current_part_ids_by_group.get(group_key)
+        for row in rows:
+            if self.row_id(row) == current_id:
+                return row
+        if self.sort_column is None:
+            available_ids = {self.row_id(row) for row in rows}
+            for row in self.sorted_part_siblings(rows[0]):
+                if self.row_id(row) in available_ids:
+                    return row
+            return rows[0]
+        return sorted(
+            rows,
+            key=lambda row: self.sort_key(row, similarity_targets=similarity_targets),
+            reverse=self.sort_descending,
+        )[0]
+
+    def grouped_rows_for_table(
+        self,
+        rows: list[AnalysisRow],
+        similarity_targets: list[AnalysisRow] | None = None,
+    ) -> list[AnalysisRow]:
+        groups: dict[str, list[AnalysisRow]] = {}
+        group_order: list[str] = []
+        for row in rows:
+            group_key = self.row_part_group_key(row)
+            if group_key not in groups:
+                groups[group_key] = []
+                group_order.append(group_key)
+            groups[group_key].append(row)
+
+        displayed_rows = [
+            self.best_group_row(groups[group_key], similarity_targets=similarity_targets)
+            for group_key in group_order
+        ]
+        for row in displayed_rows:
+            self.current_part_ids_by_group[self.row_part_group_key(row)] = self.row_id(row)
+
+        if self.sort_column is None:
+            return displayed_rows
+        return sorted(
+            displayed_rows,
+            key=lambda row: self.sort_key(row, similarity_targets=similarity_targets),
+            reverse=self.sort_descending,
+        )
 
     def row_marker_count(self, row: AnalysisRow) -> int:
         return len(row.user_beat_seconds) + len(row.cue_points)
@@ -3212,11 +3353,16 @@ class TempoWindow:
         tempo_gap_context_ids: set[str] | None = None,
         tempo_gap_target_tempos: list[float] | None = None,
     ) -> list[AnalysisRow]:
-        return [
+        matching_rows = [
             row
-            for row in self.sorted_rows()
+            for row in self.rows
             if self.row_matches_search(row, selected_match_uids, tempo_gap_context_ids, tempo_gap_target_tempos)
         ]
+        similarity_targets = None
+        if self.sort_column in {"similarity", "chroma_similarity", "chroma_tempo_similarity"}:
+            if self.similarity_mode() == SIMILARITY_BASE_BPM and self.similarity_target_ids:
+                similarity_targets = self.current_similarity_target_rows()
+        return self.grouped_rows_for_table(matching_rows, similarity_targets=similarity_targets)
 
     def row_matches_search(
         self,
@@ -3272,9 +3418,10 @@ class TempoWindow:
             "Tempo": "" if effective_tempo is None else f"{effective_tempo:.2f}",
             "Similarity": self.similarity_text_for_row(row),
             "Chroma": simple_chroma_peaks(row.chroma),
+            "Base": self.base_text_for_row(row),
             "Marks": self.row_marker_summary(row),
             "Matches": str(self.match_count_for(row.row_uid)) if row.row_uid is not None else "",
-            "Part": str(self.row_part_number(row)),
+            "Part": self.row_part_label(row),
         }
 
     def clear_tables(self) -> None:
@@ -3294,19 +3441,21 @@ class TempoWindow:
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
         similarity_text = self.similarity_text_for_row(row)
         chroma_text = simple_chroma_peaks(row.chroma)
+        base_text = self.base_text_for_row(row)
 
         if row.error and row.bpm is None and row.chroma is None:
             uncertainty_text = f"failed: {row.error}"
 
         return (
             self.row_display_name(row),
-            str(self.row_part_number(row)),
+            self.row_part_label(row),
             str(self.match_count_for(row.row_uid)) if row.row_uid is not None else "",
             self.row_marker_summary(row),
             tempo_text,
             uncertainty_text,
             similarity_text,
             chroma_text,
+            base_text,
             row.artist,
             row.title,
             row.album,
@@ -3352,10 +3501,47 @@ class TempoWindow:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
         self.split_button.configure(state="normal" if self.table.selection() else "disabled")
+        self.update_next_part_button()
         self.update_match_cycle_button()
         self.update_selected_detected_tempo()
         self.update_waveform_selection()
         self.update_selected_edit_fields()
+
+    def selected_part_row(self) -> AnalysisRow | None:
+        selected_ids = list(self.table.selection())
+        if selected_ids:
+            return self.row_by_id(selected_ids[-1])
+        if len(self.waveform_slots) == 1:
+            return self.waveform_slots[0].row
+        return None
+
+    def update_next_part_button(self) -> None:
+        row = self.selected_part_row()
+        enabled = row is not None and len(self.sorted_part_siblings(row)) > 1
+        self.next_part_button.configure(state="normal" if enabled else "disabled")
+
+    def select_next_part(self) -> None:
+        row = self.selected_part_row()
+        if row is None:
+            messagebox.showinfo("Chromatch", "Select a track part first.")
+            return
+
+        sibling_ids = [self.row_id(sibling) for sibling in self.sorted_part_siblings(row)]
+        if len(sibling_ids) <= 1:
+            messagebox.showinfo("Chromatch", "No other part for this track.")
+            return
+
+        current_id = self.row_id(row)
+        try:
+            current_index = sibling_ids.index(current_id)
+        except ValueError:
+            current_index = -1
+        next_id = sibling_ids[(current_index + 1) % len(sibling_ids)]
+        self.current_part_ids_by_group[self.row_part_group_key(row)] = next_id
+        self.refresh_table()
+        self.table.selection_set(next_id)
+        self.table.see(next_id)
+        self.handle_table_selection()
 
     def play_file(self, row: AnalysisRow) -> None:
         try:
@@ -5339,6 +5525,7 @@ class TempoWindow:
             "tapped_tempo_bpm": "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
             "part_start_seconds": "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
             "part_end_seconds": "" if row.part_end_seconds is None else f"{row.part_end_seconds:.6f}",
+            "part_index": "" if row.part_index is None else str(row.part_index),
             "beat_anchor_seconds": "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
             "beat_anchor_source": row.beat_anchor_source,
             "base_chroma_bin": "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
@@ -5372,6 +5559,7 @@ class TempoWindow:
             "tapped_tempo_bpm",
             "part_start_seconds",
             "part_end_seconds",
+            "part_index",
             "beat_anchor_seconds",
             "beat_anchor_source",
             "base_chroma_bin",

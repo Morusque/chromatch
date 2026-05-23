@@ -2,10 +2,6 @@
 to review :
 
 next tasks :
-- figure out how "base" could (or could not) be calculated and aim for an automatic base detection (most bases in chromatch-analysis.json are reviewed and validaded, a few of them are defined over ambiguous tracks where another base could have chosen) see if there's a way to derive them from chroma or something else, maybe build a table comparing top peak, base, other features...
-- make graphviz graph better
-- export as traktor/mixxx file
-- automix
 
 tasks for later :
 
@@ -13,6 +9,7 @@ check this :
 - copy warning messages and report them
 
 maybe at some point :
+- automix
 - option to relink track with file
 - option to keep absolute and/or relative url of files
 - detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantité is a good example of this)
@@ -27,3 +24,5 @@ maybe at some point :
 - still occasional playback glitches
 - dropping a track takes some processing time, why?
 - reorganize the UI in sections that make sense
+- investigate automatic base detection, if this is ever possible
+- revise graphviz graphs further

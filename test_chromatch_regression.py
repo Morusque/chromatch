@@ -1156,6 +1156,49 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), self.app.rows[0].cue_points)
         self.assertEqual({(10, 20): 2}, self.app.match_links)
 
+    def test_traktor_nml_export_contains_track_tempo_grid_cues_and_loops(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            row_uid=10,
+            artist="Alice",
+            title="One",
+            album="Album",
+            tapped_bpm=121.5,
+            beat_anchor_seconds=1.25,
+            base_chroma_bin=42,
+            cue_points=(chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)),
+        )
+
+        contents = self.app.traktor_nml_text_for_rows([row])
+        root = ET.fromstring(contents)
+
+        entry = root.find("./COLLECTION/ENTRY")
+        self.assertIsNotNone(entry)
+        self.assertEqual("One", entry.get("TITLE"))
+        self.assertEqual("Alice", entry.get("ARTIST"))
+        self.assertEqual("121.500000", entry.find("TEMPO").get("BPM"))
+        self.assertEqual(chromatch.chroma_bin_label(42, chromatch.CHROMA_BINS), entry.find("MUSICAL_KEY").get("VALUE"))
+        hotcues = entry.findall("./CUE_V2_LIST/CUE_V2")
+        self.assertEqual(["4", "0", "5"], [hotcue.get("TYPE") for hotcue in hotcues])
+        self.assertEqual("1250.000", hotcues[0].get("START"))
+        self.assertEqual("3500.000", hotcues[1].get("START"))
+        self.assertAlmostEqual(16.0 * 60.0 / 121.5 * 1000.0, float(hotcues[2].get("LEN")), places=3)
+
+    def test_traktor_nml_export_expands_selected_multipart_rows(self):
+        first = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10, part_index=1)
+        second = chromatch.replace(self.make_row("track.wav", bpm=122.0), row_uid=20, part_index=2)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(first))
+        self.app.export_selected_only_var.set(True)
+
+        rows = self.app.expand_part_groups_for_rows(self.app.export_rows_for_scope())
+        contents = self.app.traktor_nml_text_for_rows(rows)
+        root = ET.fromstring(contents)
+
+        self.assertEqual("2", root.find("COLLECTION").get("ENTRIES"))
+        self.assertEqual(2, len(root.findall("./COLLECTION/ENTRY")))
+
     def test_graphviz_export_text_contains_rows_and_matches(self):
         first = chromatch.replace(
             self.make_row("first.wav", bpm=120.0),
@@ -1180,6 +1223,51 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIn("Alice - One", contents)
         self.assertIn("row_10 -- row_20", contents)
         self.assertIn('label="super"', contents)
+        self.assertIn("rankdir=LR", contents)
+        self.assertIn("packmode=graph", contents)
+
+    def test_graphviz_export_groups_multipart_rows_in_cluster(self):
+        first = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            row_uid=10,
+            artist="Alice",
+            title="One",
+            part_index=1,
+        )
+        second = chromatch.replace(
+            self.make_row("track.wav", bpm=122.0),
+            row_uid=20,
+            artist="Alice",
+            title="One",
+            part_index=2,
+        )
+        self.app.rows = [first, second]
+
+        contents = self.app.graphviz_text_for_rows([first, second])
+
+        self.assertIn("subgraph cluster_part_group_", contents)
+        self.assertIn("Alice - One", contents)
+        self.assertIn("1/2", contents)
+        self.assertIn("2/2", contents)
+        self.assertIn("120.00 BPM", contents)
+        self.assertIn("122.00 BPM", contents)
+
+    def test_graph_export_scope_expands_parts_and_removes_isolated_rows(self):
+        first = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10, part_index=1)
+        second = chromatch.replace(self.make_row("track.wav", bpm=122.0), row_uid=20, part_index=2)
+        connected = chromatch.replace(self.make_row("connected.wav", bpm=123.0), row_uid=30)
+        isolated = chromatch.replace(self.make_row("isolated.wav", bpm=124.0), row_uid=40)
+        self.app.rows = [first, second, connected, isolated]
+        self.app.set_match(10, 30, 1)
+        self.app.refresh_table()
+
+        rows = self.app.graph_export_rows_for_scope()
+
+        self.assertEqual(
+            {self.app.row_id(first), self.app.row_id(second), self.app.row_id(connected)},
+            {self.app.row_id(row) for row in rows},
+        )
+        self.assertNotIn(self.app.row_id(isolated), {self.app.row_id(row) for row in rows})
 
     def test_graph_svg_export_text_contains_simple_nodes_and_unlabeled_edges(self):
         first = chromatch.replace(
@@ -1295,6 +1383,58 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.export_selected_mode()
 
         self.assertEqual(["svg"], called)
+
+    def test_export_selected_mode_dispatches_traktor_nml(self):
+        called = []
+        self.app.export_mode_var.set(chromatch.EXPORT_TRAKTOR_NML)
+        self.app.export_traktor_nml = lambda: called.append("nml")
+
+        self.app.export_selected_mode()
+
+        self.assertEqual(["nml"], called)
+
+    def test_base_audit_record_compares_reviewed_base_to_chroma_peaks(self):
+        row = chromatch.replace(self.make_chroma_row("track.wav", 120.0, 80), base_chroma_bin=85)
+
+        record = self.app.base_audit_record(row)
+
+        self.assertEqual("track.wav", record["filename"])
+        self.assertEqual("85", record["reviewed_base_bin"])
+        self.assertEqual("80", record["candidate_base_bin"])
+        self.assertEqual("5.00", record["strongest_peak_distance_bins"])
+        self.assertIn("80", record["top_peak_bins"].split())
+
+    def test_trained_base_detection_uses_reviewed_base_profile(self):
+        training = chromatch.replace(self.make_chroma_row("training.wav", 120.0, 10), base_chroma_bin=10)
+        target = self.make_chroma_row("target.wav", 120.0, 35)
+        self.app.rows = [training, target]
+
+        detected = self.app.detect_base_from_trained_profile(target)
+
+        self.assertIsNotNone(detected)
+        self.assertEqual(35, detected[0])
+
+    def test_export_base_audit_writes_chroma_rows(self):
+        row = chromatch.replace(self.make_chroma_row("track.wav", 120.0, 80), base_chroma_bin=85)
+        no_chroma = self.make_row("plain.wav")
+        self.app.rows = [row, no_chroma]
+        self.app.refresh_table()
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "base-audit.csv"
+            original_save = chromatch.filedialog.asksaveasfilename
+            chromatch.filedialog.asksaveasfilename = lambda **_kwargs: str(path)
+            try:
+                self.app.export_base_audit()
+            finally:
+                chromatch.filedialog.asksaveasfilename = original_save
+            with path.open(encoding="utf-8") as csv_file:
+                rows = list(chromatch.csv.DictReader(csv_file))
+
+        self.assertEqual(1, len(rows))
+        self.assertEqual("track.wav", rows[0]["filename"])
+        self.assertEqual("85", rows[0]["reviewed_base_bin"])
+        self.assertIn("detected_base", rows[0])
 
     def test_closest_pairs_export_sorts_by_base_bpm_category_before_similarity(self):
         first = chromatch.replace(self.make_chroma_row("first.wav", 120.0, 0), base_chroma_bin=100)

@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import tkinter as tk
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
@@ -100,6 +101,8 @@ EXPORT_MAP = "HTML map"
 EXPORT_GRAPH_SVG = "Graph SVG"
 EXPORT_GRAPHVIZ = "Graphviz DOT"
 EXPORT_CLOSEST_PAIRS = "Closest pairs"
+EXPORT_BASE_AUDIT = "Base audit"
+EXPORT_TRAKTOR_NML = "Traktor NML"
 EXPORT_MODES = (
     EXPORT_CSV,
     EXPORT_JSON,
@@ -108,6 +111,8 @@ EXPORT_MODES = (
     EXPORT_GRAPH_SVG,
     EXPORT_GRAPHVIZ,
     EXPORT_CLOSEST_PAIRS,
+    EXPORT_BASE_AUDIT,
+    EXPORT_TRAKTOR_NML,
 )
 
 
@@ -5423,6 +5428,8 @@ class TempoWindow:
             EXPORT_GRAPH_SVG: self.export_graph_svg,
             EXPORT_GRAPHVIZ: self.export_graphviz,
             EXPORT_CLOSEST_PAIRS: self.export_closest_pairs,
+            EXPORT_BASE_AUDIT: self.export_base_audit,
+            EXPORT_TRAKTOR_NML: self.export_traktor_nml,
         }
         actions.get(mode, self.export_csv)()
 
@@ -5437,6 +5444,45 @@ class TempoWindow:
         if not rows:
             messagebox.showinfo("Chromatch", "Select one or more tracks to export.")
         return rows
+
+    def expand_part_groups_for_rows(self, rows: list[AnalysisRow]) -> list[AnalysisRow]:
+        if not rows:
+            return []
+        self.update_row_part_numbers()
+        requested_groups = {self.row_part_group_key(row) for row in rows}
+        expanded = [
+            row
+            for group in self.row_part_groups.values()
+            if self.row_part_group_key(group[0]) in requested_groups
+            for row in group
+        ]
+        if not expanded:
+            return rows
+        expanded_ids = {self.row_id(row) for row in expanded}
+        expanded.extend(row for row in rows if self.row_id(row) not in expanded_ids)
+        return expanded
+
+    def connected_graph_rows(self, rows: list[AnalysisRow]) -> list[AnalysisRow]:
+        row_uids = {row.row_uid for row in rows if row.row_uid is not None}
+        connected_uids = {
+            uid
+            for first_uid, second_uid in self.match_links
+            if first_uid in row_uids and second_uid in row_uids
+            for uid in (first_uid, second_uid)
+        }
+        connected_groups = {
+            self.row_part_group_key(row)
+            for row in rows
+            if row.row_uid in connected_uids
+        }
+        return [
+            row
+            for row in rows
+            if row.row_uid in connected_uids or self.row_part_group_key(row) in connected_groups
+        ]
+
+    def graph_export_rows_for_scope(self) -> list[AnalysisRow]:
+        return self.connected_graph_rows(self.expand_part_groups_for_rows(self.export_rows_for_scope()))
 
     def export_csv(self) -> None:
         if not self.rows:
@@ -5613,6 +5659,160 @@ class TempoWindow:
         }
         path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def traktor_location_parts(self, path: Path) -> tuple[str, str, str]:
+        absolute = path if path.is_absolute() else (Path.cwd() / path)
+        drive = absolute.drive
+        volume = drive.rstrip(":") if drive else ""
+        parts = absolute.parts
+        if drive and parts and parts[0] == drive + "\\":
+            directory_parts = parts[1:-1]
+        elif drive and parts and parts[0] == drive:
+            directory_parts = parts[1:-1]
+        else:
+            directory_parts = parts[:-1]
+        directory = "/:" + "/:".join(directory_parts) + "/:" if directory_parts else "/:"
+        return volume, directory, absolute.name
+
+    def traktor_key_text_for_row(self, row: AnalysisRow) -> str:
+        if row.base_chroma_bin is None:
+            return ""
+        return chroma_bin_label(row.base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
+
+    def traktor_hotcue_element(
+        self,
+        *,
+        name: str,
+        hotcue_type: int,
+        start_seconds: float,
+        length_seconds: float = 0.0,
+        number: int = -1,
+    ) -> ET.Element:
+        return ET.Element(
+            "CUE_V2",
+            {
+                "NAME": name,
+                "DISPL_ORDER": str(number),
+                "TYPE": str(hotcue_type),
+                "START": f"{max(0.0, start_seconds) * 1000.0:.3f}",
+                "LEN": f"{max(0.0, length_seconds) * 1000.0:.3f}",
+                "REPEATS": "-1",
+                "HOTCUE": str(number),
+            },
+        )
+
+    def traktor_nml_entry_for_row(self, row: AnalysisRow) -> ET.Element:
+        tempo = self.row_tempo_for_matching(row)
+        volume, directory, filename = self.traktor_location_parts(row.path)
+        entry = ET.Element(
+            "ENTRY",
+            {
+                "MODIFIED_DATE": "",
+                "MODIFIED_TIME": "",
+                "AUDIO_ID": "",
+                "TITLE": row.title or row.path.stem,
+                "ARTIST": row.artist,
+            },
+        )
+        ET.SubElement(entry, "LOCATION", {"DIR": directory, "FILE": filename, "VOLUME": volume, "VOLUMEID": ""})
+        info_attrs = {"BITRATE": "", "GENRE": "", "LABEL": "", "COMMENT": ""}
+        if row.album:
+            info_attrs["ALBUM"] = row.album
+        ET.SubElement(entry, "INFO", info_attrs)
+        tempo_attrs = {}
+        if tempo is not None:
+            tempo_attrs["BPM"] = f"{tempo:.6f}"
+            tempo_attrs["BPM_QUALITY"] = "100.000000" if row.tapped_bpm is not None else "50.000000"
+        ET.SubElement(entry, "TEMPO", tempo_attrs)
+        ET.SubElement(entry, "ALBUM", {"TITLE": row.album})
+        key_text = self.traktor_key_text_for_row(row)
+        if key_text:
+            ET.SubElement(entry, "MUSICAL_KEY", {"VALUE": key_text})
+
+        cues = ET.SubElement(entry, "CUE_V2_LIST")
+        if row.beat_anchor_seconds is not None:
+            cues.append(
+                self.traktor_hotcue_element(
+                    name="Beatgrid",
+                    hotcue_type=4,
+                    start_seconds=row.beat_anchor_seconds,
+                    number=1,
+                )
+            )
+
+        beat_seconds = None if tempo is None or tempo <= 0 else 60.0 / tempo
+        next_hotcue = 2 if row.beat_anchor_seconds is not None else 1
+        for cue in row.cue_points:
+            if cue.length_beats is None:
+                cues.append(
+                    self.traktor_hotcue_element(
+                        name=f"Cue {next_hotcue}",
+                        hotcue_type=0,
+                        start_seconds=cue.seconds,
+                        number=next_hotcue,
+                    )
+                )
+            else:
+                length_seconds = 0.0 if beat_seconds is None else cue.length_beats * beat_seconds
+                cues.append(
+                    self.traktor_hotcue_element(
+                        name=f"Loop {next_hotcue}",
+                        hotcue_type=5,
+                        start_seconds=cue.seconds,
+                        length_seconds=length_seconds,
+                        number=next_hotcue,
+                    )
+                )
+            next_hotcue += 1
+        return entry
+
+    def traktor_nml_text_for_rows(self, rows: list[AnalysisRow]) -> str:
+        collection = ET.Element(
+            "NML",
+            {
+                "VERSION": "19",
+            },
+        )
+        ET.SubElement(collection, "HEAD", {"COMPANY": "www.native-instruments.com", "PROGRAM": "Chromatch"})
+        music_folders = ET.SubElement(collection, "MUSICFOLDERS")
+        for folder in sorted({str((row.path if row.path.is_absolute() else Path.cwd() / row.path).parent) for row in rows}):
+            ET.SubElement(music_folders, "FOLDER", {"DIR": folder})
+        collection_element = ET.SubElement(collection, "COLLECTION", {"ENTRIES": str(len(rows))})
+        for row in rows:
+            collection_element.append(self.traktor_nml_entry_for_row(row))
+        playlists = ET.SubElement(collection, "PLAYLISTS")
+        node = ET.SubElement(playlists, "NODE", {"TYPE": "FOLDER", "NAME": "$ROOT"})
+        subnodes = ET.SubElement(node, "SUBNODES", {"COUNT": "1"})
+        playlist = ET.SubElement(subnodes, "NODE", {"TYPE": "PLAYLIST", "NAME": "Chromatch Export"})
+        ET.SubElement(playlist, "PLAYLIST", {"ENTRIES": str(len(rows)), "TYPE": "LIST"})
+        ET.indent(collection, space="  ")
+        return '<?xml version="1.0" encoding="UTF-8" standalone="no"?>\n' + ET.tostring(
+            collection,
+            encoding="unicode",
+            short_empty_elements=True,
+        )
+
+    def export_traktor_nml(self) -> None:
+        rows = self.expand_part_groups_for_rows(self.export_rows_for_scope())
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows to export.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".nml",
+            filetypes=(("Traktor NML files", "*.nml"), ("XML files", "*.xml"), ("All files", "*.*")),
+            initialfile="chromatch-traktor.nml",
+        )
+        if not filename:
+            return
+
+        try:
+            Path(filename).write_text(self.traktor_nml_text_for_rows(rows), encoding="utf-8")
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export Traktor NML:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported Traktor NML: {Path(filename).name}")
+
     def export_selected_chromagram(self) -> None:
         selected = self.table.selection()
         if not selected:
@@ -5728,6 +5928,40 @@ class TempoWindow:
             details.append(f"base {row.base_chroma_bin}")
         return title if not details else f"{title}\\n{', '.join(details)}"
 
+    def graphviz_group_label_for_rows(self, rows: list[AnalysisRow]) -> str:
+        row = rows[0]
+        title = " - ".join(part for part in (row.artist, row.title) if part).strip()
+        return title or self.row_display_name(row)
+
+    def graphviz_part_label_for_row(self, row: AnalysisRow) -> str:
+        details = [self.row_part_label(row)]
+        tempo = self.row_tempo_for_matching(row)
+        if tempo is not None:
+            details.append(f"{tempo:.2f} BPM")
+        if row.base_chroma_bin is not None:
+            details.append(f"base {self.base_text_for_row(row)}")
+        return "\\n".join(details)
+
+    def graphviz_cluster_id(self, index: int) -> str:
+        return f"cluster_part_group_{index}"
+
+    def graphviz_group_rows(self, rows: list[AnalysisRow]) -> list[list[AnalysisRow]]:
+        groups: dict[str, list[AnalysisRow]] = {}
+        order: list[str] = []
+        for row in rows:
+            key = self.row_part_group_key(row)
+            if key not in groups:
+                groups[key] = []
+                order.append(key)
+            groups[key].append(row)
+
+        grouped_rows = []
+        for key in order:
+            group = groups[key]
+            group.sort(key=self.row_part_sort_key)
+            grouped_rows.append(group)
+        return grouped_rows
+
     def graphviz_text_for_rows(self, rows: list[AnalysisRow]) -> str:
         row_indexes = {id(row): index for index, row in enumerate(rows)}
         uid_to_node = {
@@ -5737,31 +5971,48 @@ class TempoWindow:
         }
         lines = [
             "graph chromatch {",
-            "  graph [overlap=false, splines=true];",
+            "  graph [rankdir=LR, overlap=false, splines=true, pack=true, packmode=graph, concentrate=true, outputorder=edgesfirst];",
             "  node [shape=box, style=rounded, fontname=\"Segoe UI\"];",
-            "  edge [fontname=\"Segoe UI\"];",
+            "  edge [fontname=\"Segoe UI\", len=2.0, weight=2];",
         ]
-        for row in rows:
-            node_id = self.graphviz_node_id(row, row_indexes[id(row)])
-            lines.append(f"  {node_id} [label={self.dot_quote(self.graphviz_label_for_row(row))}];")
+        for group_index, group in enumerate(self.graphviz_group_rows(rows)):
+            if len(group) <= 1:
+                row = group[0]
+                node_id = self.graphviz_node_id(row, row_indexes[id(row)])
+                lines.append(f"  {node_id} [label={self.dot_quote(self.graphviz_label_for_row(row))}];")
+                continue
+
+            lines.append(f"  subgraph {self.graphviz_cluster_id(group_index)} {{")
+            lines.append(f"    label={self.dot_quote(self.graphviz_group_label_for_rows(group))};")
+            lines.append("    style=\"rounded,dashed\";")
+            lines.append("    color=\"#777777\";")
+            lines.append("    margin=14;")
+            for row in group:
+                node_id = self.graphviz_node_id(row, row_indexes[id(row)])
+                lines.append(f"    {node_id} [label={self.dot_quote(self.graphviz_part_label_for_row(row))}];")
+            for first, second in zip(group, group[1:]):
+                first_node = self.graphviz_node_id(first, row_indexes[id(first)])
+                second_node = self.graphviz_node_id(second, row_indexes[id(second)])
+                lines.append(f"    {first_node} -- {second_node} [style=dotted, color=\"#777777\", weight=1, len=0.8];")
+            lines.append("  }")
 
         for (first_uid, second_uid), score in sorted(self.match_links.items()):
             first_node = uid_to_node.get(first_uid)
             second_node = uid_to_node.get(second_uid)
             if first_node is None or second_node is None:
                 continue
-            attributes = 'label="match"'
+            attributes = 'label="match", weight=3, len=1.6'
             if score == 2:
-                attributes = 'label="super", color="#b00020", penwidth=2'
+                attributes = 'label="super", color="#b00020", penwidth=2, weight=5, len=1.2'
             lines.append(f"  {first_node} -- {second_node} [{attributes}];")
 
         lines.append("}")
         return "\n".join(lines) + "\n"
 
     def export_graphviz(self) -> None:
-        rows = self.export_rows_for_scope()
+        rows = self.graph_export_rows_for_scope()
         if not rows:
-            messagebox.showinfo("Chromatch", "No rows to export.")
+            messagebox.showinfo("Chromatch", "No connected rows to export.")
             return
 
         filename = filedialog.asksaveasfilename(
@@ -5927,9 +6178,9 @@ class TempoWindow:
 """
 
     def export_graph_svg(self) -> None:
-        rows = self.export_rows_for_scope()
+        rows = self.graph_export_rows_for_scope()
         if not rows:
-            messagebox.showinfo("Chromatch", "No rows to export.")
+            messagebox.showinfo("Chromatch", "No connected rows to export.")
             return
 
         filename = filedialog.asksaveasfilename(
@@ -6065,6 +6316,215 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             return
 
         self.result.configure(text=f"Exported HTML map: {Path(filename).name}")
+
+    def chroma_peak_bins_for_row(self, row: AnalysisRow, count: int = 8) -> list[int]:
+        if row.chroma is None or row.chroma.histogram.size == 0:
+            return []
+        count = max(0, min(count, row.chroma.histogram.size))
+        if count == 0:
+            return []
+        return [int(index) for index in np.argsort(row.chroma.histogram)[-count:][::-1]]
+
+    def nearest_chroma_peak_distance(self, base_bin: int | None, peak_bins: list[int]) -> float | None:
+        if base_bin is None or not peak_bins:
+            return None
+        return min(self.cyclic_chroma_distance_bins(base_bin, peak_bin) for peak_bin in peak_bins)
+
+    def normalized_chroma_histogram(self, row: AnalysisRow) -> np.ndarray | None:
+        if row.chroma is None or row.chroma.histogram.size != CHROMA_BINS:
+            return None
+        histogram = row.chroma.histogram.astype(np.float64)
+        norm = float(np.linalg.norm(histogram))
+        if norm <= 0:
+            return None
+        return histogram / norm
+
+    def trained_base_profile(
+        self,
+        training_rows: list[AnalysisRow] | None = None,
+        exclude_row_id: str | None = None,
+    ) -> np.ndarray | None:
+        if training_rows is None:
+            training_rows = self.rows
+        aligned_histograms = []
+        for row in training_rows:
+            if exclude_row_id is not None and self.row_id(row) == exclude_row_id:
+                continue
+            if row.base_chroma_bin is None:
+                continue
+            histogram = self.normalized_chroma_histogram(row)
+            if histogram is None:
+                continue
+            aligned_histograms.append(np.roll(histogram, -int(row.base_chroma_bin % CHROMA_BINS)))
+        if not aligned_histograms:
+            return None
+        profile = np.mean(np.vstack(aligned_histograms), axis=0)
+        norm = float(np.linalg.norm(profile))
+        return None if norm <= 0 else profile / norm
+
+    def trained_base_offset_priors(
+        self,
+        training_rows: list[AnalysisRow] | None = None,
+        peak_count: int = 8,
+    ) -> np.ndarray:
+        if training_rows is None:
+            training_rows = self.rows
+        priors = np.zeros(CHROMA_BINS, dtype=np.float64)
+        for row in training_rows:
+            if row.base_chroma_bin is None or row.chroma is None:
+                continue
+            peaks = self.chroma_peak_bins_for_row(row, peak_count)
+            if not peaks:
+                continue
+            base_bin = row.base_chroma_bin % CHROMA_BINS
+            max_value = float(max(row.chroma.histogram[peak] for peak in peaks)) or 1.0
+            for rank, peak in enumerate(peaks):
+                offset = int((base_bin - peak) % CHROMA_BINS)
+                strength = float(row.chroma.histogram[peak]) / max_value
+                priors[offset] += strength / (rank + 1)
+        total = float(priors.sum())
+        return priors / total if total > 0 else priors
+
+    def trained_base_model(
+        self,
+        training_rows: list[AnalysisRow] | None = None,
+    ) -> tuple[np.ndarray | None, np.ndarray]:
+        return (
+            self.trained_base_profile(training_rows, exclude_row_id=None),
+            self.trained_base_offset_priors(training_rows),
+        )
+
+    def detect_base_from_trained_profile(
+        self,
+        row: AnalysisRow,
+        training_rows: list[AnalysisRow] | None = None,
+        exclude_self: bool = True,
+        trained_model: tuple[np.ndarray | None, np.ndarray] | None = None,
+    ) -> tuple[int, float] | None:
+        histogram = self.normalized_chroma_histogram(row)
+        if histogram is None:
+            return None
+        if trained_model is None:
+            profile = self.trained_base_profile(
+                training_rows,
+                exclude_row_id=self.row_id(row) if exclude_self else None,
+            )
+            offset_priors = self.trained_base_offset_priors(training_rows)
+        else:
+            profile, offset_priors = trained_model
+        if profile is None:
+            return None
+        peak_bins = self.chroma_peak_bins_for_row(row)
+        peak_weights = np.array([float(row.chroma.histogram[peak]) for peak in peak_bins], dtype=np.float64)
+        if peak_weights.size and float(peak_weights.sum()) > 0:
+            peak_weights = peak_weights / float(peak_weights.sum())
+
+        scores = []
+        for candidate in range(CHROMA_BINS):
+            profile_score = float(np.dot(np.roll(histogram, -candidate), profile))
+            scores.append(profile_score)
+        scores = np.array(scores)
+        best = int(np.argmax(scores))
+        if scores.size < 2:
+            return best, 0.0
+        partitioned = np.partition(scores, -2)
+        best_score = float(partitioned[-1])
+        second_score = float(partitioned[-2])
+        confidence = 0.0 if best_score <= 0 else max(0.0, min(1.0, (best_score - second_score) / best_score))
+        return best, confidence
+
+    def base_audit_record(
+        self,
+        row: AnalysisRow,
+        trained_model: tuple[np.ndarray | None, np.ndarray] | None = None,
+    ) -> dict[str, str]:
+        peak_bins = self.chroma_peak_bins_for_row(row)
+        top_bin = peak_bins[0] if peak_bins else None
+        reviewed_base = row.base_chroma_bin % CHROMA_BINS if row.base_chroma_bin is not None else None
+        nearest_distance = self.nearest_chroma_peak_distance(reviewed_base, peak_bins)
+        strongest_distance = (
+            None
+            if reviewed_base is None or top_bin is None
+            else self.cyclic_chroma_distance_bins(reviewed_base, top_bin)
+        )
+        candidate_bin = top_bin
+        detected = self.detect_base_from_trained_profile(row, trained_model=trained_model, exclude_self=False)
+        detected_bin = None if detected is None else detected[0]
+        detected_confidence = None if detected is None else detected[1]
+        detected_distance = (
+            None
+            if reviewed_base is None or detected_bin is None
+            else self.cyclic_chroma_distance_bins(reviewed_base, detected_bin)
+        )
+        return {
+            "filename": row.path.name,
+            "filepath": str(row.path),
+            "artist": row.artist,
+            "title": row.title,
+            "part": self.row_part_label(row),
+            "tempo_bpm": "" if self.row_tempo_for_matching(row) is None else f"{self.row_tempo_for_matching(row):.2f}",
+            "reviewed_base_bin": "" if reviewed_base is None else str(reviewed_base),
+            "reviewed_base": "" if reviewed_base is None else chroma_bin_label(reviewed_base, CHROMA_BINS),
+            "detected_base_bin": "" if detected_bin is None else str(detected_bin),
+            "detected_base": "" if detected_bin is None else chroma_bin_label(detected_bin, CHROMA_BINS),
+            "detected_base_confidence": "" if detected_confidence is None else f"{detected_confidence:.3f}",
+            "detected_vs_reviewed_distance_bins": "" if detected_distance is None else f"{detected_distance:.2f}",
+            "candidate_base_bin": "" if candidate_bin is None else str(candidate_bin),
+            "candidate_base": "" if candidate_bin is None else chroma_bin_label(candidate_bin, CHROMA_BINS),
+            "strongest_peak_distance_bins": "" if strongest_distance is None else f"{strongest_distance:.2f}",
+            "nearest_top8_peak_distance_bins": "" if nearest_distance is None else f"{nearest_distance:.2f}",
+            "top_peak_bins": " ".join(str(bin_index) for bin_index in peak_bins),
+            "top_peaks": "" if row.chroma is None else row.chroma.top_peaks,
+            "least_to_most": "" if row.chroma is None else row.chroma.least_to_most,
+        }
+
+    def export_base_audit(self) -> None:
+        rows = [row for row in self.export_rows_for_scope() if row.chroma is not None]
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows with chroma data to export.")
+            return
+        trained_model = self.trained_base_model(self.rows)
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            initialfile="chromatch-base-audit.csv",
+        )
+        if not filename:
+            return
+
+        fieldnames = [
+            "filename",
+            "filepath",
+            "artist",
+            "title",
+            "part",
+            "tempo_bpm",
+            "reviewed_base_bin",
+            "reviewed_base",
+            "detected_base_bin",
+            "detected_base",
+            "detected_base_confidence",
+            "detected_vs_reviewed_distance_bins",
+            "candidate_base_bin",
+            "candidate_base",
+            "strongest_peak_distance_bins",
+            "nearest_top8_peak_distance_bins",
+            "top_peak_bins",
+            "top_peaks",
+            "least_to_most",
+        ]
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(self.base_audit_record(row, trained_model=trained_model))
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export base audit:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported base audit: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
         source_rows = self.export_rows_for_scope()

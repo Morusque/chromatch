@@ -2,27 +2,32 @@
 to review :
 
 next tasks :
+- clicking on a track from the list takes time to load, can we just load an easy part of it then thread the rest?
+- only show a single track once in the display zone even for two distinct parts of it
+- dropping a track takes some processing time, why?
+- still occasional playback glitches
+- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantite is a good example of this)
+- analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
+- option to keep absolute and/or relative url of files
+- option to relink track with file
+- handle variations in tempo and chroma (throughout a track)
+- detect cue points for structure parts and loops
+- reorganize the UI in sections that make more sense
+- inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
+- automix (many things to define about this)
 
-tasks for later :
+tried already but could be better :
+- auto beat detection could still be better, maybe refine this kind of detection on proven files
+- handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
+- revise graphviz graphs further
+- investigate automatic base detection, if this is ever possible
 
 check this :
-- copy warning messages and report them
+- decide if Mixxx export is still needed after Traktor NML, and which Mixxx import target should be used if yes
+- decide what automix should optimize first: compatible sequence, live crossfade behavior, or offline playlist generation (TODO answer this)
+
+work to do with files manually :
+- some audio files still need re-encoding or something
 
 maybe at some point :
-- automix
-- option to relink track with file
-- option to keep absolute and/or relative url of files
-- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantité is a good example of this)
-- handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
-- analysis and variable to state if a track is strongly correlated with its tempo (ie easily "mixable") or not
-- auto beat detection could still be better, maybe refine this kind of detection on proven files
 - handle time signatures (detect/redefine by user, same logic than tempo and downbeat)
-- detect cue points for structure parts and loops
-- handle variations in tempo and chroma (throughout a track)
-- inverse associate with eq profile
-- some audio files still need re-encoding or something
-- still occasional playback glitches
-- dropping a track takes some processing time, why?
-- reorganize the UI in sections that make sense
-- investigate automatic base detection, if this is ever possible
-- revise graphviz graphs further

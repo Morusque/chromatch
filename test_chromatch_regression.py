@@ -1101,6 +1101,52 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), loaded.cue_points)
 
+    def test_capture_native_stderr_catches_fd_writes(self):
+        def callback():
+            chromatch.os.write(2, b"Note: Illegal Audio-MPEG-Header\\n")
+            return "done"
+
+        result, warning = chromatch.capture_native_stderr(callback)
+
+        self.assertEqual("done", result)
+        self.assertIn("Illegal Audio-MPEG-Header", warning)
+
+    def test_analysis_worker_attaches_decoder_warnings_to_row_error(self):
+        task = chromatch.AnalysisTask(path=Path("warning.mp3"))
+        self.app.analysis_queue = [task]
+        self.app.analysis_paths = {self.app.analysis_task_id(task)}
+
+        original_read_tags = chromatch.read_audio_tags
+        original_estimate_tempo = chromatch.estimate_tempo
+        original_estimate_chroma = chromatch.estimate_chroma
+        original_detect_beat_anchor = chromatch.detect_beat_anchor_seconds
+        chromatch.read_audio_tags = lambda _path: ("", "", "")
+
+        def fake_estimate_tempo(*_args, **_kwargs):
+            chromatch.os.write(2, b"Note: Illegal Audio-MPEG-Header 0x20416e64\\n")
+            return chromatch.TempoEstimate(120.0, 0.0, 100.0, "test", "")
+
+        chromatch.estimate_tempo = fake_estimate_tempo
+        chromatch.estimate_chroma = lambda *_args, **_kwargs: None
+        chromatch.detect_beat_anchor_seconds = lambda *_args, **_kwargs: None
+        try:
+            self.app._analyze_queue_in_background()
+        finally:
+            chromatch.read_audio_tags = original_read_tags
+            chromatch.estimate_tempo = original_estimate_tempo
+            chromatch.estimate_chroma = original_estimate_chroma
+            chromatch.detect_beat_anchor_seconds = original_detect_beat_anchor
+
+        row = None
+        while not self.app.result_queue.empty():
+            message = self.app.result_queue.get_nowait()
+            if message[0] == "row":
+                row = message[1]
+
+        self.assertIsNotNone(row)
+        self.assertIn("decoder warnings", row.error)
+        self.assertIn("Illegal Audio-MPEG-Header", row.error)
+
     def test_csv_writer_exports_row_uid_and_sidecar_matches(self):
         first = chromatch.replace(self.make_row("first.wav"), row_uid=10)
         second = chromatch.replace(self.make_row("second.wav"), row_uid=20)

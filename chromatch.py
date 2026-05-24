@@ -9,6 +9,7 @@ import math
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 import tkinter as tk
@@ -397,6 +398,40 @@ def format_seconds_compact(seconds: float) -> str:
 
 def analysis_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def capture_native_stderr(callback):
+    captured_text = ""
+    with tempfile.TemporaryFile(mode="w+b") as capture_file:
+        try:
+            original_fd = os.dup(2)
+        except OSError:
+            return callback(), captured_text
+
+        try:
+            sys.stderr.flush()
+            os.dup2(capture_file.fileno(), 2)
+            try:
+                result = callback()
+            finally:
+                sys.stderr.flush()
+                os.dup2(original_fd, 2)
+                capture_file.seek(0)
+                captured_text = capture_file.read().decode(errors="replace").strip()
+        finally:
+            os.close(original_fd)
+
+    return result, captured_text
+
+
+def compact_decoder_warnings(text: str, limit: int = 1200) -> str:
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    compacted = " | ".join(lines)
+    if len(compacted) <= limit:
+        return compacted
+    return compacted[: limit - 3].rstrip() + "..."
 
 
 def strip_nul_bytes(lines):
@@ -5285,39 +5320,55 @@ class TempoWindow:
                 path = task.path
                 task_id = self.analysis_task_id(task)
                 self.result_queue.put(("started", path.name, remaining))
-                estimate = None
-                chroma = None
-                beat_anchor_seconds = None
-                artist, title, album = read_audio_tags(path)
-                errors = []
 
-                try:
-                    estimate = estimate_tempo(
-                        path,
-                        start_seconds=task.part_start_seconds,
-                        end_seconds=task.part_end_seconds,
-                    )
-                except Exception as exc:
-                    errors.append(f"tempo: {exc}")
+                def analyze_task():
+                    estimate = None
+                    chroma = None
+                    beat_anchor_seconds = None
+                    artist, title, album = read_audio_tags(path)
+                    errors = []
 
-                try:
-                    chroma = estimate_chroma(
-                        path,
-                        start_seconds=task.part_start_seconds,
-                        end_seconds=task.part_end_seconds,
-                    )
-                except Exception as exc:
-                    errors.append(f"chroma: {exc}")
+                    try:
+                        estimate = estimate_tempo(
+                            path,
+                            start_seconds=task.part_start_seconds,
+                            end_seconds=task.part_end_seconds,
+                        )
+                    except Exception as exc:
+                        errors.append(f"tempo: {exc}")
 
-                try:
-                    beat_anchor_seconds = detect_beat_anchor_seconds(
-                        path,
-                        None if estimate is None else estimate.bpm,
-                        start_seconds=task.part_start_seconds,
-                        end_seconds=task.part_end_seconds,
-                    )
-                except Exception as exc:
-                    errors.append(f"beat anchor: {exc}")
+                    try:
+                        chroma = estimate_chroma(
+                            path,
+                            start_seconds=task.part_start_seconds,
+                            end_seconds=task.part_end_seconds,
+                        )
+                    except Exception as exc:
+                        errors.append(f"chroma: {exc}")
+
+                    try:
+                        beat_anchor_seconds = detect_beat_anchor_seconds(
+                            path,
+                            None if estimate is None else estimate.bpm,
+                            start_seconds=task.part_start_seconds,
+                            end_seconds=task.part_end_seconds,
+                        )
+                    except Exception as exc:
+                        errors.append(f"beat anchor: {exc}")
+
+                    return estimate, chroma, beat_anchor_seconds, artist, title, album, errors
+
+                (
+                    estimate,
+                    chroma,
+                    beat_anchor_seconds,
+                    artist,
+                    title,
+                    album,
+                    errors,
+                ), decoder_warnings = capture_native_stderr(analyze_task)
+                if decoder_warnings:
+                    errors.append(f"decoder warnings: {compact_decoder_warnings(decoder_warnings)}")
 
                 row = AnalysisRow(
                     row_uid=None,

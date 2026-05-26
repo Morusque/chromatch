@@ -87,6 +87,7 @@ SEARCH_FIELDS = (
     "Title",
     "Album",
     "Tempo",
+    "Agreement",
     "Similarity",
     "Chroma",
     "Base",
@@ -95,6 +96,10 @@ SEARCH_FIELDS = (
     "Part",
 )
 BASE_BPM_CLOSE_DISTANCE_BINS = CHROMA_BINS / 24
+THREE_TWO_TEMPO_RATIO_TOLERANCE = 0.055
+SEGMENT_CONSENSUS_MIN_AGREEMENT = 70.0
+HIGH_CONFIDENCE_SEGMENT_OVERRIDE_THRESHOLD = 80.0
+HIGH_CONFIDENCE_SEGMENT_MAX_CHANGE_BPM = 0.1
 EXPORT_CSV = "CSV"
 EXPORT_JSON = "JSON"
 EXPORT_CHROMAGRAM = "Chromagram"
@@ -103,6 +108,8 @@ EXPORT_GRAPH_SVG = "Graph SVG"
 EXPORT_GRAPHVIZ = "Graphviz DOT"
 EXPORT_CLOSEST_PAIRS = "Closest pairs"
 EXPORT_BASE_AUDIT = "Base audit"
+EXPORT_TEMPO_AUDIT = "Tempo audit"
+EXPORT_TEMPO_REFERENCE_AUDIT = "Tempo reference audit"
 EXPORT_TRAKTOR_NML = "Traktor NML"
 EXPORT_MODES = (
     EXPORT_CSV,
@@ -113,6 +120,8 @@ EXPORT_MODES = (
     EXPORT_GRAPHVIZ,
     EXPORT_CLOSEST_PAIRS,
     EXPORT_BASE_AUDIT,
+    EXPORT_TEMPO_AUDIT,
+    EXPORT_TEMPO_REFERENCE_AUDIT,
     EXPORT_TRAKTOR_NML,
 )
 
@@ -124,6 +133,8 @@ class TempoEstimate:
     confidence: float
     method: str
     detail: str
+    segment_agreement_score: float | None = None
+    segment_agreement_detail: str = ""
 
 
 @dataclass(frozen=True)
@@ -135,6 +146,35 @@ class ChromaEstimate:
 
 
 @dataclass(frozen=True)
+class TempoGridSegment:
+    start_seconds: float
+    end_seconds: float
+    bpm: float
+    anchor_seconds: float | None
+    confidence: float
+
+
+@dataclass(frozen=True)
+class StableTempoGridResult:
+    bpm: float
+    uncertainty_bpm: float
+    confidence: float
+    anchor_seconds: float | None
+    agreement_score: float
+    tempo_spread_bpm: float
+    anchor_spread_seconds: float | None
+    segment_count: int
+
+
+@dataclass(frozen=True)
+class TempoSegmentAgreement:
+    score: float
+    tempo_spread_bpm: float
+    anchor_spread_seconds: float | None
+    segment_count: int
+
+
+@dataclass(frozen=True)
 class AnalysisRow:
     row_uid: int | None
     path: Path
@@ -143,6 +183,8 @@ class AnalysisRow:
     album: str
     bpm: float | None
     uncertainty_bpm: float | None
+    tempo_agreement_score: float | None
+    tempo_agreement_detail: str
     confidence: float | None
     tapped_bpm: float | None
     chroma: ChromaEstimate | None
@@ -290,6 +332,223 @@ def fit_tempo_grid_from_user_beats(
         return None
 
     return fold_bpm(60.0 / float(interval_seconds)), float(anchor_seconds)
+
+
+def tempo_grid_fit_drift_seconds(
+    beat_seconds: tuple[float, ...],
+    current_bpm: float,
+) -> tuple[float, float] | None:
+    if len(beat_seconds) < 2 or current_bpm <= 0:
+        return None
+
+    beats = np.array(sorted(beat_seconds), dtype=float)
+    if not np.all(np.isfinite(beats)):
+        return None
+
+    current_interval = 60.0 / current_bpm
+    if current_interval <= 0:
+        return None
+
+    beat_indexes = np.rint((beats - beats[0]) / current_interval).astype(float)
+    if np.unique(beat_indexes).size < 2:
+        return None
+
+    try:
+        interval_seconds, anchor_seconds = np.polyfit(beat_indexes, beats, 1)
+    except Exception:
+        return None
+
+    if not np.isfinite(interval_seconds) or interval_seconds <= 0 or not np.isfinite(anchor_seconds):
+        return None
+
+    current_grid = beats[0] + beat_indexes * current_interval
+    fitted_grid = anchor_seconds + beat_indexes * interval_seconds
+    return (
+        float(np.max(np.abs(beats - current_grid))),
+        float(np.max(np.abs(beats - fitted_grid))),
+    )
+
+
+def beat_phase_distance_seconds(first_seconds: float, second_seconds: float, bpm: float) -> float | None:
+    if bpm <= 0:
+        return None
+    beat_seconds = 60.0 / bpm
+    if beat_seconds <= 0:
+        return None
+    distance = abs(((first_seconds - second_seconds + beat_seconds / 2.0) % beat_seconds) - beat_seconds / 2.0)
+    return float(distance)
+
+
+def manual_beat_interval_seconds(
+    anchor_seconds: float,
+    next_anchor_seconds: float,
+    nominal_beat_seconds: float,
+) -> float | None:
+    if nominal_beat_seconds <= 0:
+        return None
+    distance = next_anchor_seconds - anchor_seconds
+    if not np.isfinite(distance) or distance <= 0:
+        return None
+    beat_count = int(round(distance / nominal_beat_seconds))
+    if beat_count < 1:
+        return None
+    interval = distance / beat_count
+    if not np.isfinite(interval) or interval <= 0:
+        return None
+    return float(interval)
+
+
+def align_bpm_to_reference(bpm: float, reference_bpm: float) -> float:
+    if bpm <= 0 or reference_bpm <= 0:
+        return bpm
+
+    candidates = [bpm / 2.0, bpm, bpm * 2.0]
+    return min(candidates, key=lambda candidate: abs(candidate - reference_bpm))
+
+
+def is_three_two_tempo_ratio(
+    first_bpm: float,
+    second_bpm: float,
+    tolerance: float = THREE_TWO_TEMPO_RATIO_TOLERANCE,
+) -> bool:
+    if first_bpm <= 0 or second_bpm <= 0:
+        return False
+    ratio = max(first_bpm, second_bpm) / min(first_bpm, second_bpm)
+    return abs(ratio - 1.5) <= tolerance
+
+
+def circular_mean_period(values: list[float], period: float) -> tuple[float, float] | None:
+    if not values or period <= 0:
+        return None
+
+    angles = np.array([(value % period) / period * math.tau for value in values], dtype=float)
+    if not np.all(np.isfinite(angles)):
+        return None
+
+    mean_sin = float(np.mean(np.sin(angles)))
+    mean_cos = float(np.mean(np.cos(angles)))
+    if abs(mean_sin) < 1e-12 and abs(mean_cos) < 1e-12:
+        return None
+
+    mean_angle = math.atan2(mean_sin, mean_cos)
+    if mean_angle < 0:
+        mean_angle += math.tau
+    mean_value = (mean_angle / math.tau) * period
+    distances = [
+        abs(((value - mean_value + period / 2.0) % period) - period / 2.0)
+        for value in values
+    ]
+    return float(mean_value), float(max(distances))
+
+
+def stable_tempo_grid_from_segments(
+    initial_bpm: float,
+    initial_uncertainty_bpm: float,
+    initial_confidence: float,
+    segments: list[TempoGridSegment],
+) -> StableTempoGridResult | None:
+    agreement = tempo_segment_agreement_from_segments(initial_bpm, segments)
+    if agreement is None:
+        return None
+
+    if initial_bpm <= 0:
+        return None
+
+    usable = [
+        segment
+        for segment in segments
+        if segment.bpm > 0 and np.isfinite(segment.bpm) and segment.confidence >= 20.0
+    ]
+    if len(usable) < 3:
+        return None
+
+    aligned_bpms = np.array(
+        [align_bpm_to_reference(segment.bpm, initial_bpm) for segment in usable],
+        dtype=float,
+    )
+    median_bpm = float(np.median(aligned_bpms))
+    tempo_spread = agreement.tempo_spread_bpm
+    stable_limit = max(1.0, median_bpm * 0.012)
+    if tempo_spread > stable_limit:
+        return None
+
+    bpm = median_bpm
+    uncertainty_bpm = max(0.5, min(initial_uncertainty_bpm, tempo_spread if tempo_spread > 0 else 0.5))
+    confidence = max(initial_confidence, confidence_from_uncertainty(bpm, uncertainty_bpm))
+
+    beat_seconds = 60.0 / bpm
+    anchor_values = [
+        segment.anchor_seconds
+        for segment in usable
+        if segment.anchor_seconds is not None and np.isfinite(segment.anchor_seconds)
+    ]
+    anchor_seconds = None
+    anchor_spread = None
+    if len(anchor_values) >= 3:
+        phase = circular_mean_period([float(anchor) for anchor in anchor_values], beat_seconds)
+        if phase is not None:
+            anchor_seconds, anchor_spread = phase
+            if anchor_spread > max(0.12, beat_seconds * 0.18):
+                anchor_seconds = None
+
+    return StableTempoGridResult(
+        bpm=bpm,
+        uncertainty_bpm=uncertainty_bpm,
+        confidence=confidence,
+        anchor_seconds=anchor_seconds,
+        agreement_score=agreement.score,
+        tempo_spread_bpm=tempo_spread,
+        anchor_spread_seconds=agreement.anchor_spread_seconds if agreement.anchor_spread_seconds is not None else anchor_spread,
+        segment_count=agreement.segment_count,
+    )
+
+
+def tempo_segment_agreement_from_segments(
+    initial_bpm: float,
+    segments: list[TempoGridSegment],
+) -> TempoSegmentAgreement | None:
+    if initial_bpm <= 0:
+        return None
+
+    usable = [
+        segment
+        for segment in segments
+        if segment.bpm > 0 and np.isfinite(segment.bpm) and segment.confidence >= 20.0
+    ]
+    if len(usable) < 3:
+        return None
+
+    aligned_bpms = np.array(
+        [align_bpm_to_reference(segment.bpm, initial_bpm) for segment in usable],
+        dtype=float,
+    )
+    median_bpm = float(np.median(aligned_bpms))
+    tempo_spread = float(1.4826 * np.median(np.abs(aligned_bpms - median_bpm)))
+    tempo_limit = max(1.0, median_bpm * 0.012)
+    tempo_score = 100.0 - min(100.0, (tempo_spread / (tempo_limit * 2.0)) * 100.0)
+
+    beat_seconds = 60.0 / median_bpm
+    anchor_values = [
+        segment.anchor_seconds
+        for segment in usable
+        if segment.anchor_seconds is not None and np.isfinite(segment.anchor_seconds)
+    ]
+    anchor_spread = None
+    anchor_score = tempo_score
+    if len(anchor_values) >= 3:
+        phase = circular_mean_period([float(anchor) for anchor in anchor_values], beat_seconds)
+        if phase is not None:
+            _anchor_seconds, anchor_spread = phase
+            anchor_limit = max(0.12, beat_seconds * 0.18)
+            anchor_score = 100.0 - min(100.0, (anchor_spread / (anchor_limit * 2.0)) * 100.0)
+
+    score = max(0.0, min(100.0, tempo_score * 0.7 + anchor_score * 0.3))
+    return TempoSegmentAgreement(
+        score=score,
+        tempo_spread_bpm=tempo_spread,
+        anchor_spread_seconds=anchor_spread,
+        segment_count=len(usable),
+    )
 
 
 def parse_optional_float(value: str | None) -> float | None:
@@ -1245,6 +1504,7 @@ def estimate_tempo_with_librosa(
     path: Path,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    bpm_hint: float | None = None,
 ) -> TempoEstimate:
     if librosa is None:
         raise RuntimeError("librosa is not installed.")
@@ -1253,7 +1513,10 @@ def estimate_tempo_with_librosa(
     if audio.size < sample_rate:
         raise ValueError("The file is too short to estimate a tempo.")
 
-    tempo, beats = librosa.beat.beat_track(y=audio, sr=sample_rate, units="time")
+    beat_kwargs = {"y": audio, "sr": sample_rate, "units": "time"}
+    if bpm_hint is not None and bpm_hint > 0:
+        beat_kwargs["bpm"] = bpm_hint
+    tempo, beats = librosa.beat.beat_track(**beat_kwargs)
     tempo = float(np.asarray(tempo).squeeze())
 
     if not np.isfinite(tempo) or tempo <= 0 or len(beats) < 2:
@@ -1269,6 +1532,8 @@ def estimate_tempo_with_librosa(
         mad = float(np.median(np.abs(interval_bpms - median_bpm)))
         uncertainty_bpm = max(1.0, min(30.0, 1.4826 * mad))
         detail = f"{len(beats)} beats tracked; tracker {tracker_tempo:.2f} BPM"
+        if bpm_hint is not None and bpm_hint > 0:
+            detail += f"; guided by {bpm_hint:.2f} BPM"
     else:
         uncertainty_bpm = 12.0
         detail = "few beats tracked"
@@ -1358,6 +1623,62 @@ def estimate_tempo(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> TempoEstimate:
+    estimate = estimate_tempo_core(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    segments = tempo_grid_segments_for_file(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    agreement = tempo_segment_agreement_from_segments(estimate.bpm, segments)
+    stable_grid = None
+    if segments:
+        stable_grid = stable_tempo_grid_from_segments(
+            estimate.bpm,
+            estimate.uncertainty_bpm,
+            estimate.confidence,
+            segments,
+        )
+    if stable_grid is not None:
+        stable_difference = abs(stable_grid.bpm - estimate.bpm)
+        if stable_grid.agreement_score < SEGMENT_CONSENSUS_MIN_AGREEMENT:
+            stable_grid = None
+        elif (
+            estimate.confidence >= HIGH_CONFIDENCE_SEGMENT_OVERRIDE_THRESHOLD
+            and stable_difference > HIGH_CONFIDENCE_SEGMENT_MAX_CHANGE_BPM
+        ):
+            stable_grid = None
+    if stable_grid is None:
+        if agreement is None:
+            return estimate
+        return TempoEstimate(
+            bpm=estimate.bpm,
+            uncertainty_bpm=estimate.uncertainty_bpm,
+            confidence=estimate.confidence,
+            method=estimate.method,
+            detail=estimate.detail,
+            segment_agreement_score=agreement.score,
+            segment_agreement_detail=tempo_segment_agreement_detail(agreement),
+        )
+
+    anchor_detail = ""
+    if stable_grid.anchor_seconds is not None:
+        anchor_detail = f"; segment anchor {stable_grid.anchor_seconds:.3f}s"
+    agreement_detail = tempo_segment_agreement_detail(stable_grid)
+    return TempoEstimate(
+        bpm=stable_grid.bpm,
+        uncertainty_bpm=stable_grid.uncertainty_bpm,
+        confidence=stable_grid.confidence,
+        method=estimate.method,
+        detail=(
+            f"{estimate.detail}; segment consensus {stable_grid.segment_count} windows, "
+            f"spread {stable_grid.tempo_spread_bpm:.2f} BPM{anchor_detail}"
+        ),
+        segment_agreement_score=stable_grid.agreement_score,
+        segment_agreement_detail=agreement_detail,
+    )
+
+
+def estimate_tempo_core(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate:
     try:
         primary = estimate_tempo_with_librosa(path, start_seconds=start_seconds, end_seconds=end_seconds)
     except Exception:
@@ -1372,6 +1693,31 @@ def estimate_tempo(
     if disagreement <= max(primary.uncertainty_bpm, secondary.uncertainty_bpm, 6.0):
         return primary
 
+    if is_three_two_tempo_ratio(primary.bpm, secondary.bpm):
+        try:
+            guided = estimate_tempo_with_librosa(
+                path,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+                bpm_hint=secondary.bpm,
+            )
+        except Exception:
+            guided = None
+        if guided is not None:
+            guided_secondary_disagreement = abs(guided.bpm - secondary.bpm)
+            if guided_secondary_disagreement <= max(guided.uncertainty_bpm, secondary.uncertainty_bpm, 6.0):
+                confidence = min(guided.confidence, max(40.0, secondary.confidence + 20.0))
+                return TempoEstimate(
+                    bpm=guided.bpm,
+                    uncertainty_bpm=guided.uncertainty_bpm,
+                    confidence=confidence,
+                    method=guided.method,
+                    detail=(
+                        f"{guided.detail}; accepted 3:2 tempo correction "
+                        f"(primary {primary.bpm:.2f}, fallback {secondary.bpm:.2f})"
+                    ),
+                )
+
     uncertainty_bpm = max(primary.uncertainty_bpm, min(30.0, disagreement / 2))
     disagreement_penalty = min(60.0, (disagreement / primary.bpm) * 180.0)
     confidence = max(0.0, min(primary.confidence, secondary.confidence) - disagreement_penalty)
@@ -1383,6 +1729,142 @@ def estimate_tempo(
         method=primary.method,
         detail=f"{primary.detail}; fallback disagrees by {disagreement:.1f} BPM",
     )
+
+
+def tempo_analysis_windows(
+    duration: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    count: int = 5,
+) -> list[tuple[float, float]]:
+    analysis_start = 0.0 if start_seconds is None else max(0.0, start_seconds)
+    analysis_end = duration if end_seconds is None else min(duration, max(analysis_start, end_seconds))
+    analysis_duration = analysis_end - analysis_start
+    if analysis_duration < 30.0:
+        return []
+
+    window_count = max(3, min(count, int(analysis_duration // 12.0)))
+    window_seconds = min(45.0, max(12.0, analysis_duration / window_count))
+    if analysis_duration < window_seconds:
+        return []
+
+    windows = []
+    for index in range(window_count):
+        if window_count == 1:
+            center = analysis_start + analysis_duration / 2.0
+        else:
+            center = analysis_start + (index + 0.5) * (analysis_duration / window_count)
+        window_start = max(analysis_start, center - window_seconds / 2.0)
+        window_end = min(analysis_end, window_start + window_seconds)
+        window_start = max(analysis_start, window_end - window_seconds)
+        if window_end - window_start >= 8.0:
+            windows.append((round(window_start, 6), round(window_end, 6)))
+    return windows
+
+
+def tempo_segment_agreement_detail(agreement: TempoSegmentAgreement | StableTempoGridResult) -> str:
+    anchor_text = "anchor n/a"
+    if agreement.anchor_spread_seconds is not None:
+        anchor_text = f"anchor spread {agreement.anchor_spread_seconds:.3f}s"
+    return (
+        f"{agreement.segment_count} windows; tempo spread {agreement.tempo_spread_bpm:.2f} BPM; "
+        f"{anchor_text}"
+    )
+
+
+def tempo_grid_segments_for_file(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> list[TempoGridSegment]:
+    duration = audio_file_duration(path)
+    if duration is None:
+        return []
+
+    windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
+    if len(windows) < 3:
+        return []
+
+    segments = []
+    for window_start, window_end in windows:
+        try:
+            estimate = estimate_tempo_core(path, start_seconds=window_start, end_seconds=window_end)
+        except Exception:
+            continue
+
+        anchor_seconds = None
+        try:
+            anchor_seconds = detect_beat_anchor_seconds(
+                path,
+                estimate.bpm,
+                start_seconds=window_start,
+                end_seconds=window_end,
+            )
+        except Exception:
+            pass
+
+        segments.append(
+            TempoGridSegment(
+                start_seconds=window_start,
+                end_seconds=window_end,
+                bpm=estimate.bpm,
+                anchor_seconds=anchor_seconds,
+                confidence=estimate.confidence,
+            )
+        )
+    return segments
+
+
+def detect_stable_tempo_grid(
+    path: Path,
+    initial_estimate: TempoEstimate,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> StableTempoGridResult | None:
+    segments = tempo_grid_segments_for_file(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    return stable_tempo_grid_from_segments(
+        initial_estimate.bpm,
+        initial_estimate.uncertainty_bpm,
+        initial_estimate.confidence,
+        segments,
+    )
+
+
+def detect_stable_beat_anchor_seconds(
+    path: Path,
+    bpm: float | None = None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
+    if bpm is None or bpm <= 0:
+        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    duration = audio_file_duration(path)
+    if duration is None:
+        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
+    if len(windows) < 3:
+        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    anchors = []
+    for window_start, window_end in windows:
+        try:
+            anchor = detect_beat_anchor_seconds(path, bpm, start_seconds=window_start, end_seconds=window_end)
+        except Exception:
+            continue
+        if anchor is not None and np.isfinite(anchor):
+            anchors.append(float(anchor))
+
+    beat_seconds = 60.0 / bpm
+    phase = circular_mean_period(anchors, beat_seconds)
+    if phase is None:
+        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    anchor_seconds, anchor_spread = phase
+    if anchor_spread > max(0.12, beat_seconds * 0.18):
+        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+    return round(anchor_seconds, 6)
 
 
 def collect_audio_files(paths: list[Path]) -> list[Path]:
@@ -1793,6 +2275,7 @@ class TempoWindow:
             "markers",
             "tempo",
             "uncertainty",
+            "tempo_agreement",
             "similarity",
             "chroma",
             "base",
@@ -1808,6 +2291,7 @@ class TempoWindow:
             "markers": "Marks",
             "tempo": "Tempo",
             "uncertainty": "Uncertainty",
+            "tempo_agreement": "Agree",
             "similarity": "Sim",
             "chroma": "Chroma peaks",
             "base": "Base",
@@ -1829,6 +2313,7 @@ class TempoWindow:
         self.table.column("markers", width=75, anchor="center", stretch=False)
         self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
+        self.table.column("tempo_agreement", width=70, anchor="center", stretch=False)
         self.table.column("similarity", width=105, anchor="center")
         self.table.column("chroma", width=95, anchor="center")
         self.table.column("base", width=75, anchor="center", stretch=False)
@@ -1936,20 +2421,7 @@ class TempoWindow:
             return
 
         try:
-            payload = json.loads(json_path.read_text(encoding="utf-8"))
-            if not isinstance(payload, dict):
-                raise ValueError("Expected a JSON object.")
-            row_payload = payload.get("rows", [])
-            if not isinstance(row_payload, list):
-                raise ValueError("Expected rows to be a list.")
-            rows = [
-                self.row_from_csv_record(
-                    {str(key): "" if value is None else str(value) for key, value in record.items()},
-                    json_path.parent,
-                )
-                for record in row_payload
-                if isinstance(record, dict)
-            ]
+            payload, rows = self.read_json_rows(json_path)
         except Exception as exc:
             messagebox.showerror("Chromatch", f"Could not load JSON:\n{exc}")
             return
@@ -1984,6 +2456,23 @@ class TempoWindow:
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from JSON")
+
+    def read_json_rows(self, json_path: Path) -> tuple[dict, list[AnalysisRow]]:
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            raise ValueError("Expected a JSON object.")
+        row_payload = payload.get("rows", [])
+        if not isinstance(row_payload, list):
+            raise ValueError("Expected rows to be a list.")
+        rows = [
+            self.row_from_csv_record(
+                {str(key): "" if value is None else str(value) for key, value in record.items()},
+                json_path.parent,
+            )
+            for record in row_payload
+            if isinstance(record, dict)
+        ]
+        return payload, rows
 
     def load_matches_path(self, path: Path) -> None:
         self.match_links = {}
@@ -2059,6 +2548,8 @@ class TempoWindow:
             album=album,
             bpm=parse_optional_float(record.get("detected_tempo_bpm")),
             uncertainty_bpm=parse_optional_float(record.get("uncertainty_bpm")),
+            tempo_agreement_score=parse_optional_float(record.get("tempo_agreement_0_100")),
+            tempo_agreement_detail=record.get("tempo_agreement_detail", ""),
             confidence=parse_optional_float(record.get("confidence_0_100")),
             tapped_bpm=parse_optional_float(record.get("tapped_tempo_bpm")),
             chroma=chroma,
@@ -2112,6 +2603,8 @@ class TempoWindow:
                 album="",
                 bpm=None,
                 uncertainty_bpm=None,
+                tempo_agreement_score=None,
+                tempo_agreement_detail="",
                 confidence=None,
                 tapped_bpm=None,
                 chroma=None,
@@ -2707,11 +3200,16 @@ class TempoWindow:
         self.row_part_totals = part_totals
         self.row_part_groups = row_part_groups
         valid_ids = {self.row_id(row) for row in self.rows}
-        self.current_part_ids_by_group = {
-            group_key: row_id
-            for group_key, row_id in self.current_part_ids_by_group.items()
-            if row_id in valid_ids and group_key in row_part_groups
-        }
+        current_part_ids_by_group = {}
+        for group_key, row_id in self.current_part_ids_by_group.items():
+            if row_id not in valid_ids:
+                continue
+            normalized_group_key = group_key
+            if normalized_group_key not in row_part_groups:
+                normalized_group_key = canonical_path_id(Path(group_key))
+            if normalized_group_key in row_part_groups:
+                current_part_ids_by_group[normalized_group_key] = row_id
+        self.current_part_ids_by_group = current_part_ids_by_group
 
     def sync_waveform_rows(self) -> None:
         rows_by_id = {self.row_id(row): row for row in self.rows}
@@ -3257,6 +3755,8 @@ class TempoWindow:
             return tempo if tempo is not None else missing_number
         if self.sort_column == "uncertainty":
             return row.uncertainty_bpm if row.uncertainty_bpm is not None else missing_number
+        if self.sort_column == "tempo_agreement":
+            return row.tempo_agreement_score if row.tempo_agreement_score is not None else missing_number
         if self.sort_column in {"similarity", "chroma_similarity", "chroma_tempo_similarity"}:
             if self.similarity_mode() == SIMILARITY_BASE_BPM:
                 score = self.similarity_score_for_row(row)
@@ -3472,6 +3972,7 @@ class TempoWindow:
             "Title": row.title,
             "Album": row.album,
             "Tempo": "" if effective_tempo is None else f"{effective_tempo:.2f}",
+            "Agreement": "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}",
             "Similarity": self.similarity_text_for_row(row),
             "Chroma": simple_chroma_peaks(row.chroma),
             "Base": self.base_text_for_row(row),
@@ -3495,6 +3996,7 @@ class TempoWindow:
             tempo_text = f"{effective_tempo:.2f}"
 
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
+        agreement_text = "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}"
         similarity_text = self.similarity_text_for_row(row)
         chroma_text = simple_chroma_peaks(row.chroma)
         base_text = self.base_text_for_row(row)
@@ -3509,6 +4011,7 @@ class TempoWindow:
             self.row_marker_summary(row),
             tempo_text,
             uncertainty_text,
+            agreement_text,
             similarity_text,
             chroma_text,
             base_text,
@@ -3672,7 +4175,7 @@ class TempoWindow:
         def worker() -> None:
             downbeat_seconds = None
             try:
-                downbeat_seconds = detect_beat_anchor_seconds(
+                downbeat_seconds = detect_stable_beat_anchor_seconds(
                     slot.row.path,
                     self.row_tempo_for_matching(slot.row),
                     start_seconds=slot.row.part_start_seconds,
@@ -4134,6 +4637,30 @@ class TempoWindow:
             return max(anchors)
         return self.slot_beat_anchor_seconds(slot)
 
+    def slot_resync_grid(self, slot: WaveformSlot, seconds: float) -> tuple[float, float] | None:
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or beat_seconds <= 0:
+            return None
+
+        user_anchors = sorted(beat for beat in slot.row.user_beat_seconds if np.isfinite(beat))
+        previous_user_anchors = [beat for beat in user_anchors if beat <= seconds]
+        if previous_user_anchors:
+            anchor = max(previous_user_anchors)
+            next_anchors = [beat for beat in user_anchors if beat > anchor]
+            if next_anchors:
+                interval = manual_beat_interval_seconds(anchor, min(next_anchors), beat_seconds)
+                if interval is not None:
+                    return anchor, interval
+
+            earlier_anchors = [beat for beat in user_anchors if beat < anchor]
+            if earlier_anchors:
+                interval = manual_beat_interval_seconds(max(earlier_anchors), anchor, beat_seconds)
+                if interval is not None:
+                    return anchor, interval
+            return anchor, beat_seconds
+
+        return self.slot_beat_anchor_seconds(slot), beat_seconds
+
     def quantized_cue_seconds(self, slot: WaveformSlot, seconds: float) -> float:
         try:
             should_quantize = bool(self.quantize_cues_var.get())
@@ -4146,7 +4673,10 @@ class TempoWindow:
         if beat_seconds is None or beat_seconds <= 0:
             return max(0.0, min(slot.duration, seconds))
 
-        anchor = self.slot_resync_anchor_seconds(slot, seconds)
+        grid = self.slot_resync_grid(slot, seconds)
+        if grid is None:
+            return max(0.0, min(slot.duration, seconds))
+        anchor, beat_seconds = grid
         beat_number = round((seconds - anchor) / beat_seconds)
         quantized = anchor + beat_number * beat_seconds
         return max(0.0, min(slot.duration, round(quantized, 6)))
@@ -4167,13 +4697,18 @@ class TempoWindow:
         for index, anchor in enumerate(anchors):
             segment_start = start_seconds if index == 0 else max(start_seconds, anchor)
             segment_end = end_seconds
+            segment_beat_seconds = beat_seconds
             if index + 1 < len(anchors):
-                segment_end = min(segment_end, anchors[index + 1])
+                next_anchor = anchors[index + 1]
+                segment_end = min(segment_end, next_anchor)
+                fitted_interval = manual_beat_interval_seconds(anchor, next_anchor, beat_seconds)
+                if fitted_interval is not None:
+                    segment_beat_seconds = fitted_interval
 
-            first_beat = math.floor((segment_start - anchor) / beat_seconds)
-            last_beat = math.ceil((segment_end - anchor) / beat_seconds)
+            first_beat = math.floor((segment_start - anchor) / segment_beat_seconds)
+            last_beat = math.ceil((segment_end - anchor) / segment_beat_seconds)
             for beat_index in range(first_beat, last_beat + 1):
-                beat_time = anchor + beat_index * beat_seconds
+                beat_time = anchor + beat_index * segment_beat_seconds
                 if segment_start <= beat_time <= segment_end:
                     line_times.add(round(beat_time, 6))
 
@@ -4521,6 +5056,7 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "Place at least two distinct beats first.")
             return
 
+        drift = tempo_grid_fit_drift_seconds(user_beats, current_tempo)
         fitted_bpm, anchor_seconds = fit
         updated_rows = []
         for row in self.rows:
@@ -4541,7 +5077,11 @@ class TempoWindow:
         self.update_similarity_scores()
         self.refresh_table()
         self.draw_all_waveforms()
-        self.result.configure(text=f"Fitted BPM from {len(user_beats)} beats: {fitted_bpm:.2f}")
+        message = f"Fitted BPM from {len(user_beats)} beats: {fitted_bpm:.2f}"
+        if drift is not None:
+            before_drift, after_drift = drift
+            message += f" (grid drift {before_drift:.3f}s -> {after_drift:.3f}s)"
+        self.result.configure(text=message)
 
     def selected_waveform_slot(self) -> WaveformSlot | None:
         selected_ids = list(self.table.selection())
@@ -4869,7 +5409,10 @@ class TempoWindow:
             return current_seconds
 
         target_phase = self.metronome_beat_phase()
-        anchor = self.slot_resync_anchor_seconds(slot, current_seconds)
+        grid = self.slot_resync_grid(slot, current_seconds)
+        if grid is None:
+            return current_seconds
+        anchor, beat_seconds = grid
         beat_number = round(((current_seconds - anchor) / beat_seconds) - target_phase)
         synced_seconds = anchor + (beat_number + target_phase) * beat_seconds
         return max(0.0, min(slot.duration, synced_seconds))
@@ -5451,7 +5994,7 @@ class TempoWindow:
                         errors.append(f"chroma: {exc}")
 
                     try:
-                        beat_anchor_seconds = detect_beat_anchor_seconds(
+                        beat_anchor_seconds = detect_stable_beat_anchor_seconds(
                             path,
                             None if estimate is None else estimate.bpm,
                             start_seconds=task.part_start_seconds,
@@ -5482,6 +6025,8 @@ class TempoWindow:
                     album=album,
                     bpm=None if estimate is None else estimate.bpm,
                     uncertainty_bpm=None if estimate is None else estimate.uncertainty_bpm,
+                    tempo_agreement_score=None if estimate is None else estimate.segment_agreement_score,
+                    tempo_agreement_detail="" if estimate is None else estimate.segment_agreement_detail,
                     confidence=None if estimate is None else estimate.confidence,
                     tapped_bpm=None,
                     chroma=chroma,
@@ -5585,6 +6130,8 @@ class TempoWindow:
             EXPORT_GRAPHVIZ: self.export_graphviz,
             EXPORT_CLOSEST_PAIRS: self.export_closest_pairs,
             EXPORT_BASE_AUDIT: self.export_base_audit,
+            EXPORT_TEMPO_AUDIT: self.export_tempo_audit,
+            EXPORT_TEMPO_REFERENCE_AUDIT: self.export_tempo_reference_audit,
             EXPORT_TRAKTOR_NML: self.export_traktor_nml,
         }
         actions.get(mode, self.export_csv)()
@@ -5723,6 +6270,8 @@ class TempoWindow:
             "album": row.album,
             "detected_tempo_bpm": "" if row.bpm is None else f"{row.bpm:.2f}",
             "uncertainty_bpm": "" if row.uncertainty_bpm is None else f"{row.uncertainty_bpm:.2f}",
+            "tempo_agreement_0_100": "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}",
+            "tempo_agreement_detail": row.tempo_agreement_detail,
             "confidence_0_100": "" if row.confidence is None else f"{row.confidence:.0f}",
             "tapped_tempo_bpm": "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
             "part_start_seconds": "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
@@ -5757,6 +6306,8 @@ class TempoWindow:
             "album",
             "detected_tempo_bpm",
             "uncertainty_bpm",
+            "tempo_agreement_0_100",
+            "tempo_agreement_detail",
             "confidence_0_100",
             "tapped_tempo_bpm",
             "part_start_seconds",
@@ -6681,6 +7232,236 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             return
 
         self.result.configure(text=f"Exported base audit: {Path(filename).name}")
+
+    def tempo_audit_record(self, row: AnalysisRow) -> dict[str, str]:
+        manual_bpm = row.tapped_bpm
+        automatic_bpm = row.bpm
+        aligned_automatic_bpm = None
+        tempo_error = None
+        if manual_bpm is not None and automatic_bpm is not None:
+            aligned_automatic_bpm = align_bpm_to_reference(automatic_bpm, manual_bpm)
+            tempo_error = aligned_automatic_bpm - manual_bpm
+
+        manual_anchor = row.user_beat_seconds[0] if row.user_beat_seconds else None
+        automatic_anchor = row.beat_anchor_seconds
+        anchor_error = None
+        if manual_anchor is not None and automatic_anchor is not None:
+            anchor_bpm = manual_bpm if manual_bpm is not None else automatic_bpm
+            if anchor_bpm is not None:
+                anchor_error = beat_phase_distance_seconds(automatic_anchor, manual_anchor, anchor_bpm)
+
+        return {
+            "filename": row.path.name,
+            "filepath": str(row.path),
+            "artist": row.artist,
+            "title": row.title,
+            "part": self.row_part_label(row),
+            "automatic_bpm": "" if automatic_bpm is None else f"{automatic_bpm:.2f}",
+            "manual_bpm": "" if manual_bpm is None else f"{manual_bpm:.2f}",
+            "aligned_automatic_bpm": "" if aligned_automatic_bpm is None else f"{aligned_automatic_bpm:.2f}",
+            "tempo_error_bpm": "" if tempo_error is None else f"{tempo_error:.3f}",
+            "tempo_abs_error_bpm": "" if tempo_error is None else f"{abs(tempo_error):.3f}",
+            "tempo_agreement_0_100": "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}",
+            "tempo_agreement_detail": row.tempo_agreement_detail,
+            "automatic_anchor_seconds": "" if automatic_anchor is None else f"{automatic_anchor:.6f}",
+            "automatic_anchor_source": row.beat_anchor_source,
+            "manual_anchor_seconds": "" if manual_anchor is None else f"{manual_anchor:.6f}",
+            "anchor_phase_error_seconds": "" if anchor_error is None else f"{anchor_error:.6f}",
+            "anchor_phase_abs_error_seconds": "" if anchor_error is None else f"{abs(anchor_error):.6f}",
+            "manual_beat_count": str(len(row.user_beat_seconds)),
+            "method": row.method,
+            "detail": row.detail,
+            "error": row.error,
+        }
+
+    def tempo_reference_audit_record(
+        self,
+        row: AnalysisRow,
+        estimate: TempoEstimate | None = None,
+        anchor_seconds: float | None = None,
+        analysis_error: str = "",
+    ) -> dict[str, str]:
+        manual_bpm = row.tapped_bpm
+        current_bpm = None if estimate is None else estimate.bpm
+        aligned_current_bpm = None
+        tempo_error = None
+        if manual_bpm is not None and current_bpm is not None:
+            aligned_current_bpm = align_bpm_to_reference(current_bpm, manual_bpm)
+            tempo_error = aligned_current_bpm - manual_bpm
+
+        manual_anchor = row.user_beat_seconds[0] if row.user_beat_seconds else None
+        anchor_error = None
+        if manual_anchor is not None and anchor_seconds is not None:
+            anchor_bpm = manual_bpm if manual_bpm is not None else current_bpm
+            if anchor_bpm is not None:
+                anchor_error = beat_phase_distance_seconds(anchor_seconds, manual_anchor, anchor_bpm)
+
+        base_bin = row.base_chroma_bin
+        return {
+            "filename": row.path.name,
+            "filepath": str(row.path),
+            "artist": row.artist,
+            "title": row.title,
+            "part": self.row_part_label(row),
+            "saved_automatic_bpm": "" if row.bpm is None else f"{row.bpm:.2f}",
+            "current_automatic_bpm": "" if current_bpm is None else f"{current_bpm:.2f}",
+            "manual_bpm": "" if manual_bpm is None else f"{manual_bpm:.2f}",
+            "aligned_current_automatic_bpm": "" if aligned_current_bpm is None else f"{aligned_current_bpm:.2f}",
+            "current_tempo_error_bpm": "" if tempo_error is None else f"{tempo_error:.3f}",
+            "current_tempo_abs_error_bpm": "" if tempo_error is None else f"{abs(tempo_error):.3f}",
+            "current_tempo_agreement_0_100": "" if estimate is None or estimate.segment_agreement_score is None else f"{estimate.segment_agreement_score:.0f}",
+            "current_tempo_agreement_detail": "" if estimate is None else estimate.segment_agreement_detail,
+            "saved_anchor_seconds": "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
+            "current_anchor_seconds": "" if anchor_seconds is None else f"{anchor_seconds:.6f}",
+            "manual_anchor_seconds": "" if manual_anchor is None else f"{manual_anchor:.6f}",
+            "current_anchor_phase_error_seconds": "" if anchor_error is None else f"{anchor_error:.6f}",
+            "current_anchor_phase_abs_error_seconds": "" if anchor_error is None else f"{abs(anchor_error):.6f}",
+            "manual_beat_count": str(len(row.user_beat_seconds)),
+            "manual_base_bin": "" if base_bin is None else str(base_bin),
+            "manual_base": "" if base_bin is None else chroma_bin_label(base_bin, CHROMA_BINS),
+            "current_method": "" if estimate is None else estimate.method,
+            "current_detail": "" if estimate is None else estimate.detail,
+            "analysis_error": analysis_error,
+        }
+
+    def export_tempo_audit(self) -> None:
+        rows = [
+            row
+            for row in self.export_rows_for_scope()
+            if row.tapped_bpm is not None or row.user_beat_seconds
+        ]
+        if not rows:
+            messagebox.showinfo("Chromatch", "No rows with tapped tempo or manual beats to audit.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            initialfile="chromatch-tempo-audit.csv",
+        )
+        if not filename:
+            return
+
+        fieldnames = [
+            "filename",
+            "filepath",
+            "artist",
+            "title",
+            "part",
+            "automatic_bpm",
+            "manual_bpm",
+            "aligned_automatic_bpm",
+            "tempo_error_bpm",
+            "tempo_abs_error_bpm",
+            "tempo_agreement_0_100",
+            "tempo_agreement_detail",
+            "automatic_anchor_seconds",
+            "automatic_anchor_source",
+            "manual_anchor_seconds",
+            "anchor_phase_error_seconds",
+            "anchor_phase_abs_error_seconds",
+            "manual_beat_count",
+            "method",
+            "detail",
+            "error",
+        ]
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    writer.writerow(self.tempo_audit_record(row))
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export tempo audit:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported tempo audit: {Path(filename).name}")
+
+    def export_tempo_reference_audit(self) -> None:
+        reference_filename = filedialog.askopenfilename(
+            filetypes=(("Chromatch JSON", "*.json"), ("All files", "*.*")),
+            initialfile="proven files 01.json",
+        )
+        if not reference_filename:
+            return
+
+        try:
+            _payload, rows = self.read_json_rows(Path(reference_filename))
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not load tempo reference JSON:\n{exc}")
+            return
+
+        rows = [
+            row
+            for row in rows
+            if row.tapped_bpm is not None or row.user_beat_seconds or row.base_chroma_bin is not None
+        ]
+        if not rows:
+            messagebox.showinfo("Chromatch", "No proven tempo, beat, or base data found in the reference file.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            initialfile="chromatch-tempo-reference-audit.csv",
+        )
+        if not filename:
+            return
+
+        fieldnames = [
+            "filename",
+            "filepath",
+            "artist",
+            "title",
+            "part",
+            "saved_automatic_bpm",
+            "current_automatic_bpm",
+            "manual_bpm",
+            "aligned_current_automatic_bpm",
+            "current_tempo_error_bpm",
+            "current_tempo_abs_error_bpm",
+            "current_tempo_agreement_0_100",
+            "current_tempo_agreement_detail",
+            "saved_anchor_seconds",
+            "current_anchor_seconds",
+            "manual_anchor_seconds",
+            "current_anchor_phase_error_seconds",
+            "current_anchor_phase_abs_error_seconds",
+            "manual_beat_count",
+            "manual_base_bin",
+            "manual_base",
+            "current_method",
+            "current_detail",
+            "analysis_error",
+        ]
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    estimate = None
+                    anchor_seconds = None
+                    error = ""
+                    try:
+                        estimate = estimate_tempo(
+                            row.path,
+                            start_seconds=row.part_start_seconds,
+                            end_seconds=row.part_end_seconds,
+                        )
+                        anchor_seconds = detect_stable_beat_anchor_seconds(
+                            row.path,
+                            estimate.bpm,
+                            start_seconds=row.part_start_seconds,
+                            end_seconds=row.part_end_seconds,
+                        )
+                    except Exception as exc:
+                        error = str(exc)
+                    writer.writerow(self.tempo_reference_audit_record(row, estimate, anchor_seconds, error))
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export tempo reference audit:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported tempo reference audit: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
         source_rows = self.export_rows_for_scope()

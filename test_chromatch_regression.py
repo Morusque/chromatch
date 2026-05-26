@@ -26,6 +26,8 @@ class ChromatchRegressionTests(unittest.TestCase):
             album="",
             bpm=bpm,
             uncertainty_bpm=None,
+            tempo_agreement_score=None,
+            tempo_agreement_detail="",
             confidence=None,
             tapped_bpm=None,
             chroma=None,
@@ -92,6 +94,100 @@ class ChromatchRegressionTests(unittest.TestCase):
         fitted_bpm, fitted_anchor = fit
         self.assertAlmostEqual(expected_bpm, fitted_bpm, places=2)
         self.assertAlmostEqual(anchor, fitted_anchor, places=6)
+
+    def test_tempo_grid_fit_drift_reports_before_and_after_fit_error(self):
+        beats = (10.0, 12.1, 14.4)
+
+        drift = chromatch.tempo_grid_fit_drift_seconds(beats, 120.0)
+
+        self.assertIsNotNone(drift)
+        before_drift, after_drift = drift
+        self.assertGreater(before_drift, 0.08)
+        self.assertLess(after_drift, before_drift)
+
+    def test_manual_beat_interval_uses_inferred_beat_count_between_anchors(self):
+        interval = chromatch.manual_beat_interval_seconds(10.0, 14.2, 0.5)
+
+        self.assertAlmostEqual(0.525, interval)
+
+    def test_stable_tempo_grid_uses_segment_consensus_to_correct_bpm_and_anchor(self):
+        segments = [
+            chromatch.TempoGridSegment(0.0, 20.0, 120.1, 0.24, 90.0),
+            chromatch.TempoGridSegment(20.0, 40.0, 119.9, 20.25, 88.0),
+            chromatch.TempoGridSegment(40.0, 60.0, 120.0, 40.26, 92.0),
+            chromatch.TempoGridSegment(60.0, 80.0, 120.05, 60.24, 87.0),
+            chromatch.TempoGridSegment(80.0, 100.0, 119.95, 80.25, 91.0),
+        ]
+
+        result = chromatch.stable_tempo_grid_from_segments(118.0, 6.0, 50.0, segments)
+
+        self.assertIsNotNone(result)
+        self.assertAlmostEqual(120.0, result.bpm, places=1)
+        self.assertAlmostEqual(0.25, result.anchor_seconds, delta=0.02)
+        self.assertEqual(5, result.segment_count)
+
+    def test_stable_tempo_grid_rejects_wide_segment_tempo_spread(self):
+        segments = [
+            chromatch.TempoGridSegment(0.0, 20.0, 118.0, 0.24, 90.0),
+            chromatch.TempoGridSegment(20.0, 40.0, 121.0, 20.25, 88.0),
+            chromatch.TempoGridSegment(40.0, 60.0, 126.0, 40.26, 92.0),
+        ]
+
+        result = chromatch.stable_tempo_grid_from_segments(120.0, 6.0, 50.0, segments)
+
+        self.assertIsNone(result)
+
+    def test_tempo_segment_agreement_scores_stable_segments_higher_than_conflicting_segments(self):
+        stable = [
+            chromatch.TempoGridSegment(0.0, 20.0, 120.1, 0.24, 90.0),
+            chromatch.TempoGridSegment(20.0, 40.0, 119.9, 20.25, 88.0),
+            chromatch.TempoGridSegment(40.0, 60.0, 120.0, 40.26, 92.0),
+        ]
+        conflicting = [
+            chromatch.TempoGridSegment(0.0, 20.0, 118.0, 0.24, 90.0),
+            chromatch.TempoGridSegment(20.0, 40.0, 121.0, 20.25, 88.0),
+            chromatch.TempoGridSegment(40.0, 60.0, 126.0, 40.26, 92.0),
+        ]
+
+        stable_score = chromatch.tempo_segment_agreement_from_segments(120.0, stable).score
+        conflicting_score = chromatch.tempo_segment_agreement_from_segments(120.0, conflicting).score
+
+        self.assertGreater(stable_score, 80.0)
+        self.assertLess(conflicting_score, stable_score)
+
+    def test_tempo_analysis_windows_splits_long_track_into_analysis_segments(self):
+        windows = chromatch.tempo_analysis_windows(100.0, count=5)
+
+        self.assertEqual(5, len(windows))
+        self.assertEqual((0.0, 20.0), windows[0])
+        self.assertEqual((80.0, 100.0), windows[-1])
+
+    def test_estimate_tempo_core_uses_guided_librosa_for_three_two_disagreement(self):
+        original_librosa = chromatch.estimate_tempo_with_librosa
+        original_autocorrelation = chromatch.estimate_tempo_with_autocorrelation
+        calls = []
+
+        def fake_librosa(_path, start_seconds=None, end_seconds=None, bpm_hint=None):
+            calls.append(bpm_hint)
+            if bpm_hint is not None:
+                return chromatch.TempoEstimate(133.57, 1.0, 96.0, "librosa", "guided")
+            return chromatch.TempoEstimate(89.89, 1.0, 96.0, "librosa", "primary")
+
+        def fake_autocorrelation(_path, start_seconds=None, end_seconds=None):
+            return chromatch.TempoEstimate(136.0, 28.0, 38.0, "autocorrelation", "fallback")
+
+        try:
+            chromatch.estimate_tempo_with_librosa = fake_librosa
+            chromatch.estimate_tempo_with_autocorrelation = fake_autocorrelation
+
+            estimate = chromatch.estimate_tempo_core(Path("track.wav"))
+        finally:
+            chromatch.estimate_tempo_with_librosa = original_librosa
+            chromatch.estimate_tempo_with_autocorrelation = original_autocorrelation
+
+        self.assertEqual([None, 136.0], calls)
+        self.assertAlmostEqual(133.57, estimate.bpm)
+        self.assertIn("3:2 tempo correction", estimate.detail)
 
     def test_fold_bpm_preserves_fast_tempo(self):
         self.assertEqual(240.0, chromatch.fold_bpm(240.0))
@@ -312,6 +408,13 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertIn("base", columns)
 
+    def test_table_includes_tempo_agreement_column_after_uncertainty(self):
+        columns = tuple(self.app.table.cget("columns"))
+
+        self.assertIn("tempo_agreement", columns)
+        self.assertLess(columns.index("uncertainty"), columns.index("tempo_agreement"))
+        self.assertLess(columns.index("tempo_agreement"), columns.index("similarity"))
+
     def test_base_bpm_similarity_mode_groups_close_base_first(self):
         target = chromatch.replace(self.make_chroma_row("target.wav", 120, 0), row_uid=1, base_chroma_bin=100)
         close = chromatch.replace(self.make_chroma_row("close.wav", 120, 0), row_uid=2, base_chroma_bin=109)
@@ -349,7 +452,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         values = self.app.row_values(row)
 
-        self.assertEqual(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS), values[8])
+        self.assertEqual(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS), values[9])
 
     def test_base_column_is_sortable_by_chroma_bin(self):
         low = chromatch.replace(self.make_row("low.wav"), base_chroma_bin=5)
@@ -773,7 +876,86 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("", values[3])
         self.assertEqual("123.03 (A)", values[4])
         self.assertNotIn("BPM", values[4])
-        self.assertEqual(3, len(values[7].split()))
+        self.assertEqual(3, len(values[8].split()))
+
+    def test_row_values_show_tempo_agreement_score(self):
+        row = chromatch.replace(self.make_row("track.wav"), tempo_agreement_score=87.4)
+
+        values = self.app.row_values(row)
+
+        self.assertEqual("87", values[6])
+
+    def test_tempo_audit_record_compares_automatic_to_manual_tempo_and_anchor(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=119.5),
+            row_uid=4,
+            tapped_bpm=120.0,
+            beat_anchor_seconds=0.62,
+            beat_anchor_source="automatic",
+            user_beat_seconds=(0.5,),
+            tempo_agreement_score=91.0,
+            tempo_agreement_detail="5 windows; tempo spread 0.20 BPM; anchor spread 0.010s",
+        )
+
+        record = self.app.tempo_audit_record(row)
+
+        self.assertEqual("119.50", record["automatic_bpm"])
+        self.assertEqual("120.00", record["manual_bpm"])
+        self.assertEqual("0.500", record["tempo_abs_error_bpm"])
+        self.assertEqual("0.120000", record["anchor_phase_abs_error_seconds"])
+        self.assertEqual("91", record["tempo_agreement_0_100"])
+
+    def test_tempo_reference_audit_record_compares_current_analysis_to_proven_values(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=89.89),
+            tapped_bpm=133.5,
+            beat_anchor_seconds=7.65,
+            user_beat_seconds=(7.5,),
+            base_chroma_bin=58,
+        )
+        estimate = chromatch.TempoEstimate(
+            bpm=134.0,
+            uncertainty_bpm=0.5,
+            confidence=99.0,
+            method="test",
+            detail="segment consensus",
+            segment_agreement_score=94.0,
+            segment_agreement_detail="5 windows; tempo spread 0.20 BPM; anchor spread 0.010s",
+        )
+
+        record = self.app.tempo_reference_audit_record(row, estimate, 7.52)
+
+        self.assertEqual("89.89", record["saved_automatic_bpm"])
+        self.assertEqual("134.00", record["current_automatic_bpm"])
+        self.assertEqual("133.50", record["manual_bpm"])
+        self.assertEqual("0.500", record["current_tempo_abs_error_bpm"])
+        self.assertEqual("0.020000", record["current_anchor_phase_abs_error_seconds"])
+        self.assertEqual("58", record["manual_base_bin"])
+
+    def test_read_json_rows_loads_chromatch_reference_file(self):
+        payload = {
+            "format": "chromatch-analysis",
+            "version": 1,
+            "rows": [
+                {
+                    "filepath": "track.wav",
+                    "detected_tempo_bpm": "119.50",
+                    "tapped_tempo_bpm": "120.00",
+                    "user_beat_seconds": "[0.5]",
+                    "base_chroma_bin": "58",
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "reference.json"
+            path.write_text(chromatch.json.dumps(payload), encoding="utf-8")
+
+            _loaded_payload, rows = self.app.read_json_rows(path)
+
+        self.assertEqual(1, len(rows))
+        self.assertAlmostEqual(120.0, rows[0].tapped_bpm)
+        self.assertEqual((0.5,), rows[0].user_beat_seconds)
+        self.assertEqual(58, rows[0].base_chroma_bin)
 
     def test_part_rows_have_range_ids_and_part_numbers(self):
         row = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
@@ -2137,6 +2319,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
         original_detect = chromatch.detect_beat_anchor_seconds
+        original_after = self.app.root.after
         detected_calls = []
 
         with tempfile.TemporaryDirectory() as folder:
@@ -2152,9 +2335,15 @@ class ChromatchRegressionTests(unittest.TestCase):
                 or 0.37
             )
             try:
+                self.app.root.after = lambda _delay, callback: callback()
                 self.app.add_waveform(row)
+                for _ in range(100):
+                    if self.app.waveform_slots and self.app.waveform_slots[0].downbeat_seconds is not None:
+                        break
+                    chromatch.time.sleep(0.01)
             finally:
                 chromatch.detect_beat_anchor_seconds = original_detect
+                self.app.root.after = original_after
 
         self.assertEqual(1, len(self.app.waveform_slots))
         self.assertAlmostEqual(0.37, self.app.waveform_slots[0].downbeat_seconds)
@@ -2165,6 +2354,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
         original_detect = chromatch.detect_beat_anchor_seconds
+        original_after = self.app.root.after
 
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "track.wav"
@@ -2174,9 +2364,15 @@ class ChromatchRegressionTests(unittest.TestCase):
 
             chromatch.detect_beat_anchor_seconds = lambda _path, _bpm, start_seconds=None, end_seconds=None: 0.37
             try:
+                self.app.root.after = lambda _delay, callback: callback()
                 self.app.add_waveform(row)
+                for _ in range(100):
+                    if self.app.rows[0].beat_anchor_seconds is not None:
+                        break
+                    chromatch.time.sleep(0.01)
             finally:
                 chromatch.detect_beat_anchor_seconds = original_detect
+                self.app.root.after = original_after
 
         self.assertAlmostEqual(0.37, self.app.rows[0].beat_anchor_seconds)
         self.assertEqual("automatic", self.app.rows[0].beat_anchor_source)
@@ -3219,6 +3415,29 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertIn(10.25, lines)
         self.assertIn(10.75, lines)
+
+    def test_adjacent_user_beats_stretch_grid_lines_between_resync_anchors(self):
+        row = chromatch.replace(self.make_row(bpm=120), user_beat_seconds=(10.0, 14.2))
+        slot = chromatch.WaveformSlot(row_id="track", row=row, downbeat_seconds=0.0)
+
+        lines = self.app.resynced_beat_line_times(slot, 10.0, 14.2)
+
+        self.assertIn(10.525, lines)
+        self.assertIn(14.2, lines)
+        self.assertNotIn(10.5, lines)
+
+    def test_beat_sync_uses_stretched_grid_between_user_anchors(self):
+        row = chromatch.replace(self.make_row(bpm=120), user_beat_seconds=(10.0, 14.2))
+        slot = chromatch.WaveformSlot(row_id="track", row=row, duration=100.0)
+        self.app.beat_sync_enabled_var.set(True)
+        self.app.target_tempo_var.set("120")
+        self.app.update_playback_settings_from_ui()
+        self.app.metronome_position_samples = 0.0
+
+        with self.app.mixer_lock:
+            synced = self.app.synced_source_seconds_for_slot(slot, 10.8)
+
+        self.assertAlmostEqual(11.05, synced)
 
     def test_grid_lines_keep_latest_user_anchor_before_visible_window(self):
         row = chromatch.replace(self.make_row(bpm=120), user_beat_seconds=(10.25,))

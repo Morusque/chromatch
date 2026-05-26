@@ -1,8 +1,12 @@
 
 to review :
+- stable tempo/beat segment consensus for automatic detection on stable tracks
+- tempo segment agreement score column next to uncertainty
+- tempo audit export comparing automatic tempo/anchor against tapped tempo and manual beats
+- tempo reference audit using a proven Chromatch JSON file as benchmark
+- tempo detector calibrated against proven files, including 3:2 correction and benchmark script
 
 next tasks :
-- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantite is a good example of this) this can be done when detecting tempo or resyncing tempo to manually placed beats ("fit bpm")
 - still occasional playback glitches
 - analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
 - option to keep absolute and/or relative url of files
@@ -13,6 +17,10 @@ next tasks :
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - a way to manually change base frequency (as a directly editable field in the "tap tempo, reset tap, etc" lane)
 - automix (many things to define about this)
+- option to say "undefined tempo" when the track has none
+- make ogg tags work
+- buttons to nudge tempo up or down very slightly (parametrable)
+- tapping tempo is sometimes just plain wrong (eg detects about twice the tapped tempo)
 
 tried already but could be better :
 - auto beat detection could still be better, maybe refine this kind of detection on proven files

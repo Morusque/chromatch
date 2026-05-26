@@ -823,6 +823,47 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIn(second_id, self.app.table.get_children())
         self.assertNotIn(first_id, self.app.table.get_children())
 
+    def test_selecting_other_part_reuses_existing_waveform_slot(self):
+        first = chromatch.replace(self.make_row("track.wav"), part_start_seconds=0.0, part_end_seconds=10.0)
+        second = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        first_id = self.app.row_id(first)
+        second_id = self.app.row_id(second)
+        slot = chromatch.WaveformSlot(row_id=first_id, row=first, duration=30.0, playhead=0.1)
+        self.app.rows = [first, second]
+        self.app.waveform_slots = [slot]
+        self.app.table.insert("", "end", iid=second_id, values=self.app.row_values(second))
+        self.app.table.selection_set(second_id)
+        self.app.load_slot_downbeat = lambda _slot: None
+        self.app.render_waveforms = lambda: None
+        self.app.update_target_tempo_from_waveforms = lambda: None
+
+        self.app.update_waveform_selection()
+
+        self.assertEqual([slot], self.app.waveform_slots)
+        self.assertEqual(second_id, slot.row_id)
+        self.assertEqual(second, slot.row)
+        self.assertAlmostEqual(10.0 / 30.0, slot.playhead)
+
+    def test_add_waveform_retargets_existing_part_slot_without_reloading(self):
+        first = chromatch.replace(self.make_row("track.wav"), part_start_seconds=0.0, part_end_seconds=10.0)
+        second = chromatch.replace(self.make_row("track.wav"), part_start_seconds=10.0, part_end_seconds=20.0)
+        slot = chromatch.WaveformSlot(row_id=self.app.row_id(first), row=first, duration=30.0)
+        self.app.waveform_slots = [slot]
+        original_waveform_overview = chromatch.waveform_overview
+        calls = []
+        chromatch.waveform_overview = lambda *_args, **_kwargs: calls.append("load")
+        self.app.load_slot_downbeat = lambda _slot: None
+        self.app.render_waveforms = lambda: None
+
+        try:
+            self.app.add_waveform(second)
+        finally:
+            chromatch.waveform_overview = original_waveform_overview
+
+        self.assertEqual([], calls)
+        self.assertEqual(self.app.row_id(second), slot.row_id)
+        self.assertEqual(second, slot.row)
+
     def test_sorted_table_shows_best_part_for_sort_column(self):
         weaker = chromatch.replace(
             self.make_row("track.wav"),
@@ -1668,6 +1709,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
     def test_dropped_audio_files_are_added_without_starting_analysis(self):
         self.app.start_tag_refresh_for_rows = lambda _rows: None
+        self.app.handle_table_selection = lambda: None
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "drop.wav"
             chromatch.sf.write(path, np.zeros(8_000, dtype=np.float32), 8_000)
@@ -3011,6 +3053,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         queued_rows = []
         chromatch.read_audio_tags = lambda _path: (_ for _ in ()).throw(AssertionError("tag read should be deferred"))
         self.app.start_tag_refresh_for_rows = lambda rows: queued_rows.extend(rows)
+        self.app.handle_table_selection = lambda: None
 
         try:
             with tempfile.TemporaryDirectory() as folder:
@@ -3024,6 +3067,30 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(1, len(self.app.rows))
         self.assertEqual("", self.app.rows[0].artist)
         self.assertEqual([self.app.rows[0]], queued_rows)
+
+    def test_dropping_audio_files_does_not_resolve_library_paths(self):
+        existing = self.make_row("existing.wav")
+        self.app.rows = [existing]
+        self.app.rebuild_known_path_ids()
+        self.app.start_tag_refresh_for_rows = lambda _rows: None
+        self.app.handle_table_selection = lambda: None
+        original_resolve = chromatch.Path.resolve
+
+        def forbidden_resolve(_path, *args, **kwargs):
+            raise AssertionError("drop path should not call Path.resolve")
+
+        try:
+            chromatch.Path.resolve = forbidden_resolve
+            with tempfile.TemporaryDirectory() as folder:
+                path = Path(folder) / "track.wav"
+                path.write_bytes(b"")
+
+                self.app.add_unanalyzed_files([path])
+        finally:
+            chromatch.Path.resolve = original_resolve
+
+        self.assertEqual(2, len(self.app.rows))
+        self.assertIn(chromatch.canonical_path_id(path), self.app.known_path_ids)
 
     def test_deferred_tag_update_only_fills_missing_metadata(self):
         row = chromatch.replace(self.make_row("track.wav"), row_uid=7, artist="Existing artist")

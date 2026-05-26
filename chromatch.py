@@ -1387,7 +1387,7 @@ def estimate_tempo(
 
 def collect_audio_files(paths: list[Path]) -> list[Path]:
     audio_files: list[Path] = []
-    seen: set[Path] = set()
+    seen: set[str] = set()
 
     for path in paths:
         if path.is_dir():
@@ -1401,7 +1401,7 @@ def collect_audio_files(paths: list[Path]) -> list[Path]:
             if candidate.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
                 continue
 
-            resolved = candidate.resolve()
+            resolved = canonical_path_id(candidate)
             if resolved in seen:
                 continue
 
@@ -1409,6 +1409,10 @@ def collect_audio_files(paths: list[Path]) -> list[Path]:
             audio_files.append(candidate)
 
     return sorted(audio_files, key=lambda item: str(item).lower())
+
+
+def canonical_path_id(path: Path) -> str:
+    return os.path.normcase(str(path if path.is_absolute() else Path.cwd() / path))
 
 
 class TempoWindow:
@@ -1447,6 +1451,7 @@ class TempoWindow:
         self.row_part_totals: dict[str, int] = {}
         self.row_part_groups: dict[str, list[AnalysisRow]] = {}
         self.current_part_ids_by_group: dict[str, str] = {}
+        self.known_path_ids: set[str] = set()
         self.tap_times: list[float] = []
         self.current_tapped_bpm: float | None = None
         self.ctrl_pressed = False
@@ -1909,6 +1914,7 @@ class TempoWindow:
 
         self.rows = rows
         self.ensure_row_uids()
+        self.rebuild_known_path_ids()
         self.load_matches_path(matches_sidecar_path(csv_path))
         with self.queue_lock:
             self.analysis_queue.clear()
@@ -1950,6 +1956,7 @@ class TempoWindow:
 
         self.rows = rows
         self.ensure_row_uids()
+        self.rebuild_known_path_ids()
         self.match_links = {}
         match_payload = payload.get("matches", [])
         if isinstance(match_payload, list):
@@ -2089,10 +2096,12 @@ class TempoWindow:
             messagebox.showerror("Chromatch", "No supported audio files were found.")
             return
 
-        known_ids = {str(Path(row.path).resolve()) for row in self.rows}
+        if not self.known_path_ids or len(self.known_path_ids) != len({canonical_path_id(row.path) for row in self.rows}):
+            self.rebuild_known_path_ids()
+        known_ids = self.known_path_ids
         added_rows = []
         for path in audio_files:
-            resolved = str(path.resolve())
+            resolved = canonical_path_id(path)
             if resolved in known_ids:
                 continue
             row = AnalysisRow(
@@ -2222,6 +2231,7 @@ class TempoWindow:
         with self.mixer_lock:
             self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id not in selected_ids]
         self.rows = [row for row in self.rows if self.row_id(row) not in selected_ids]
+        self.rebuild_known_path_ids()
         self.similarity_target_ids.difference_update(selected_ids)
         self.prune_match_links()
 
@@ -2431,6 +2441,9 @@ class TempoWindow:
                 return row
         return None
 
+    def rebuild_known_path_ids(self) -> None:
+        self.known_path_ids = {canonical_path_id(row.path) for row in self.rows}
+
     def next_row_uid(self) -> int:
         used = {row.row_uid for row in self.rows if row.row_uid is not None}
         while self.next_available_row_uid in used:
@@ -2614,7 +2627,7 @@ class TempoWindow:
         return row.path.name
 
     def row_part_group_key(self, row: AnalysisRow) -> str:
-        return str(row.path.resolve())
+        return canonical_path_id(row.path)
 
     def row_part_number(self, row: AnalysisRow) -> int:
         row_id = self.row_id(row)
@@ -2625,7 +2638,7 @@ class TempoWindow:
         siblings = [
             candidate
             for candidate in self.rows
-            if candidate.path.resolve() == row.path.resolve()
+            if canonical_path_id(candidate.path) == canonical_path_id(row.path)
         ]
         if not siblings:
             return 1
@@ -2644,7 +2657,8 @@ class TempoWindow:
         cached_group = self.row_part_groups.get(self.row_part_group_key(row))
         if cached_group is not None:
             return len(cached_group) or 1
-        return sum(1 for candidate in self.rows if candidate.path.resolve() == row.path.resolve()) or 1
+        group_key = self.row_part_group_key(row)
+        return sum(1 for candidate in self.rows if self.row_part_group_key(candidate) == group_key) or 1
 
     def row_part_label(self, row: AnalysisRow) -> str:
         number = self.row_part_number(row)
@@ -2658,7 +2672,7 @@ class TempoWindow:
         if cached is not None:
             return list(cached)
         return sorted(
-            (candidate for candidate in self.rows if candidate.path.resolve() == row.path.resolve()),
+            (candidate for candidate in self.rows if canonical_path_id(candidate.path) == canonical_path_id(row.path)),
             key=self.row_part_sort_key,
         )
 
@@ -3539,6 +3553,27 @@ class TempoWindow:
                 return slot
         return None
 
+    def slot_by_row_group(self, row: AnalysisRow) -> WaveformSlot | None:
+        group_key = self.row_part_group_key(row)
+        for slot in self.waveform_slots:
+            if self.row_part_group_key(slot.row) == group_key:
+                return slot
+        return None
+
+    def retarget_waveform_slot(self, slot: WaveformSlot, row: AnalysisRow) -> None:
+        row_id = self.row_id(row)
+        if slot.row_id == row_id:
+            return
+        slot.row = row
+        slot.row_id = row_id
+        slot.downbeat_seconds = row.beat_anchor_seconds
+        if slot.duration > 0:
+            start = self.row_part_start(row)
+            end = self.row_part_end(row, slot.duration)
+            current_seconds = slot.playhead * slot.duration
+            if current_seconds < start or (end is not None and current_seconds > end):
+                slot.playhead = max(0.0, min(1.0, start / slot.duration))
+
     def handle_table_selection(self, _event=None) -> None:
         has_target_chroma = bool(self.selected_target_rows())
         self.similarity_button.configure(state="normal" if has_target_chroma else "disabled")
@@ -3593,7 +3628,11 @@ class TempoWindow:
 
     def add_waveform(self, row: AnalysisRow) -> None:
         row_id = self.row_id(row)
-        if any(slot.row_id == row_id for slot in self.waveform_slots):
+        existing_slot = self.slot_by_row_group(row)
+        if existing_slot is not None:
+            self.retarget_waveform_slot(existing_slot, row)
+            self.load_slot_downbeat(existing_slot)
+            self.render_waveforms()
             return
 
         try:
@@ -3727,23 +3766,30 @@ class TempoWindow:
     def update_waveform_selection(self) -> None:
         selected_ids = list(self.table.selection())
         selected_id = selected_ids[-1] if selected_ids else None
+        selected_row = self.row_by_id(selected_id) if selected_id else None
+        selected_group = None if selected_row is None else self.row_part_group_key(selected_row)
 
         with self.mixer_lock:
             for slot in self.waveform_slots:
-                if slot.is_playing and not slot.kept and slot.row_id != selected_id:
+                slot_group = self.row_part_group_key(slot.row)
+                if slot.is_playing and not slot.kept and slot_group != selected_group:
                     slot.kept = True
                     if slot.keep_var is not None:
                         slot.keep_var.set(True)
 
             self.waveform_slots = [
-                slot for slot in self.waveform_slots if slot.kept or slot.row_id == selected_id
+                slot
+                for slot in self.waveform_slots
+                if slot.kept or (selected_group is not None and self.row_part_group_key(slot.row) == selected_group)
             ]
 
-        if selected_id and not any(slot.row_id == selected_id for slot in self.waveform_slots):
-            row = self.row_by_id(selected_id)
-            if row is not None:
-                self.add_waveform(row)
+        if selected_row is not None:
+            slot = self.slot_by_row_group(selected_row)
+            if slot is None:
+                self.add_waveform(selected_row)
                 return
+            self.retarget_waveform_slot(slot, selected_row)
+            self.load_slot_downbeat(slot)
 
         self.render_waveforms()
         self.update_target_tempo_from_waveforms()
@@ -5497,6 +5543,7 @@ class TempoWindow:
             self.rows = updated_rows
         else:
             self.rows.append(row if row.row_uid is not None else replace(row, row_uid=self.next_row_uid()))
+        self.rebuild_known_path_ids()
 
         for slot in self.waveform_slots:
             if slot.row_id == row_id:

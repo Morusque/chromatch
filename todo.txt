@@ -3,8 +3,6 @@ to review :
 
 next tasks :
 - detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantite is a good example of this) this can be done when detecting tempo or resyncing tempo to manually placed beats ("fit bpm")
-- only load a single track once in the display zone even when clicking on a second distinct "part" of it
-- dropping a track takes some processing time, why? (I mean dropping an audio file on the window, which is supposed to add it to the list but not trigger the full analysis yet)
 - still occasional playback glitches
 - analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
 - option to keep absolute and/or relative url of files
@@ -13,6 +11,7 @@ next tasks :
 - detect cue points for structure parts and loops
 - reorganize the UI in sections that make more sense
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
+- a way to manually change base frequency (as a directly editable field in the "tap tempo, reset tap, etc" lane)
 - automix (many things to define about this)
 
 tried already but could be better :

@@ -868,6 +868,35 @@ class ChromatchRegressionTests(unittest.TestCase):
         finally:
             chromatch.librosa = original_librosa
 
+    def test_stable_beat_anchor_keeps_raw_anchor_when_segment_phase_agrees(self):
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            133.5,
+            0.01,
+            [0.04, 20.06, 40.05, 60.06],
+        )
+
+        self.assertAlmostEqual(0.01, anchor)
+
+    def test_stable_beat_anchor_uses_segment_phase_when_raw_anchor_disagrees(self):
+        beat_seconds = 60.0 / 124.0
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            124.0,
+            0.21,
+            [0.408, 0.408 + beat_seconds * 20, 0.408 + beat_seconds * 50],
+        )
+
+        self.assertAlmostEqual(0.408, anchor, delta=0.01)
+
+    def test_stable_beat_anchor_uses_half_tempo_phase_for_alternate_double_tempo_beat(self):
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            133.43,
+            0.209,
+            [0.188, 42.314, 83.985, 126.325],
+            [0.434, 42.313, 83.984, 126.325],
+        )
+
+        self.assertAlmostEqual(0.434, anchor, delta=0.02)
+
     def test_row_values_use_compact_tempo_and_chroma_display(self):
         row = self.make_chroma_row("track.wav", 123.034, 180)
         values = self.app.row_values(row)
@@ -1232,6 +1261,50 @@ class ChromatchRegressionTests(unittest.TestCase):
             chromatch.read_audio_tags = original_read_tags
 
         self.assertEqual("", row.artist)
+
+    def test_read_audio_tags_handles_case_insensitive_ogg_vorbis_comments(self):
+        original_mutagen_file = chromatch.mutagen_file
+
+        class FakeAudio:
+            tags = {
+                "ARTIST": ["Ogg Artist"],
+                "TITLE": ["Ogg Title"],
+                "ALBUM": ["Ogg Album"],
+            }
+
+        try:
+            chromatch.mutagen_file = lambda _path, easy=True: FakeAudio()
+
+            artist, title, album = chromatch.read_audio_tags(Path("track.ogg"))
+        finally:
+            chromatch.mutagen_file = original_mutagen_file
+
+        self.assertEqual(("Ogg Artist", "Ogg Title", "Ogg Album"), (artist, title, album))
+
+    def test_read_audio_tags_falls_back_to_non_easy_ogg_tags(self):
+        original_mutagen_file = chromatch.mutagen_file
+        calls = []
+
+        class FakeAudio:
+            tags = {
+                "artist": ["Ogg Artist"],
+                "title": ["Ogg Title"],
+                "album": ["Ogg Album"],
+            }
+
+        def fake_mutagen_file(_path, easy=True):
+            calls.append(easy)
+            return None if easy else FakeAudio()
+
+        try:
+            chromatch.mutagen_file = fake_mutagen_file
+
+            artist, title, album = chromatch.read_audio_tags(Path("track.ogg"))
+        finally:
+            chromatch.mutagen_file = original_mutagen_file
+
+        self.assertEqual([True, False], calls)
+        self.assertEqual(("Ogg Artist", "Ogg Title", "Ogg Album"), (artist, title, album))
 
     def test_csv_loader_preserves_beat_anchor(self):
         row = self.app.row_from_csv_record(

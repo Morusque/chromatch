@@ -737,8 +737,18 @@ def first_tag_value(tags, names: tuple[str, ...]) -> str:
     if not tags:
         return ""
 
+    lookup = {}
+    try:
+        items = tags.items()
+    except AttributeError:
+        items = ()
+    for key, value in items:
+        lookup.setdefault(str(key).casefold(), value)
+
     for name in names:
         value = tags.get(name)
+        if value is None:
+            value = lookup.get(name.casefold())
         if value is None:
             continue
 
@@ -851,19 +861,25 @@ def read_audio_tags(path: Path) -> tuple[str, str, str]:
     if mutagen_file is None:
         return fallback_artist, fallback_title, fallback_album
 
+    audio = None
     try:
         audio = mutagen_file(path, easy=True)
     except Exception:
-        return fallback_artist, fallback_title, fallback_album
+        audio = None
+    if audio is None or not getattr(audio, "tags", None):
+        try:
+            audio = mutagen_file(path, easy=False)
+        except Exception:
+            return fallback_artist, fallback_title, fallback_album
 
     if audio is None:
         return fallback_artist, fallback_title, fallback_album
 
     tags = audio.tags or {}
     return (
-        first_tag_value(tags, ("artist", "albumartist", "TPE1", "TPE2")) or fallback_artist,
-        first_tag_value(tags, ("title", "TIT2")) or fallback_title,
-        first_tag_value(tags, ("album", "TALB")) or fallback_album,
+        first_tag_value(tags, ("artist", "albumartist", "performer", "composer", "TPE1", "TPE2")) or fallback_artist,
+        first_tag_value(tags, ("title", "tracktitle", "TIT2")) or fallback_title,
+        first_tag_value(tags, ("album", "release", "TALB")) or fallback_album,
     )
 
 
@@ -1476,6 +1492,43 @@ def detect_beat_anchor_seconds(
     return offset + beat_seconds
 
 
+def choose_stable_beat_anchor_seconds(
+    bpm: float,
+    fallback_anchor: float | None,
+    segment_anchors: list[float],
+    half_tempo_segment_anchors: list[float] | None = None,
+) -> float | None:
+    if bpm <= 0:
+        return fallback_anchor
+
+    beat_seconds = 60.0 / bpm
+    phase = circular_mean_period(segment_anchors, beat_seconds)
+    if phase is None:
+        return fallback_anchor
+
+    anchor_seconds, anchor_spread = phase
+    if fallback_anchor is not None and bpm > 125 and half_tempo_segment_anchors:
+        fallback_phase_distance = beat_phase_distance_seconds(fallback_anchor, anchor_seconds, bpm)
+        half_beat_seconds = 120.0 / bpm
+        half_phase = circular_mean_period(half_tempo_segment_anchors, half_beat_seconds)
+        if (
+            half_phase is not None
+            and fallback_phase_distance is not None
+            and fallback_phase_distance <= 0.05
+            and half_phase[1] <= max(0.45, half_beat_seconds * 0.45)
+        ):
+            return round(half_phase[0], 6)
+
+    if fallback_anchor is not None:
+        fallback_phase_distance = beat_phase_distance_seconds(fallback_anchor, anchor_seconds, bpm)
+        if fallback_phase_distance is not None and fallback_phase_distance <= 0.08:
+            return round(fallback_anchor, 6)
+
+    if anchor_spread > max(0.25, beat_seconds * 0.45):
+        return fallback_anchor
+    return round(anchor_seconds, 6)
+
+
 def refine_beat_anchor_from_file(
     path: Path,
     beat_seconds: float,
@@ -1839,13 +1892,15 @@ def detect_stable_beat_anchor_seconds(
     if bpm is None or bpm <= 0:
         return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
 
+    fallback_anchor = detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+
     duration = audio_file_duration(path)
     if duration is None:
-        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+        return fallback_anchor
 
     windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
     if len(windows) < 3:
-        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+        return fallback_anchor
 
     anchors = []
     for window_start, window_end in windows:
@@ -1856,15 +1911,17 @@ def detect_stable_beat_anchor_seconds(
         if anchor is not None and np.isfinite(anchor):
             anchors.append(float(anchor))
 
-    beat_seconds = 60.0 / bpm
-    phase = circular_mean_period(anchors, beat_seconds)
-    if phase is None:
-        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
+    half_anchors = []
+    if bpm > 125:
+        for window_start, window_end in windows:
+            try:
+                half_anchor = detect_beat_anchor_seconds(path, bpm / 2.0, start_seconds=window_start, end_seconds=window_end)
+            except Exception:
+                continue
+            if half_anchor is not None and np.isfinite(half_anchor):
+                half_anchors.append(float(half_anchor))
 
-    anchor_seconds, anchor_spread = phase
-    if anchor_spread > max(0.12, beat_seconds * 0.18):
-        return detect_beat_anchor_seconds(path, bpm, start_seconds=start_seconds, end_seconds=end_seconds)
-    return round(anchor_seconds, 6)
+    return choose_stable_beat_anchor_seconds(bpm, fallback_anchor, anchors, half_anchors)
 
 
 def collect_audio_files(paths: list[Path]) -> list[Path]:

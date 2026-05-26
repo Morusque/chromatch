@@ -208,6 +208,8 @@ class WaveformSlot:
     stream: object | None = None
     audio: np.ndarray | None = None
     audio_loading: bool = False
+    zoom_waveform_loading: bool = False
+    downbeat_loading: bool = False
     audio_peak: float = 1.0
     sample_rate: int = 0
     duration: float = 0.0
@@ -3596,7 +3598,6 @@ class TempoWindow:
 
         try:
             waveform, duration = waveform_overview(row.path)
-            zoom_waveform, _ = waveform_overview(row.path, width=zoom_waveform_width(duration))
         except Exception as exc:
             messagebox.showerror("Chromatch", f"Could not load waveform:\n{exc}")
             return
@@ -3605,33 +3606,90 @@ class TempoWindow:
         if downbeat_seconds is not None:
             row = self.refine_traktor_beat_anchor_for_row(row_id, row)
             downbeat_seconds = row.beat_anchor_seconds
-        if downbeat_seconds is None:
-            try:
-                downbeat_seconds = detect_beat_anchor_seconds(
-                    row.path,
-                    self.row_tempo_for_matching(row),
-                    start_seconds=row.part_start_seconds,
-                    end_seconds=row.part_end_seconds,
-                )
-            except Exception:
-                downbeat_seconds = None
-            if downbeat_seconds is not None:
-                self.update_row_beat_anchor(row_id, downbeat_seconds, "automatic")
-                row = self.row_by_id(row_id) or row
 
         slot = WaveformSlot(
             row_id=row_id,
             row=row,
             waveform=waveform,
-            zoom_waveform=zoom_waveform,
-            transient_tokens=transient_token_times(zoom_waveform, duration),
+            zoom_waveform=waveform,
             duration=duration,
             downbeat_seconds=downbeat_seconds,
         )
         self.waveform_slots.append(slot)
         self.render_waveforms()
+        self.load_slot_downbeat(slot)
+        self.load_slot_zoom_waveform(slot)
         self.load_slot_audio_for_precise_zoom(slot)
         self.update_target_tempo_from_waveforms()
+
+    def load_slot_downbeat(self, slot: WaveformSlot) -> None:
+        if slot.downbeat_seconds is not None:
+            return
+        with self.mixer_lock:
+            if slot.downbeat_loading:
+                return
+            slot.downbeat_loading = True
+
+        def worker() -> None:
+            downbeat_seconds = None
+            try:
+                downbeat_seconds = detect_beat_anchor_seconds(
+                    slot.row.path,
+                    self.row_tempo_for_matching(slot.row),
+                    start_seconds=slot.row.part_start_seconds,
+                    end_seconds=slot.row.part_end_seconds,
+                )
+            except Exception:
+                pass
+
+            def complete(redraw: bool = True) -> None:
+                with self.mixer_lock:
+                    slot.downbeat_loading = False
+                    if downbeat_seconds is not None and slot.downbeat_seconds is None:
+                        slot.downbeat_seconds = downbeat_seconds
+                if downbeat_seconds is not None:
+                    self.update_row_beat_anchor(slot.row_id, downbeat_seconds, "automatic")
+                    self.sync_waveform_rows()
+                if redraw and downbeat_seconds is not None and slot in self.waveform_slots:
+                    self.draw_zoomed_waveform(slot)
+
+            try:
+                self.root.after(0, complete)
+            except RuntimeError:
+                complete(redraw=False)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def load_slot_zoom_waveform(self, slot: WaveformSlot) -> None:
+        with self.mixer_lock:
+            if slot.zoom_waveform_loading:
+                return
+            slot.zoom_waveform_loading = True
+
+        def worker() -> None:
+            zoom_waveform = None
+            transient_tokens = ()
+            try:
+                zoom_waveform, _duration = waveform_overview(slot.row.path, width=zoom_waveform_width(slot.duration))
+                transient_tokens = transient_token_times(zoom_waveform, slot.duration)
+            except Exception:
+                pass
+
+            def complete(redraw: bool = True) -> None:
+                with self.mixer_lock:
+                    slot.zoom_waveform_loading = False
+                    if zoom_waveform is not None:
+                        slot.zoom_waveform = zoom_waveform
+                        slot.transient_tokens = transient_tokens
+                if redraw and slot in self.waveform_slots:
+                    self.draw_zoomed_waveform(slot)
+
+            try:
+                self.root.after(0, complete)
+            except RuntimeError:
+                complete(redraw=False)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def load_slot_audio_for_precise_zoom(self, slot: WaveformSlot) -> None:
         with self.mixer_lock:

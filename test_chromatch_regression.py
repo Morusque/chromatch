@@ -2736,6 +2736,109 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual([slot], loaded)
         self.assertTrue(slot.is_playing)
 
+    def test_add_waveform_renders_quick_waveform_before_precise_zoom_worker(self):
+        row = self.make_row("track.wav")
+        calls = []
+        original_waveform_overview = chromatch.waveform_overview
+        original_load_downbeat = self.app.load_slot_downbeat
+        original_load_zoom = self.app.load_slot_zoom_waveform
+        original_load_audio = self.app.load_slot_audio_for_precise_zoom
+        original_render = self.app.render_waveforms
+        original_update_target = self.app.update_target_tempo_from_waveforms
+
+        def fake_waveform_overview(_path, width=900):
+            calls.append(width)
+            return np.ones(width, dtype=np.float32), 10.0
+
+        try:
+            chromatch.waveform_overview = fake_waveform_overview
+            self.app.load_slot_downbeat = lambda slot: calls.append("downbeat-worker")
+            self.app.load_slot_zoom_waveform = lambda slot: calls.append("zoom-worker")
+            self.app.load_slot_audio_for_precise_zoom = lambda slot: calls.append("audio-worker")
+            self.app.render_waveforms = lambda: calls.append("render")
+            self.app.update_target_tempo_from_waveforms = lambda: calls.append("tempo")
+
+            self.app.add_waveform(row)
+        finally:
+            chromatch.waveform_overview = original_waveform_overview
+            self.app.load_slot_downbeat = original_load_downbeat
+            self.app.load_slot_zoom_waveform = original_load_zoom
+            self.app.load_slot_audio_for_precise_zoom = original_load_audio
+            self.app.render_waveforms = original_render
+            self.app.update_target_tempo_from_waveforms = original_update_target
+
+        self.assertEqual([900, "render", "downbeat-worker", "zoom-worker", "audio-worker", "tempo"], calls)
+        self.assertEqual(1, len(self.app.waveform_slots))
+        self.assertEqual(900, self.app.waveform_slots[0].zoom_waveform.size)
+
+    def test_load_slot_downbeat_updates_anchor_asynchronously(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, duration=10.0)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        original_detect = chromatch.detect_beat_anchor_seconds
+        original_after = self.app.root.after
+        original_draw = self.app.draw_zoomed_waveform
+        draws = []
+
+        try:
+            chromatch.detect_beat_anchor_seconds = lambda *_args, **_kwargs: 1.25
+            self.app.root.after = lambda _delay, callback: callback()
+            self.app.draw_zoomed_waveform = lambda updated_slot: draws.append(updated_slot)
+
+            self.app.load_slot_downbeat(slot)
+            for _ in range(100):
+                if draws:
+                    break
+                chromatch.time.sleep(0.01)
+        finally:
+            chromatch.detect_beat_anchor_seconds = original_detect
+            self.app.root.after = original_after
+            self.app.draw_zoomed_waveform = original_draw
+
+        self.assertFalse(slot.downbeat_loading)
+        self.assertAlmostEqual(1.25, slot.downbeat_seconds)
+        self.assertAlmostEqual(1.25, self.app.rows[0].beat_anchor_seconds)
+        self.assertEqual([slot], draws)
+
+    def test_load_slot_zoom_waveform_updates_zoom_data_asynchronously(self):
+        row = self.make_row("track.wav")
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            waveform=np.ones(10, dtype=np.float32),
+            zoom_waveform=np.ones(10, dtype=np.float32),
+            duration=10.0,
+        )
+        self.app.waveform_slots = [slot]
+        original_waveform_overview = chromatch.waveform_overview
+        original_after = self.app.root.after
+        original_draw = self.app.draw_zoomed_waveform
+        draws = []
+
+        def fake_waveform_overview(_path, width=900):
+            return np.arange(width, dtype=np.float32), 10.0
+
+        try:
+            chromatch.waveform_overview = fake_waveform_overview
+            self.app.root.after = lambda _delay, callback: callback()
+            self.app.draw_zoomed_waveform = lambda updated_slot: draws.append(updated_slot)
+
+            self.app.load_slot_zoom_waveform(slot)
+            for _ in range(100):
+                if draws:
+                    break
+                chromatch.time.sleep(0.01)
+        finally:
+            chromatch.waveform_overview = original_waveform_overview
+            self.app.root.after = original_after
+            self.app.draw_zoomed_waveform = original_draw
+
+        self.assertFalse(slot.zoom_waveform_loading)
+        self.assertEqual(chromatch.zoom_waveform_width(10.0), slot.zoom_waveform.size)
+        self.assertEqual([slot], draws)
+
     def test_start_waveform_stinger_loads_audio_outside_mixer_lock(self):
         row = self.make_row("track.wav", bpm=120)
         slot = chromatch.WaveformSlot(row_id="track", row=row)

@@ -2,11 +2,10 @@
 to review :
 
 next tasks :
-- clicking on a track from the list takes time to load, can we just load an easy part of it then thread the rest?
-- only show a single track once in the display zone even for two distinct parts of it
-- dropping a track takes some processing time, why?
+- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantite is a good example of this) this can be done when detecting tempo or resyncing tempo to manually placed beats ("fit bpm")
+- only load a single track once in the display zone even when clicking on a second distinct "part" of it
+- dropping a track takes some processing time, why? (I mean dropping an audio file on the window, which is supposed to add it to the list but not trigger the full analysis yet)
 - still occasional playback glitches
-- detect when bars and audio get out of sync and resync them over the course of the track (eg 00.Sonorhc-Danse Des Chiens.mp3 in radio quantite is a good example of this)
 - analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
 - option to keep absolute and/or relative url of files
 - option to relink track with file

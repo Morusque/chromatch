@@ -4,7 +4,6 @@ to review :
 next tasks :
 - option to keep absolute and/or relative url of files
 - option to relink track with file
-- a way to manually change base frequency (as a directly editable field in the "tap tempo, reset tap, etc" lane)
 - option to say "undefined tempo" when the track has none
 - buttons to nudge tempo up or down very slightly (parametrable)
 - tapping tempo is sometimes just plain wrong (eg detects about twice the tapped tempo)

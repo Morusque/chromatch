@@ -97,6 +97,10 @@ SEARCH_FIELDS = (
 )
 BASE_BPM_CLOSE_DISTANCE_BINS = CHROMA_BINS / 24
 THREE_TWO_TEMPO_RATIO_TOLERANCE = 0.055
+LIBROSA_DEFAULT_BEAT_TIGHTNESS = 100
+LIBROSA_TEMPO_BEAT_TIGHTNESS = 200
+ANCHOR_TEMPO_CANDIDATE_MAX_DIFFERENCE_BPM = 0.75
+ANCHOR_LOOSE_TEMPO_MIN_SPREAD_SECONDS = 0.18
 SEGMENT_CONSENSUS_MIN_AGREEMENT = 70.0
 HIGH_CONFIDENCE_SEGMENT_OVERRIDE_THRESHOLD = 80.0
 HIGH_CONFIDENCE_SEGMENT_MAX_CHANGE_BPM = 0.1
@@ -1116,6 +1120,40 @@ def chroma_bin_preview_frequency(bin_index: float, min_hz: float = 200.0, max_hz
     return frequency
 
 
+def frequency_to_chroma_bin(frequency_hz: float) -> int | None:
+    if frequency_hz <= 0 or not np.isfinite(frequency_hz):
+        return None
+
+    midi = 69.0 + 12.0 * math.log2(frequency_hz / A4_HZ)
+    pitch_class = (midi - 60.0) % 12.0
+    return int(round((pitch_class / 12.0) * CHROMA_BINS)) % CHROMA_BINS
+
+
+def parse_base_chroma_value(value: str | None) -> int | None:
+    if value is None:
+        return None
+
+    stripped = value.strip().lower()
+    if not stripped:
+        return None
+
+    is_frequency = stripped.endswith("hz")
+    if is_frequency:
+        stripped = stripped[:-2].strip()
+
+    try:
+        parsed = float(stripped)
+    except ValueError:
+        return None
+
+    if is_frequency:
+        return frequency_to_chroma_bin(parsed)
+
+    if not np.isfinite(parsed):
+        return None
+    return int(round(parsed)) % CHROMA_BINS
+
+
 def strongest_chroma_peaks(histogram: np.ndarray, count: int = 3, min_strength: float = 0.05) -> list[int]:
     if histogram.size == 0 or np.max(histogram) <= 0:
         return []
@@ -1507,7 +1545,8 @@ def choose_stable_beat_anchor_seconds(
         return fallback_anchor
 
     anchor_seconds, anchor_spread = phase
-    if fallback_anchor is not None and bpm > 125 and half_tempo_segment_anchors:
+    anchor_limit = max(0.12, beat_seconds * 0.18)
+    if fallback_anchor is not None and bpm > 125 and half_tempo_segment_anchors and anchor_spread > anchor_limit:
         fallback_phase_distance = beat_phase_distance_seconds(fallback_anchor, anchor_seconds, bpm)
         half_beat_seconds = 120.0 / bpm
         half_phase = circular_mean_period(half_tempo_segment_anchors, half_beat_seconds)
@@ -1558,6 +1597,7 @@ def estimate_tempo_with_librosa(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
     bpm_hint: float | None = None,
+    beat_tightness: int = LIBROSA_TEMPO_BEAT_TIGHTNESS,
 ) -> TempoEstimate:
     if librosa is None:
         raise RuntimeError("librosa is not installed.")
@@ -1566,7 +1606,12 @@ def estimate_tempo_with_librosa(
     if audio.size < sample_rate:
         raise ValueError("The file is too short to estimate a tempo.")
 
-    beat_kwargs = {"y": audio, "sr": sample_rate, "units": "time"}
+    beat_kwargs = {
+        "y": audio,
+        "sr": sample_rate,
+        "units": "time",
+        "tightness": beat_tightness,
+    }
     if bpm_hint is not None and bpm_hint > 0:
         beat_kwargs["bpm"] = bpm_hint
     tempo, beats = librosa.beat.beat_track(**beat_kwargs)
@@ -1924,6 +1969,96 @@ def detect_stable_beat_anchor_seconds(
     return choose_stable_beat_anchor_seconds(bpm, fallback_anchor, anchors, half_anchors)
 
 
+def beat_anchor_phase_spread_seconds(
+    path: Path,
+    bpm: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
+    if bpm <= 0:
+        return None
+
+    duration = audio_file_duration(path)
+    if duration is None:
+        return None
+
+    windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
+    if len(windows) < 3:
+        return None
+
+    anchors = []
+    for window_start, window_end in windows:
+        try:
+            anchor = detect_beat_anchor_seconds(path, bpm, start_seconds=window_start, end_seconds=window_end)
+        except Exception:
+            continue
+        if anchor is not None and np.isfinite(anchor):
+            anchors.append(float(anchor))
+
+    if len(anchors) < 3:
+        return None
+
+    phase = circular_mean_period(anchors, 60.0 / bpm)
+    if phase is None:
+        return None
+    return phase[1]
+
+
+def detect_stable_beat_anchor_for_estimate(
+    path: Path,
+    estimate: TempoEstimate | None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
+    if estimate is None:
+        return detect_stable_beat_anchor_seconds(path, None, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    try:
+        loose_estimate = estimate_tempo_with_librosa(
+            path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            beat_tightness=LIBROSA_DEFAULT_BEAT_TIGHTNESS,
+        )
+    except Exception:
+        loose_estimate = None
+
+    if loose_estimate is not None:
+        aligned_loose_bpm = align_bpm_to_reference(loose_estimate.bpm, estimate.bpm)
+        if abs(aligned_loose_bpm - estimate.bpm) <= ANCHOR_TEMPO_CANDIDATE_MAX_DIFFERENCE_BPM:
+            tight_spread = beat_anchor_phase_spread_seconds(
+                path,
+                estimate.bpm,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+            loose_spread = beat_anchor_phase_spread_seconds(
+                path,
+                aligned_loose_bpm,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+            if (
+                tight_spread is not None
+                and loose_spread is not None
+                and tight_spread >= ANCHOR_LOOSE_TEMPO_MIN_SPREAD_SECONDS
+                and loose_spread < tight_spread
+            ):
+                return detect_stable_beat_anchor_seconds(
+                    path,
+                    aligned_loose_bpm,
+                    start_seconds=start_seconds,
+                    end_seconds=end_seconds,
+                )
+
+    return detect_stable_beat_anchor_seconds(
+        path,
+        estimate.bpm,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+
+
 def collect_audio_files(paths: list[Path]) -> list[Path]:
     audio_files: list[Path] = []
     seen: set[str] = set()
@@ -1997,6 +2132,8 @@ class TempoWindow:
         self.tapped_tempo_var = tk.StringVar(value="")
         self.part_start_marker_var = tk.StringVar(value="")
         self.part_end_marker_var = tk.StringVar(value="")
+        self.base_chroma_var = tk.StringVar(value="")
+        self.base_chroma_apply_after_id: str | None = None
         self.suppress_part_marker_update = False
         self.waveform_slots: list[WaveformSlot] = []
         self.target_tempo_var = tk.StringVar(value="")
@@ -2221,6 +2358,13 @@ class TempoWindow:
         self.part_end_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
         self.part_end_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
         ttk.Button(tap_frame, text="Set end", command=self.set_selected_part_end).pack(side="left", padx=(8, 0))
+        ttk.Label(tap_frame, text="Base").pack(side="left", padx=(14, 0))
+        self.base_chroma_entry = ttk.Entry(tap_frame, textvariable=self.base_chroma_var, width=8)
+        self.base_chroma_entry.pack(side="left", padx=(6, 0))
+        self.base_chroma_entry.bind("<Return>", self.apply_selected_base_chroma)
+        self.base_chroma_entry.bind("<KeyRelease>", self.schedule_selected_base_chroma_apply)
+        self.base_chroma_entry.bind("<FocusOut>", self.apply_selected_base_chroma_without_prompt)
+        ttk.Label(tap_frame, text="bin/Hz").pack(side="left", padx=(4, 0))
 
         self.table.drop_target_register(DND_FILES)
         self.table.dnd_bind("<<Drop>>", self.handle_drop)
@@ -4232,9 +4376,19 @@ class TempoWindow:
         def worker() -> None:
             downbeat_seconds = None
             try:
-                downbeat_seconds = detect_stable_beat_anchor_seconds(
+                tempo = self.row_tempo_for_matching(slot.row)
+                estimate = None
+                if tempo is not None:
+                    estimate = TempoEstimate(
+                        bpm=tempo,
+                        uncertainty_bpm=0.0,
+                        confidence=100.0,
+                        method="saved tempo",
+                        detail="saved tempo",
+                    )
+                downbeat_seconds = detect_stable_beat_anchor_for_estimate(
                     slot.row.path,
-                    self.row_tempo_for_matching(slot.row),
+                    estimate,
                     start_seconds=slot.row.part_start_seconds,
                     end_seconds=slot.row.part_end_seconds,
                 )
@@ -4385,6 +4539,7 @@ class TempoWindow:
             self.tapped_tempo_var.set("")
             self.part_start_marker_var.set("")
             self.part_end_marker_var.set("")
+            self.base_chroma_var.set("")
             return
 
         row = self.row_by_id(selected_ids[0])
@@ -4392,6 +4547,7 @@ class TempoWindow:
             self.tapped_tempo_var.set("")
             self.part_start_marker_var.set("")
             self.part_end_marker_var.set("")
+            self.base_chroma_var.set("")
             return
 
         self.suppress_part_marker_update = True
@@ -4401,6 +4557,7 @@ class TempoWindow:
             slot = self.slot_by_row_id(selected_ids[0])
             end = self.row_part_end(row, None if slot is None else slot.duration)
             self.part_end_marker_var.set("" if end is None else format_seconds_compact(end))
+            self.base_chroma_var.set("" if row.base_chroma_bin is None else str(row.base_chroma_bin % CHROMA_BINS))
         finally:
             self.suppress_part_marker_update = False
 
@@ -4955,11 +5112,15 @@ class TempoWindow:
 
         base_bin, preview_bin = clicked_bins
         self.update_row_base_chroma_bin(slot.row_id, base_bin)
+        self.update_similarity_scores()
+        self.update_selected_edit_fields()
         self.play_chroma_preview(preview_bin)
         self.draw_chroma_histogram(slot)
 
     def clear_base_chroma(self, slot: WaveformSlot) -> str:
         self.update_row_base_chroma_bin(slot.row_id, None)
+        self.update_similarity_scores()
+        self.update_selected_edit_fields()
         self.draw_chroma_histogram(slot)
         return "break"
 
@@ -5254,6 +5415,77 @@ class TempoWindow:
             self.part_end_marker_var.set(format_seconds_compact(marker))
             self.suppress_part_marker_update = False
             self.update_slot_part_marker(slot, end=marker)
+
+    def schedule_selected_base_chroma_apply(self, _event=None) -> str:
+        if self.base_chroma_apply_after_id is not None:
+            self.root.after_cancel(self.base_chroma_apply_after_id)
+        self.base_chroma_apply_after_id = self.root.after(
+            350,
+            self.apply_scheduled_selected_base_chroma,
+        )
+        return "break"
+
+    def apply_scheduled_selected_base_chroma(self) -> None:
+        self.base_chroma_apply_after_id = None
+        self.apply_selected_base_chroma(show_errors=False, normalize_entry=False)
+
+    def apply_selected_base_chroma_without_prompt(self, _event=None) -> str:
+        return self.apply_selected_base_chroma(show_errors=False, normalize_entry=True)
+
+    def apply_selected_base_chroma(
+        self,
+        _event=None,
+        show_errors: bool = True,
+        normalize_entry: bool = True,
+    ) -> str:
+        if self.base_chroma_apply_after_id is not None:
+            self.root.after_cancel(self.base_chroma_apply_after_id)
+            self.base_chroma_apply_after_id = None
+
+        selected_ids = set(self.table.selection())
+        if not selected_ids:
+            if show_errors:
+                messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return "break"
+
+        raw_value = self.base_chroma_var.get()
+        base_chroma_bin = parse_base_chroma_value(raw_value)
+        if raw_value.strip() and base_chroma_bin is None:
+            if show_errors:
+                messagebox.showinfo("Chromatch", "Enter a base chroma bin, or a frequency with Hz.")
+            return "break"
+
+        updated_rows = []
+        applied = False
+        for row in self.rows:
+            if self.row_id(row) in selected_ids:
+                updated_rows.append(replace(row, base_chroma_bin=base_chroma_bin))
+                applied = True
+            else:
+                updated_rows.append(row)
+
+        if not applied:
+            if show_errors:
+                messagebox.showinfo("Chromatch", "No selected rows were found.")
+            return "break"
+
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+        self.update_similarity_scores()
+        self.refresh_table()
+        for row_id in selected_ids:
+            if self.table.exists(row_id):
+                self.table.selection_add(row_id)
+        if normalize_entry:
+            self.update_selected_edit_fields()
+        else:
+            self.base_chroma_var.set(raw_value)
+        self.draw_all_waveforms()
+        if base_chroma_bin is None:
+            self.result.configure(text="Cleared base for selected rows.")
+        else:
+            self.result.configure(text=f"Set base to {base_chroma_bin} for selected rows.")
+        return "break"
 
     def split_selected_at_playhead(self) -> None:
         slot = self.selected_waveform_slot()
@@ -6051,9 +6283,9 @@ class TempoWindow:
                         errors.append(f"chroma: {exc}")
 
                     try:
-                        beat_anchor_seconds = detect_stable_beat_anchor_seconds(
+                        beat_anchor_seconds = detect_stable_beat_anchor_for_estimate(
                             path,
-                            None if estimate is None else estimate.bpm,
+                            estimate,
                             start_seconds=task.part_start_seconds,
                             end_seconds=task.part_end_seconds,
                         )
@@ -7505,9 +7737,9 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
                             start_seconds=row.part_start_seconds,
                             end_seconds=row.part_end_seconds,
                         )
-                        anchor_seconds = detect_stable_beat_anchor_seconds(
+                        anchor_seconds = detect_stable_beat_anchor_for_estimate(
                             row.path,
-                            estimate.bpm,
+                            estimate,
                             start_seconds=row.part_start_seconds,
                             end_seconds=row.part_end_seconds,
                         )

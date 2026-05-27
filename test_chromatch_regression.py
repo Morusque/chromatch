@@ -71,12 +71,71 @@ class ChromatchRegressionTests(unittest.TestCase):
             self.assertGreaterEqual(frequency, 200.0)
             self.assertLessEqual(frequency, 400.0)
 
+    def test_parse_base_chroma_value_accepts_bins_and_hz(self):
+        self.assertEqual(42, chromatch.parse_base_chroma_value("42"))
+        self.assertEqual(180, chromatch.parse_base_chroma_value("440 Hz"))
+        self.assertIsNone(chromatch.parse_base_chroma_value("not a base"))
+
     def test_refine_tempo_from_beats_recovers_non_quantized_tempo(self):
         expected_bpm = 127.37
         interval = 60.0 / expected_bpm
         beats = np.arange(128, dtype=float) * interval
 
         self.assertAlmostEqual(expected_bpm, chromatch.refine_tempo_from_beats(beats), places=2)
+
+    def test_half_tempo_anchor_override_requires_unstable_full_tempo_phase(self):
+        bpm = 133.5521931876404
+        fallback = 0.009841269841269842
+        full_tempo_anchors = [
+            0.009841269841269842,
+            17.546667,
+            35.093333,
+            52.65931972789116,
+            70.186667,
+        ]
+        half_tempo_anchors = [
+            0.4581859410430839,
+            17.589206682539682,
+            35.093333,
+            52.94780045351474,
+            70.507846138322,
+        ]
+
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            bpm,
+            fallback,
+            full_tempo_anchors,
+            half_tempo_anchors,
+        )
+
+        self.assertAlmostEqual(fallback, anchor, places=6)
+
+    def test_half_tempo_anchor_override_handles_unstable_double_tempo_phase(self):
+        bpm = 133.4330083982104
+        fallback = 0.2089795918367347
+        full_tempo_anchors = [
+            0.2089795918367347,
+            42.03453968253968,
+            83.984,
+            125.976,
+            168.17697959183673,
+        ]
+        half_tempo_anchors = [
+            0.45378684807256237,
+            42.31317913832199,
+            83.984,
+            126.32488888888889,
+            167.968,
+        ]
+
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            bpm,
+            fallback,
+            full_tempo_anchors,
+            half_tempo_anchors,
+        )
+
+        self.assertAlmostEqual(0.435832, anchor)
 
     def test_fit_tempo_grid_from_user_beats_handles_non_consecutive_beats(self):
         expected_bpm = 121.52
@@ -1156,6 +1215,7 @@ class ChromatchRegressionTests(unittest.TestCase):
             tapped_bpm=128.5,
             part_start_seconds=10.0,
             part_end_seconds=20.0,
+            base_chroma_bin=42,
         )
         row_id = self.app.row_id(row)
         self.app.rows = [row]
@@ -1167,6 +1227,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("128.50", self.app.tapped_tempo_var.get())
         self.assertEqual("10", self.app.part_start_marker_var.get())
         self.assertEqual("20", self.app.part_end_marker_var.get())
+        self.assertEqual("42", self.app.base_chroma_var.get())
 
     def test_default_part_fields_are_zero_and_duration(self):
         row = self.make_row("track.wav")
@@ -1191,12 +1252,14 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.tapped_tempo_var.set("123.00")
         self.app.part_start_marker_var.set("1")
         self.app.part_end_marker_var.set("2")
+        self.app.base_chroma_var.set("42")
 
         self.app.update_selected_edit_fields()
 
         self.assertEqual("", self.app.tapped_tempo_var.get())
         self.assertEqual("", self.app.part_start_marker_var.get())
         self.assertEqual("", self.app.part_end_marker_var.get())
+        self.assertEqual("", self.app.base_chroma_var.get())
 
     def test_csv_loader_preserves_analysis_timestamp(self):
         row = self.app.row_from_csv_record(
@@ -2391,7 +2454,7 @@ class ChromatchRegressionTests(unittest.TestCase):
     def test_loaded_waveform_uses_detected_beat_anchor(self):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
-        original_detect = chromatch.detect_beat_anchor_seconds
+        original_detect = chromatch.detect_stable_beat_anchor_for_estimate
         original_after = self.app.root.after
         detected_calls = []
 
@@ -2401,9 +2464,9 @@ class ChromatchRegressionTests(unittest.TestCase):
             row = self.make_row(path, bpm=120.0)
             self.app.rows = [row]
 
-            chromatch.detect_beat_anchor_seconds = (
-                lambda path, bpm, start_seconds=None, end_seconds=None: detected_calls.append(
-                    (path, bpm, start_seconds, end_seconds)
+            chromatch.detect_stable_beat_anchor_for_estimate = (
+                lambda path, estimate, start_seconds=None, end_seconds=None: detected_calls.append(
+                    (path, estimate.bpm if estimate is not None else None, start_seconds, end_seconds)
                 )
                 or 0.37
             )
@@ -2415,7 +2478,7 @@ class ChromatchRegressionTests(unittest.TestCase):
                         break
                     chromatch.time.sleep(0.01)
             finally:
-                chromatch.detect_beat_anchor_seconds = original_detect
+                chromatch.detect_stable_beat_anchor_for_estimate = original_detect
                 self.app.root.after = original_after
 
         self.assertEqual(1, len(self.app.waveform_slots))
@@ -2426,7 +2489,7 @@ class ChromatchRegressionTests(unittest.TestCase):
     def test_loaded_waveform_persists_detected_beat_anchor_to_row(self):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
-        original_detect = chromatch.detect_beat_anchor_seconds
+        original_detect = chromatch.detect_stable_beat_anchor_for_estimate
         original_after = self.app.root.after
 
         with tempfile.TemporaryDirectory() as folder:
@@ -2435,7 +2498,9 @@ class ChromatchRegressionTests(unittest.TestCase):
             row = self.make_row(path, bpm=120.0)
             self.app.rows = [row]
 
-            chromatch.detect_beat_anchor_seconds = lambda _path, _bpm, start_seconds=None, end_seconds=None: 0.37
+            chromatch.detect_stable_beat_anchor_for_estimate = (
+                lambda _path, _estimate, start_seconds=None, end_seconds=None: 0.37
+            )
             try:
                 self.app.root.after = lambda _delay, callback: callback()
                 self.app.add_waveform(row)
@@ -2444,7 +2509,7 @@ class ChromatchRegressionTests(unittest.TestCase):
                         break
                     chromatch.time.sleep(0.01)
             finally:
-                chromatch.detect_beat_anchor_seconds = original_detect
+                chromatch.detect_stable_beat_anchor_for_estimate = original_detect
                 self.app.root.after = original_after
 
         self.assertAlmostEqual(0.37, self.app.rows[0].beat_anchor_seconds)
@@ -2792,6 +2857,54 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("break", result)
         self.assertIsNone(self.app.rows[0].base_chroma_bin)
 
+    def test_apply_selected_base_chroma_updates_selected_rows_and_waveform_slots(self):
+        row = self.make_chroma_row("track.wav", 120, 80)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.base_chroma_var.set("440 Hz")
+
+        result = self.app.apply_selected_base_chroma()
+
+        self.assertEqual("break", result)
+        self.assertEqual(180, self.app.rows[0].base_chroma_bin)
+        self.assertEqual(180, slot.row.base_chroma_bin)
+        self.assertEqual("180", self.app.base_chroma_var.get())
+
+    def test_scheduled_base_chroma_apply_preserves_typed_text(self):
+        row = self.make_chroma_row("track.wav", 120, 80)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.base_chroma_var.set("440 Hz")
+
+        self.app.apply_scheduled_selected_base_chroma()
+
+        self.assertEqual(180, self.app.rows[0].base_chroma_bin)
+        self.assertEqual(180, slot.row.base_chroma_bin)
+        self.assertEqual("440 Hz", self.app.base_chroma_var.get())
+
+    def test_apply_selected_base_chroma_blank_clears_selected_rows(self):
+        row = chromatch.replace(self.make_chroma_row("track.wav", 120, 80), base_chroma_bin=42)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.base_chroma_var.set("")
+
+        self.app.apply_selected_base_chroma()
+
+        self.assertIsNone(self.app.rows[0].base_chroma_bin)
+        self.assertIsNone(slot.row.base_chroma_bin)
+
     def test_chroma_click_preview_uses_pitch_shifted_display_bin(self):
         row = self.make_chroma_row("track.wav", 100, 80)
         row_id = self.app.row_id(row)
@@ -3088,13 +3201,18 @@ class ChromatchRegressionTests(unittest.TestCase):
         slot = chromatch.WaveformSlot(row_id=row_id, row=row, duration=10.0)
         self.app.rows = [row]
         self.app.waveform_slots = [slot]
-        original_detect = chromatch.detect_beat_anchor_seconds
+        original_detect = chromatch.detect_stable_beat_anchor_for_estimate
         original_after = self.app.root.after
         original_draw = self.app.draw_zoomed_waveform
         draws = []
+        estimates = []
+
+        def fake_detect(_path, estimate, **_kwargs):
+            estimates.append(estimate)
+            return 1.25
 
         try:
-            chromatch.detect_beat_anchor_seconds = lambda *_args, **_kwargs: 1.25
+            chromatch.detect_stable_beat_anchor_for_estimate = fake_detect
             self.app.root.after = lambda _delay, callback: callback()
             self.app.draw_zoomed_waveform = lambda updated_slot: draws.append(updated_slot)
 
@@ -3104,7 +3222,7 @@ class ChromatchRegressionTests(unittest.TestCase):
                     break
                 chromatch.time.sleep(0.01)
         finally:
-            chromatch.detect_beat_anchor_seconds = original_detect
+            chromatch.detect_stable_beat_anchor_for_estimate = original_detect
             self.app.root.after = original_after
             self.app.draw_zoomed_waveform = original_draw
 
@@ -3112,6 +3230,8 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(1.25, slot.downbeat_seconds)
         self.assertAlmostEqual(1.25, self.app.rows[0].beat_anchor_seconds)
         self.assertEqual([slot], draws)
+        self.assertEqual(1, len(estimates))
+        self.assertAlmostEqual(120.0, estimates[0].bpm)
 
     def test_load_slot_zoom_waveform_updates_zoom_data_asynchronously(self):
         row = self.make_row("track.wav")

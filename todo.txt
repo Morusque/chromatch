@@ -6,6 +6,7 @@ next tasks :
 - option to relink track with file
 - option to say "undefined tempo" when the track has none
 - buttons to nudge tempo up or down very slightly (parametrable)
+- buttons to nudge beats offset forward or backward very slightly (parametrable)
 - tapping tempo is sometimes just plain wrong (eg detects about twice the tapped tempo)
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - reorganize the UI in sections that make more sense

@@ -100,10 +100,17 @@ THREE_TWO_TEMPO_RATIO_TOLERANCE = 0.055
 LIBROSA_DEFAULT_BEAT_TIGHTNESS = 100
 LIBROSA_TEMPO_BEAT_TIGHTNESS = 200
 ANCHOR_TEMPO_CANDIDATE_MAX_DIFFERENCE_BPM = 0.75
+ANCHOR_LOOSE_TEMPO_MAX_AGREEMENT_SCORE = 75.0
 ANCHOR_LOOSE_TEMPO_MIN_SPREAD_SECONDS = 0.18
 SEGMENT_CONSENSUS_MIN_AGREEMENT = 70.0
 HIGH_CONFIDENCE_SEGMENT_OVERRIDE_THRESHOLD = 80.0
 HIGH_CONFIDENCE_SEGMENT_MAX_CHANGE_BPM = 0.1
+DISAGREEMENT_SEGMENT_SUPPORT_MIN_CONFIDENCE = 60.0
+DISAGREEMENT_SEGMENT_SUPPORT_MIN_MARGIN = 25.0
+TEMPOGRAM_RESCUE_MAX_AGREEMENT_SCORE = 60.0
+TEMPOGRAM_RESCUE_MIN_CONFIDENCE = 75.0
+ANALYSIS_RESULT_MAX_MESSAGES_PER_TICK = 150
+ANALYSIS_RESULT_MAX_ROWS_PER_TICK = 50
 EXPORT_CSV = "CSV"
 EXPORT_JSON = "JSON"
 EXPORT_CHROMAGRAM = "Chromagram"
@@ -1562,6 +1569,15 @@ def choose_stable_beat_anchor_seconds(
         fallback_phase_distance = beat_phase_distance_seconds(fallback_anchor, anchor_seconds, bpm)
         if fallback_phase_distance is not None and fallback_phase_distance <= 0.08:
             return round(fallback_anchor, 6)
+        if anchor_spread > anchor_limit:
+            if (
+                fallback_phase_distance is not None
+                and bpm < 125.0
+                and fallback_phase_distance >= 0.15
+                and anchor_spread <= 0.15
+            ):
+                return round(anchor_seconds, 6)
+            return round(fallback_anchor, 6)
 
     if anchor_spread > max(0.25, beat_seconds * 0.45):
         return fallback_anchor
@@ -1743,7 +1759,25 @@ def estimate_tempo(
             stable_grid = None
     if stable_grid is None:
         if agreement is None:
+            rescued = rescue_tempo_with_tempogram_peak(
+                path,
+                estimate,
+                None,
+                start_seconds=start_seconds,
+                end_seconds=end_seconds,
+            )
+            if rescued is not None:
+                return rescued
             return estimate
+        rescued = rescue_tempo_with_tempogram_peak(
+            path,
+            estimate,
+            agreement,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
+        if rescued is not None:
+            return rescued
         return TempoEstimate(
             bpm=estimate.bpm,
             uncertainty_bpm=estimate.uncertainty_bpm,
@@ -1770,6 +1804,165 @@ def estimate_tempo(
         segment_agreement_score=stable_grid.agreement_score,
         segment_agreement_detail=agreement_detail,
     )
+
+
+def tempogram_peak_bpm(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
+    if librosa is None:
+        return None
+
+    audio, sample_rate = librosa_load_segment(path, start_seconds, end_seconds)
+    if audio.size < sample_rate:
+        return None
+
+    hop_size = 512
+    onset = librosa.onset.onset_strength(y=audio, sr=sample_rate, hop_length=hop_size)
+    tempogram = librosa.feature.tempogram(onset_envelope=onset, sr=sample_rate, hop_length=hop_size)
+    if tempogram.size == 0:
+        return None
+
+    scores = np.mean(tempogram, axis=1)
+    bpms = librosa.tempo_frequencies(len(scores), sr=sample_rate, hop_length=hop_size)
+    candidates = [
+        (float(score), fold_bpm(float(bpm)))
+        for bpm, score in zip(bpms, scores)
+        if 40.0 <= float(bpm) <= 250.0 and np.isfinite(score) and float(score) > 0
+    ]
+    if not candidates:
+        return None
+
+    _score, bpm = max(candidates, key=lambda item: item[0])
+    return bpm
+
+
+def rescue_tempo_with_tempogram_peak(
+    path: Path,
+    estimate: TempoEstimate,
+    agreement: TempoSegmentAgreement | None,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate | None:
+    if "accepted 3:2 tempo correction" in estimate.detail:
+        return None
+    if agreement is not None and agreement.score > TEMPOGRAM_RESCUE_MAX_AGREEMENT_SCORE:
+        return None
+
+    peak_bpm = tempogram_peak_bpm(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    if peak_bpm is None:
+        return None
+
+    try:
+        guided = estimate_tempo_with_librosa(
+            path,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+            bpm_hint=peak_bpm,
+        )
+    except Exception:
+        return None
+
+    aligned_bpm = align_bpm_to_reference(guided.bpm, estimate.bpm)
+    candidate_bpm = guided.bpm
+    if abs(aligned_bpm - estimate.bpm) <= max(1.0, estimate.bpm * 0.015):
+        candidate_bpm = aligned_bpm
+
+    if abs(candidate_bpm - estimate.bpm) <= max(1.0, estimate.bpm * 0.015):
+        return None
+    if guided.confidence < TEMPOGRAM_RESCUE_MIN_CONFIDENCE:
+        return None
+
+    detail = "n/a" if agreement is None else f"{agreement.score:.1f}"
+    return TempoEstimate(
+        bpm=candidate_bpm,
+        uncertainty_bpm=guided.uncertainty_bpm,
+        confidence=guided.confidence,
+        method=guided.method,
+        detail=(
+            f"{guided.detail}; accepted tempogram rescue "
+            f"(previous {estimate.bpm:.2f}, agreement {detail})"
+        ),
+        segment_agreement_score=None if agreement is None else agreement.score,
+        segment_agreement_detail="" if agreement is None else tempo_segment_agreement_detail(agreement),
+    )
+
+
+def tempo_candidate_window_support(
+    path: Path,
+    candidate_bpm: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float:
+    if candidate_bpm <= 0:
+        return 0.0
+
+    duration = audio_file_duration(path)
+    if duration is None:
+        return 0.0
+
+    windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
+    if len(windows) < 3:
+        return 0.0
+
+    support = 0.0
+    tolerance = max(1.25, candidate_bpm * 0.015)
+    for window_start, window_end in windows:
+        try:
+            estimate = estimate_tempo_with_librosa(path, start_seconds=window_start, end_seconds=window_end)
+        except Exception:
+            continue
+
+        aligned_bpm = align_bpm_to_reference(estimate.bpm, candidate_bpm)
+        difference = abs(aligned_bpm - candidate_bpm)
+        if difference > tolerance:
+            continue
+
+        closeness = max(0.0, 1.0 - difference / tolerance)
+        support += max(0.0, estimate.confidence) * closeness
+
+    return support
+
+
+def choose_disagreement_tempo_candidate(
+    path: Path,
+    primary: TempoEstimate,
+    secondary: TempoEstimate,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> TempoEstimate | None:
+    primary_support = tempo_candidate_window_support(
+        path,
+        primary.bpm,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    secondary_support = tempo_candidate_window_support(
+        path,
+        secondary.bpm,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    if (
+        secondary_support >= DISAGREEMENT_SEGMENT_SUPPORT_MIN_CONFIDENCE
+        and secondary_support >= primary_support + DISAGREEMENT_SEGMENT_SUPPORT_MIN_MARGIN
+    ):
+        uncertainty_bpm = max(secondary.uncertainty_bpm, min(18.0, abs(primary.bpm - secondary.bpm) / 3.0))
+        confidence = max(secondary.confidence, min(95.0, secondary_support))
+        return TempoEstimate(
+            bpm=secondary.bpm,
+            uncertainty_bpm=uncertainty_bpm,
+            confidence=confidence,
+            method=secondary.method,
+            detail=(
+                f"{secondary.detail}; accepted segment-supported fallback "
+                f"(primary {primary.bpm:.2f}, fallback {secondary.bpm:.2f}, "
+                f"support {primary_support:.1f}/{secondary_support:.1f})"
+            ),
+        )
+
+    return None
 
 
 def estimate_tempo_core(
@@ -1815,6 +2008,16 @@ def estimate_tempo_core(
                         f"(primary {primary.bpm:.2f}, fallback {secondary.bpm:.2f})"
                     ),
                 )
+
+    segment_supported = choose_disagreement_tempo_candidate(
+        path,
+        primary,
+        secondary,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+    )
+    if segment_supported is not None:
+        return segment_supported
 
     uncertainty_bpm = max(primary.uncertainty_bpm, min(30.0, disagreement / 2))
     disagreement_penalty = min(60.0, (disagreement / primary.bpm) * 180.0)
@@ -2009,9 +2212,23 @@ def detect_stable_beat_anchor_for_estimate(
     estimate: TempoEstimate | None,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    allow_loose_anchor_check: bool | None = None,
 ) -> float | None:
     if estimate is None:
         return detect_stable_beat_anchor_seconds(path, None, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    if allow_loose_anchor_check is None:
+        allow_loose_anchor_check = (
+            estimate.segment_agreement_score is None
+            or estimate.segment_agreement_score < ANCHOR_LOOSE_TEMPO_MAX_AGREEMENT_SCORE
+        )
+    if not allow_loose_anchor_check:
+        return detect_stable_beat_anchor_seconds(
+            path,
+            estimate.bpm,
+            start_seconds=start_seconds,
+            end_seconds=end_seconds,
+        )
 
     try:
         loose_estimate = estimate_tempo_with_librosa(
@@ -2103,6 +2320,7 @@ class TempoWindow:
         self.is_analyzing = False
         self.analysis_queue: list[AnalysisTask] = []
         self.analysis_paths: set[str] = set()
+        self.analysis_table_refresh_pending = False
         self.result_queue: queue.Queue = queue.Queue()
         self.tag_result_queue: queue.Queue = queue.Queue()
         self.queue_lock = threading.Lock()
@@ -2588,6 +2806,7 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "Analysis is already running.")
             return
 
+        self.analysis_table_refresh_pending = False
         rows: list[AnalysisRow] = []
         try:
             with open(csv_path, newline="", encoding="utf-8") as csv_file:
@@ -2631,6 +2850,7 @@ class TempoWindow:
         self.ensure_row_uids()
         self.rebuild_known_path_ids()
         self.match_links = {}
+        self.analysis_table_refresh_pending = False
         match_payload = payload.get("matches", [])
         if isinstance(match_payload, list):
             for item in match_payload:
@@ -2926,6 +3146,7 @@ class TempoWindow:
             self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id not in selected_ids]
         self.rows = [row for row in self.rows if self.row_id(row) not in selected_ids]
         self.rebuild_known_path_ids()
+        self.analysis_table_refresh_pending = False
         self.similarity_target_ids.difference_update(selected_ids)
         self.prune_match_links()
 
@@ -4173,7 +4394,7 @@ class TempoWindow:
             "Title": row.title,
             "Album": row.album,
             "Tempo": "" if effective_tempo is None else f"{effective_tempo:.2f}",
-            "Agreement": "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}",
+            "Agreement": self.tempo_agreement_text_for_row(row),
             "Similarity": self.similarity_text_for_row(row),
             "Chroma": simple_chroma_peaks(row.chroma),
             "Base": self.base_text_for_row(row),
@@ -4197,7 +4418,7 @@ class TempoWindow:
             tempo_text = f"{effective_tempo:.2f}"
 
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
-        agreement_text = "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}"
+        agreement_text = self.tempo_agreement_text_for_row(row)
         similarity_text = self.similarity_text_for_row(row)
         chroma_text = simple_chroma_peaks(row.chroma)
         base_text = self.base_text_for_row(row)
@@ -4220,6 +4441,13 @@ class TempoWindow:
             row.title,
             row.album,
         )
+
+    def tempo_agreement_text_for_row(self, row: AnalysisRow) -> str:
+        if row.tempo_agreement_score is not None:
+            return f"{row.tempo_agreement_score:.0f}"
+        if row.bpm is not None:
+            return "n/a"
+        return ""
 
     def handle_play_click(self, event) -> None:
         row_id = self.play_table.identify_row(event.y)
@@ -6288,6 +6516,11 @@ class TempoWindow:
                             estimate,
                             start_seconds=task.part_start_seconds,
                             end_seconds=task.part_end_seconds,
+                            allow_loose_anchor_check=(
+                                estimate is not None
+                                and estimate.segment_agreement_score is not None
+                                and estimate.segment_agreement_score < ANCHOR_LOOSE_TEMPO_MAX_AGREEMENT_SCORE
+                            ),
                         )
                     except Exception as exc:
                         errors.append(f"beat anchor: {exc}")
@@ -6338,57 +6571,124 @@ class TempoWindow:
             self.result_queue.put(("done",))
 
     def process_analysis_results(self) -> None:
-        while True:
+        pending_rows: list[tuple[AnalysisRow, int, int, str | None]] = []
+        worker_done = False
+        worker_error = None
+        last_started: tuple[str, int] | None = None
+        processed_messages = 0
+        while processed_messages < ANALYSIS_RESULT_MAX_MESSAGES_PER_TICK:
+            if len(pending_rows) >= ANALYSIS_RESULT_MAX_ROWS_PER_TICK:
+                break
             try:
                 message = self.result_queue.get_nowait()
             except queue.Empty:
                 break
 
+            processed_messages += 1
             kind = message[0]
             if kind == "started":
                 _, filename, remaining = message
-                self.result.configure(text=f"Analyzing {filename} ({remaining} queued)")
+                last_started = (filename, remaining)
             elif kind == "row":
                 _, row, processed, remaining, task_id = message
-                self._add_result(row, processed, remaining, task_id)
+                pending_rows.append((row, processed, remaining, task_id))
             elif kind == "worker_error":
-                _, error = message
-                self.result.configure(text=f"Analysis worker failed: {error}")
+                _, worker_error = message
             elif kind == "done":
-                self._finish_analysis()
+                worker_done = True
+
+        if pending_rows:
+            self._add_result_batch(pending_rows)
+        elif worker_error is not None:
+            self.result.configure(text=f"Analysis worker failed: {worker_error}")
+        elif last_started is not None:
+            filename, remaining = last_started
+            self.result.configure(text=f"Analyzing {filename} ({remaining} queued)")
+
+        if worker_done:
+            self._finish_analysis()
 
         if self.is_analyzing:
-            self.root.after(50, self.process_analysis_results)
+            delay_ms = 5 if pending_rows or processed_messages >= ANALYSIS_RESULT_MAX_MESSAGES_PER_TICK else 50
+            self.root.after(delay_ms, self.process_analysis_results)
 
     def _add_result(self, row: AnalysisRow, processed: int, remaining: int, task_id: str | None = None) -> None:
-        with self.queue_lock:
-            self.analysis_paths.discard(task_id or self.row_id(row))
+        self._add_result_batch([(row, processed, remaining, task_id)])
 
-        row_id = self.row_id(row)
-        replaced = False
-        updated_rows = []
-        for existing_row in self.rows:
-            if self.row_id(existing_row) == row_id:
-                updated_rows.append(replace(row, row_uid=existing_row.row_uid))
-                replaced = True
+    def _add_result_batch(self, results: list[tuple[AnalysisRow, int, int, str | None]]) -> None:
+        if not results:
+            return
+
+        with self.queue_lock:
+            for row, _processed, _remaining, task_id in results:
+                self.analysis_paths.discard(task_id or self.row_id(row))
+
+        rows_by_id = {self.row_id(row): index for index, row in enumerate(self.rows)}
+        any_added = False
+        replaced_count = 0
+        last_processed = 0
+        last_remaining = 0
+        last_replaced = False
+        updated_row_ids: set[str] = set()
+
+        for row, processed, remaining, _task_id in results:
+            row_id = self.row_id(row)
+            updated_row_ids.add(row_id)
+            last_processed = processed
+            last_remaining = remaining
+            existing_index = rows_by_id.get(row_id)
+            if existing_index is not None:
+                existing_row = self.rows[existing_index]
+                self.rows[existing_index] = replace(row, row_uid=existing_row.row_uid)
+                replaced_count += 1
+                last_replaced = True
             else:
-                updated_rows.append(existing_row)
-        if replaced:
-            self.rows = updated_rows
-        else:
-            self.rows.append(row if row.row_uid is not None else replace(row, row_uid=self.next_row_uid()))
+                stored_row = row if row.row_uid is not None else replace(row, row_uid=self.next_row_uid())
+                rows_by_id[row_id] = len(self.rows)
+                self.rows.append(stored_row)
+                any_added = True
+                last_replaced = False
+
         self.rebuild_known_path_ids()
 
         for slot in self.waveform_slots:
-            if slot.row_id == row_id:
-                slot.row = self.row_by_id(row_id) or row
+            if slot.row_id in updated_row_ids:
+                slot.row = self.row_by_id(slot.row_id) or slot.row
+
+        if self.is_analyzing:
+            self.analysis_table_refresh_pending = True
+            for row_id in updated_row_ids:
+                row = self.row_by_id(row_id)
+                if row is not None and self.table.exists(row_id):
+                    self.table.item(row_id, values=self.row_values(row))
+            if len(results) == 1:
+                action = "Re-analyzed" if last_replaced else "Analyzed"
+                self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
+            else:
+                added_count = len(results) - replaced_count
+                self.result.configure(
+                    text=(
+                        f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
+                        f"({replaced_count} re-analyzed, {added_count} analyzed)"
+                    )
+                )
+            return
 
         if self.current_similarity_target_rows() or self.table.selection():
             self.update_similarity_scores()
         self.refresh_table()
-        action = "Re-analyzed" if replaced else "Analyzed"
-        self.result.configure(text=f"{action} {processed}; {remaining} queued")
-        if not replaced:
+        if len(results) == 1:
+            action = "Re-analyzed" if last_replaced else "Analyzed"
+            self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
+        else:
+            added_count = len(results) - replaced_count
+            self.result.configure(
+                text=(
+                    f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
+                    f"({replaced_count} re-analyzed, {added_count} analyzed)"
+                )
+            )
+        if any_added:
             self.table.yview_moveto(1.0)
 
     def _finish_analysis(self) -> None:
@@ -6400,6 +6700,11 @@ class TempoWindow:
                 return
 
         self.is_analyzing = False
+        if self.analysis_table_refresh_pending:
+            if self.current_similarity_target_rows() or self.table.selection():
+                self.update_similarity_scores()
+            self.refresh_table()
+            self.analysis_table_refresh_pending = False
         analyzed_count = len(self.rows)
         issue_count = sum(1 for row in self.rows if row.error)
         self.set_export_state("normal" if self.rows else "disabled")

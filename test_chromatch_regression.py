@@ -137,6 +137,41 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.435832, anchor)
 
+    def test_anchor_for_estimate_can_skip_loose_anchor_check(self):
+        estimate = chromatch.TempoEstimate(
+            bpm=124.0,
+            uncertainty_bpm=1.0,
+            confidence=95.0,
+            method="test",
+            detail="test",
+            segment_agreement_score=95.0,
+        )
+        original_stable = chromatch.detect_stable_beat_anchor_seconds
+        original_loose = chromatch.estimate_tempo_with_librosa
+        calls = []
+
+        try:
+            chromatch.detect_stable_beat_anchor_seconds = (
+                lambda path, bpm, start_seconds=None, end_seconds=None: calls.append((path, bpm)) or 0.37
+            )
+
+            def fail_loose(*_args, **_kwargs):
+                raise AssertionError("loose estimate should be skipped")
+
+            chromatch.estimate_tempo_with_librosa = fail_loose
+
+            anchor = chromatch.detect_stable_beat_anchor_for_estimate(
+                Path("track.wav"),
+                estimate,
+                allow_loose_anchor_check=False,
+            )
+        finally:
+            chromatch.detect_stable_beat_anchor_seconds = original_stable
+            chromatch.estimate_tempo_with_librosa = original_loose
+
+        self.assertEqual(0.37, anchor)
+        self.assertEqual([(Path("track.wav"), 124.0)], calls)
+
     def test_fit_tempo_grid_from_user_beats_handles_non_consecutive_beats(self):
         expected_bpm = 121.52
         interval = 60.0 / expected_bpm
@@ -247,6 +282,76 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual([None, 136.0], calls)
         self.assertAlmostEqual(133.57, estimate.bpm)
         self.assertIn("3:2 tempo correction", estimate.detail)
+
+    def test_disagreement_tempo_candidate_can_use_segment_support(self):
+        primary = chromatch.TempoEstimate(96.0, 1.0, 95.0, "primary", "primary")
+        secondary = chromatch.TempoEstimate(120.0, 20.0, 50.0, "fallback", "fallback")
+        original_support = chromatch.tempo_candidate_window_support
+
+        try:
+            chromatch.tempo_candidate_window_support = (
+                lambda _path, bpm, start_seconds=None, end_seconds=None: 55.0 if bpm == 96.0 else 90.0
+            )
+
+            estimate = chromatch.choose_disagreement_tempo_candidate(
+                Path("track.wav"),
+                primary,
+                secondary,
+            )
+        finally:
+            chromatch.tempo_candidate_window_support = original_support
+
+        self.assertIsNotNone(estimate)
+        assert estimate is not None
+        self.assertEqual(120.0, estimate.bpm)
+        self.assertIn("segment-supported fallback", estimate.detail)
+
+    def test_tempogram_rescue_uses_strong_peak_for_low_agreement_estimate(self):
+        estimate = chromatch.TempoEstimate(136.0, 1.0, 97.0, "librosa", "primary")
+        agreement = chromatch.TempoSegmentAgreement(40.0, 1.5, 0.2, 5)
+        original_peak = chromatch.tempogram_peak_bpm
+        original_librosa = chromatch.estimate_tempo_with_librosa
+
+        try:
+            chromatch.tempogram_peak_bpm = lambda _path, start_seconds=None, end_seconds=None: 99.38
+            chromatch.estimate_tempo_with_librosa = (
+                lambda _path, start_seconds=None, end_seconds=None, bpm_hint=None: chromatch.TempoEstimate(
+                    99.92,
+                    1.0,
+                    97.0,
+                    "librosa",
+                    f"guided by {bpm_hint:.2f}",
+                )
+            )
+
+            rescued = chromatch.rescue_tempo_with_tempogram_peak(Path("track.wav"), estimate, agreement)
+        finally:
+            chromatch.tempogram_peak_bpm = original_peak
+            chromatch.estimate_tempo_with_librosa = original_librosa
+
+        self.assertIsNotNone(rescued)
+        assert rescued is not None
+        self.assertAlmostEqual(99.92, rescued.bpm)
+        self.assertIn("tempogram rescue", rescued.detail)
+
+    def test_tempogram_rescue_skips_three_two_correction(self):
+        estimate = chromatch.TempoEstimate(
+            133.5,
+            1.0,
+            97.0,
+            "librosa",
+            "accepted 3:2 tempo correction",
+        )
+        agreement = chromatch.TempoSegmentAgreement(40.0, 1.5, 0.2, 5)
+        original_peak = chromatch.tempogram_peak_bpm
+
+        try:
+            chromatch.tempogram_peak_bpm = lambda _path, start_seconds=None, end_seconds=None: 89.1
+            rescued = chromatch.rescue_tempo_with_tempogram_peak(Path("track.wav"), estimate, agreement)
+        finally:
+            chromatch.tempogram_peak_bpm = original_peak
+
+        self.assertIsNone(rescued)
 
     def test_fold_bpm_preserves_fast_tempo(self):
         self.assertEqual(240.0, chromatch.fold_bpm(240.0))
@@ -946,12 +1051,33 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.408, anchor, delta=0.01)
 
+    def test_stable_beat_anchor_keeps_raw_anchor_when_segment_phase_is_noisy(self):
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            104.5,
+            0.122,
+            [8.01, 69.25, 130.07, 191.15, 252.32],
+        )
+
+        self.assertAlmostEqual(0.122, anchor, places=6)
+
+    def test_stable_beat_anchor_allows_moderate_low_tempo_phase_override(self):
+        beat_seconds = 60.0 / 123.6
+        anchor = chromatch.choose_stable_beat_anchor_seconds(
+            123.6,
+            0.209,
+            [0.407, 0.407 + beat_seconds * 90, 0.407 + beat_seconds * 180],
+        )
+
+        self.assertAlmostEqual(0.407, anchor, delta=0.01)
+
     def test_stable_beat_anchor_uses_half_tempo_phase_for_alternate_double_tempo_beat(self):
+        beat_seconds = 60.0 / 133.43
+        half_beat_seconds = 120.0 / 133.43
         anchor = chromatch.choose_stable_beat_anchor_seconds(
             133.43,
             0.209,
-            [0.188, 42.314, 83.985, 126.325],
-            [0.434, 42.313, 83.984, 126.325],
+            [0.209, 0.209 + beat_seconds * 12, 0.209 + beat_seconds * 24, 0.434 + beat_seconds * 36],
+            [0.434, 0.434 + half_beat_seconds * 40, 0.434 + half_beat_seconds * 90],
         )
 
         self.assertAlmostEqual(0.434, anchor, delta=0.02)
@@ -972,6 +1098,13 @@ class ChromatchRegressionTests(unittest.TestCase):
         values = self.app.row_values(row)
 
         self.assertEqual("87", values[6])
+
+    def test_row_values_show_na_when_tempo_agreement_is_not_available(self):
+        row = self.make_row("track.wav", bpm=120.0)
+
+        values = self.app.row_values(row)
+
+        self.assertEqual("n/a", values[6])
 
     def test_tempo_audit_record_compares_automatic_to_manual_tempo_and_anchor(self):
         row = chromatch.replace(
@@ -3232,6 +3365,89 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual([slot], draws)
         self.assertEqual(1, len(estimates))
         self.assertAlmostEqual(120.0, estimates[0].bpm)
+
+    def test_process_analysis_results_batches_table_refreshes(self):
+        first = self.make_row("first.wav")
+        second = self.make_row("second.wav")
+        refreshes = []
+        original_refresh = self.app.refresh_table
+
+        try:
+            self.app.refresh_table = lambda: refreshes.append("refresh")
+            self.app.is_analyzing = False
+            self.app.result_queue.put(("row", first, 1, 1, self.app.row_id(first)))
+            self.app.result_queue.put(("row", second, 2, 0, self.app.row_id(second)))
+
+            self.app.process_analysis_results()
+        finally:
+            self.app.refresh_table = original_refresh
+
+        self.assertEqual(2, len(self.app.rows))
+        self.assertEqual(["refresh"], refreshes)
+        self.assertIn("Processed 2 results", self.app.result.cget("text"))
+
+    def test_process_analysis_results_limits_rows_per_ui_tick(self):
+        rows = [
+            self.make_row(f"track-{index}.wav")
+            for index in range(chromatch.ANALYSIS_RESULT_MAX_ROWS_PER_TICK + 2)
+        ]
+        refreshes = []
+        original_refresh = self.app.refresh_table
+
+        try:
+            self.app.refresh_table = lambda: refreshes.append("refresh")
+            self.app.is_analyzing = False
+            for index, row in enumerate(rows, start=1):
+                self.app.result_queue.put(("row", row, index, len(rows) - index, self.app.row_id(row)))
+
+            self.app.process_analysis_results()
+        finally:
+            self.app.refresh_table = original_refresh
+
+        self.assertEqual(chromatch.ANALYSIS_RESULT_MAX_ROWS_PER_TICK, len(self.app.rows))
+        self.assertEqual(["refresh"], refreshes)
+        self.assertFalse(self.app.result_queue.empty())
+
+    def test_analysis_result_updates_visible_rows_without_full_refresh_while_running(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        row_id = self.app.row_id(row)
+        updated = chromatch.replace(row, bpm=123.45, tempo_agreement_score=88.0)
+        refreshes = []
+        original_refresh = self.app.refresh_table
+
+        try:
+            self.app.rows = [row]
+            self.app.refresh_table()
+            self.app.refresh_table = lambda: refreshes.append("refresh")
+            self.app.is_analyzing = True
+
+            self.app._add_result(updated, 1, 0, row_id)
+        finally:
+            self.app.refresh_table = original_refresh
+
+        self.assertEqual([], refreshes)
+        self.assertTrue(self.app.analysis_table_refresh_pending)
+        self.assertAlmostEqual(123.45, self.app.rows[0].bpm)
+        self.assertEqual("88", self.app.table.item(row_id, "values")[6])
+
+    def test_finish_analysis_refreshes_pending_table_once(self):
+        row = self.make_row("track.wav", bpm=120.0)
+        refreshes = []
+        original_refresh = self.app.refresh_table
+
+        try:
+            self.app.rows = [row]
+            self.app.is_analyzing = True
+            self.app.analysis_table_refresh_pending = True
+            self.app.refresh_table = lambda: refreshes.append("refresh")
+
+            self.app._finish_analysis()
+        finally:
+            self.app.refresh_table = original_refresh
+
+        self.assertFalse(self.app.is_analyzing)
+        self.assertFalse(self.app.analysis_table_refresh_pending)
+        self.assertEqual(["refresh"], refreshes)
 
     def test_load_slot_zoom_waveform_updates_zoom_data_asynchronously(self):
         row = self.make_row("track.wav")

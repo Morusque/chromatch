@@ -535,6 +535,53 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual(150.0, self.app.rows[1].tapped_bpm)
 
+    def test_tempo_nudge_writes_tapped_tempo_override(self):
+        selected = self.make_row("selected.wav", bpm=120.0)
+        untouched = self.make_row("untouched.wav", bpm=130.0)
+        self.app.rows = [selected, untouched]
+        self.app.refresh_table()
+        self.app.table.selection_set(self.app.row_id(selected))
+        self.app.tempo_nudge_bpm_var.set("0.025")
+
+        self.app.nudge_selected_tempo(1)
+
+        self.assertAlmostEqual(120.025, self.app.rows[0].tapped_bpm)
+        self.assertIsNone(self.app.rows[1].tapped_bpm)
+        self.assertEqual("120.025", self.app.tapped_tempo_var.get())
+
+        self.app.nudge_selected_tempo(-1)
+
+        self.assertAlmostEqual(120.0, self.app.rows[0].tapped_bpm)
+
+    def test_beat_offset_nudge_shifts_anchor_and_manual_beats(self):
+        selected = chromatch.replace(
+            self.make_row("selected.wav"),
+            beat_anchor_seconds=1.0,
+            beat_anchor_source="automatic",
+            user_beat_seconds=(1.0, 1.5),
+        )
+        untouched = chromatch.replace(
+            self.make_row("untouched.wav"),
+            beat_anchor_seconds=2.0,
+            user_beat_seconds=(2.0,),
+        )
+        row_id = self.app.row_id(selected)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=selected, downbeat_seconds=1.0)
+        self.app.rows = [selected, untouched]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.beat_nudge_seconds_var.set("0.020")
+
+        self.app.nudge_selected_beat_offset(1)
+
+        self.assertAlmostEqual(1.02, self.app.rows[0].beat_anchor_seconds)
+        self.assertEqual("user-nudge", self.app.rows[0].beat_anchor_source)
+        self.assertEqual((1.02, 1.52), self.app.rows[0].user_beat_seconds)
+        self.assertAlmostEqual(1.02, slot.downbeat_seconds)
+        self.assertAlmostEqual(2.0, self.app.rows[1].beat_anchor_seconds)
+        self.assertEqual((2.0,), self.app.rows[1].user_beat_seconds)
+
     def test_playing_hidden_slot_is_marked_keep(self):
         first = self.make_row("first.wav")
         second = self.make_row("second.wav")
@@ -1070,6 +1117,48 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.407, anchor, delta=0.01)
 
+    def test_stronger_fallback_anchor_can_veto_alternate_phase(self):
+        original_strength = chromatch.transient_strength_near_file_time
+
+        try:
+            chromatch.transient_strength_near_file_time = (
+                lambda _path, beat_seconds: 0.8 if beat_seconds == 0.05 else 0.1
+            )
+
+            anchor = chromatch.keep_stronger_fallback_anchor(Path("track.wav"), 132.0, 0.05, 0.22)
+        finally:
+            chromatch.transient_strength_near_file_time = original_strength
+
+        self.assertEqual(0.05, anchor)
+
+    def test_weak_fallback_anchor_does_not_veto_alternate_phase(self):
+        original_strength = chromatch.transient_strength_near_file_time
+
+        try:
+            chromatch.transient_strength_near_file_time = (
+                lambda _path, beat_seconds: 0.0 if beat_seconds == 0.21 else 0.12
+            )
+
+            anchor = chromatch.keep_stronger_fallback_anchor(Path("track.wav"), 133.0, 0.21, 0.43)
+        finally:
+            chromatch.transient_strength_near_file_time = original_strength
+
+        self.assertEqual(0.43, anchor)
+
+    def test_low_tempo_fallback_anchor_does_not_veto_segment_phase(self):
+        original_strength = chromatch.transient_strength_near_file_time
+
+        try:
+            chromatch.transient_strength_near_file_time = (
+                lambda _path, beat_seconds: 0.8 if beat_seconds == 3.39 else 0.1
+            )
+
+            anchor = chromatch.keep_stronger_fallback_anchor(Path("track.wav"), 100.0, 3.39, 0.14)
+        finally:
+            chromatch.transient_strength_near_file_time = original_strength
+
+        self.assertEqual(0.14, anchor)
+
     def test_stable_beat_anchor_uses_half_tempo_phase_for_alternate_double_tempo_beat(self):
         beat_seconds = 60.0 / 133.43
         half_beat_seconds = 120.0 / 133.43
@@ -1357,7 +1446,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.table.selection_set(row_id)
         self.app.update_selected_edit_fields()
 
-        self.assertEqual("128.50", self.app.tapped_tempo_var.get())
+        self.assertEqual("128.500", self.app.tapped_tempo_var.get())
         self.assertEqual("10", self.app.part_start_marker_var.get())
         self.assertEqual("20", self.app.part_end_marker_var.get())
         self.assertEqual("42", self.app.base_chroma_var.get())
@@ -1502,6 +1591,35 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual([True, False], calls)
         self.assertEqual(("Ogg Artist", "Ogg Title", "Ogg Album"), (artist, title, album))
 
+    def test_id3v24_tags_skip_data_length_and_unsynchronisation(self):
+        def synchsafe(value: int) -> bytes:
+            return bytes(
+                (
+                    (value >> 21) & 0x7F,
+                    (value >> 14) & 0x7F,
+                    (value >> 7) & 0x7F,
+                    value & 0x7F,
+                )
+            )
+
+        def text_frame(frame_id: bytes, text: str) -> bytes:
+            text_payload = b"\x01\xff\x00\xfe" + text.encode("utf-16-le")
+            payload = synchsafe(len(text_payload)) + text_payload
+            return frame_id + synchsafe(len(payload)) + b"\x00\x03" + payload
+
+        tag = (
+            text_frame(b"TPE1", "Ben Babbitt")
+            + text_frame(b"TIT2", "Nameless Interiors")
+            + text_frame(b"TALB", "Kentucky Route Zero, Act II")
+        )
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "track.mp3"
+            path.write_bytes(b"ID3\x04\x00\x80" + synchsafe(len(tag)) + tag + b"\xff\xfb")
+
+            tags = chromatch.read_id3v2_tags(path)
+
+        self.assertEqual(("Ben Babbitt", "Nameless Interiors", "Kentucky Route Zero, Act II"), tags)
+
     def test_csv_loader_preserves_beat_anchor(self):
         row = self.app.row_from_csv_record(
             {
@@ -1538,7 +1656,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertIn("track.wav", contents)
         self.assertIn("123.45", contents)
-        self.assertIn("128.50", contents)
+        self.assertIn("128.500", contents)
 
     def test_csv_writer_exports_beat_anchor(self):
         row = chromatch.replace(
@@ -3652,6 +3770,64 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual([chromatch.AnalysisTask(path=row.path, row_id=row_id)], self.app.analysis_queue)
         self.assertIn(row_id, self.app.analysis_paths)
+
+    def test_clear_selected_analysis_data_preserves_row_identity(self):
+        chroma = chromatch.chroma_from_values(np.ones(chromatch.CHROMA_BINS, dtype=np.float32))
+        row = chromatch.replace(
+            self.make_row("first.wav", bpm=123.0),
+            row_uid=7,
+            artist="Artist",
+            title="Title",
+            album="Album",
+            uncertainty_bpm=1.2,
+            tempo_agreement_score=88.0,
+            tempo_agreement_detail="detail",
+            confidence=90.0,
+            tapped_bpm=124.0,
+            chroma=chroma,
+            chroma_similarity=80.0,
+            chroma_tempo_similarity=70.0,
+            method="method",
+            detail="detail",
+            error="error",
+            analyzed_at="now",
+            beat_anchor_seconds=0.5,
+            beat_anchor_source="user",
+            base_chroma_bin=42,
+            user_beat_seconds=(0.5, 1.0),
+            cue_points=(chromatch.CuePoint(2.5), chromatch.CuePoint(4.0, 8.0)),
+            part_start_seconds=10.0,
+            part_end_seconds=20.0,
+            part_index=2,
+        )
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.similarity_target_ids = {row_id}
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+
+        self.app.clear_selected_analysis_data()
+
+        cleared = self.app.rows[0]
+        self.assertEqual(7, cleared.row_uid)
+        self.assertEqual(Path("first.wav"), cleared.path)
+        self.assertEqual("Artist", cleared.artist)
+        self.assertEqual("Title", cleared.title)
+        self.assertEqual("Album", cleared.album)
+        self.assertEqual(10.0, cleared.part_start_seconds)
+        self.assertEqual(20.0, cleared.part_end_seconds)
+        self.assertEqual(2, cleared.part_index)
+        self.assertIsNone(cleared.bpm)
+        self.assertIsNone(cleared.tapped_bpm)
+        self.assertIsNone(cleared.chroma)
+        self.assertIsNone(cleared.base_chroma_bin)
+        self.assertEqual((), cleared.user_beat_seconds)
+        self.assertEqual((), cleared.cue_points)
+        self.assertIsNone(cleared.beat_anchor_seconds)
+        self.assertEqual("", cleared.method)
+        self.assertEqual("", cleared.error)
+        self.assertEqual(set(), self.app.similarity_target_ids)
+        self.assertIn("Cleared analysis data", self.app.result.cget("text"))
 
     def test_dropping_unanalyzed_files_does_not_read_tags_synchronously(self):
         original_read_tags = chromatch.read_audio_tags

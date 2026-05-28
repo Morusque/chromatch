@@ -782,6 +782,10 @@ def synchsafe_to_int(data: bytes) -> int:
     return value
 
 
+def remove_id3_unsynchronisation(data: bytes) -> bytes:
+    return data.replace(b"\xff\x00", b"\xff")
+
+
 def decode_id3_text(data: bytes) -> str:
     if not data:
         return ""
@@ -845,6 +849,7 @@ def read_id3v2_tags(path: Path) -> tuple[str, str, str]:
                 break
             size_bytes = tag_data[offset + 4:offset + 8]
             frame_size = synchsafe_to_int(size_bytes) if major_version == 4 else int.from_bytes(size_bytes, "big")
+            frame_flags = tag_data[offset + 8:offset + 10]
             frame_start = offset + 10
 
         if frame_size <= 0:
@@ -856,7 +861,15 @@ def read_id3v2_tags(path: Path) -> tuple[str, str, str]:
 
         field_name = wanted.get(frame_id)
         if field_name and not found[field_name]:
-            found[field_name] = decode_id3_text(tag_data[frame_start:frame_end])
+            payload_start = frame_start
+            payload = tag_data[payload_start:frame_end]
+            if major_version == 4:
+                format_flags = frame_flags[1] if len(frame_flags) > 1 else 0
+                if format_flags & 0x01 and len(payload) >= 4:
+                    payload = payload[4:]
+                if format_flags & 0x02:
+                    payload = remove_id3_unsynchronisation(payload)
+            found[field_name] = decode_id3_text(payload)
 
         if all(found.values()):
             break
@@ -1607,6 +1620,50 @@ def refine_beat_anchor_from_file(
     return refined_seconds
 
 
+def transient_strength_near_file_time(
+    path: Path,
+    beat_seconds: float,
+    before_seconds: float = 0.08,
+    after_seconds: float = 0.04,
+) -> float:
+    try:
+        audio, _sample_rate = load_audio_mono(
+            path,
+            start_seconds=max(0.0, beat_seconds - before_seconds),
+            end_seconds=beat_seconds + after_seconds,
+        )
+    except Exception:
+        return 0.0
+
+    if audio.size < 8:
+        return 0.0
+
+    envelope = np.abs(audio.astype(np.float32, copy=False))
+    return float(max(0.0, np.max(envelope) - np.median(envelope)))
+
+
+def keep_stronger_fallback_anchor(
+    path: Path,
+    bpm: float,
+    fallback_anchor: float | None,
+    chosen_anchor: float | None,
+) -> float | None:
+    if fallback_anchor is None or chosen_anchor is None or bpm <= 0:
+        return chosen_anchor
+    if bpm <= 125.0:
+        return chosen_anchor
+
+    distance = beat_phase_distance_seconds(fallback_anchor, chosen_anchor, bpm)
+    if distance is None or distance < 0.12:
+        return chosen_anchor
+
+    fallback_strength = transient_strength_near_file_time(path, fallback_anchor)
+    chosen_strength = transient_strength_near_file_time(path, chosen_anchor)
+    if fallback_strength >= 0.05 and fallback_strength >= chosen_strength * 2.0:
+        return round(fallback_anchor, 6)
+    return chosen_anchor
+
+
 
 def estimate_tempo_with_librosa(
     path: Path,
@@ -2169,7 +2226,8 @@ def detect_stable_beat_anchor_seconds(
             if half_anchor is not None and np.isfinite(half_anchor):
                 half_anchors.append(float(half_anchor))
 
-    return choose_stable_beat_anchor_seconds(bpm, fallback_anchor, anchors, half_anchors)
+    chosen_anchor = choose_stable_beat_anchor_seconds(bpm, fallback_anchor, anchors, half_anchors)
+    return keep_stronger_fallback_anchor(path, bpm, fallback_anchor, chosen_anchor)
 
 
 def beat_anchor_phase_spread_seconds(
@@ -2358,6 +2416,8 @@ class TempoWindow:
         self.target_tempo_slider_var = tk.DoubleVar(value=120.0)
         self.tempo_glide_seconds_var = tk.StringVar(value="0")
         self.beat_jump_var = tk.StringVar(value="4")
+        self.tempo_nudge_bpm_var = tk.StringVar(value="0.010")
+        self.beat_nudge_seconds_var = tk.StringVar(value="0.010")
         self.quantize_cues_var = tk.BooleanVar(value=True)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
@@ -2434,8 +2494,11 @@ class TempoWindow:
         remove_selected = ttk.Button(primary_actions, text="Remove selected", command=self.remove_selected_rows)
         remove_selected.pack(side="left", padx=(8, 0))
 
-        reanalyze_selected = ttk.Button(primary_actions, text="Re-analyze selected", command=self.reanalyze_selected_rows)
-        reanalyze_selected.pack(side="left", padx=(8, 0))
+        analyze_selected = ttk.Button(primary_actions, text="Analyze selected", command=self.reanalyze_selected_rows)
+        analyze_selected.pack(side="left", padx=(8, 0))
+
+        clear_selected = ttk.Button(primary_actions, text="Clear selected", command=self.clear_selected_analysis_data)
+        clear_selected.pack(side="left", padx=(8, 0))
 
         ttk.Label(primary_actions, text="Search").pack(side="left", padx=(12, 4))
         self.search_entry = ttk.Entry(primary_actions, textvariable=self.search_text_var, width=22)
@@ -2564,6 +2627,18 @@ class TempoWindow:
         self.tap_entry = ttk.Entry(tap_frame, textvariable=self.tapped_tempo_var, width=10)
         self.tap_entry.pack(side="left", padx=(6, 0))
         ttk.Label(tap_frame, text="BPM").pack(side="left", padx=(4, 0))
+        ttk.Label(tap_frame, text="Nudge").pack(side="left", padx=(10, 4))
+        ttk.Button(tap_frame, text="-", width=3, command=lambda: self.nudge_selected_tempo(-1)).pack(side="left")
+        ttk.Button(tap_frame, text="+", width=3, command=lambda: self.nudge_selected_tempo(1)).pack(side="left", padx=(2, 0))
+        self.tempo_nudge_entry = ttk.Entry(tap_frame, textvariable=self.tempo_nudge_bpm_var, width=7)
+        self.tempo_nudge_entry.pack(side="left", padx=(4, 0))
+        ttk.Label(tap_frame, text="BPM").pack(side="left", padx=(4, 0))
+        ttk.Label(tap_frame, text="Beat offset").pack(side="left", padx=(10, 4))
+        ttk.Button(tap_frame, text="-", width=3, command=lambda: self.nudge_selected_beat_offset(-1)).pack(side="left")
+        ttk.Button(tap_frame, text="+", width=3, command=lambda: self.nudge_selected_beat_offset(1)).pack(side="left", padx=(2, 0))
+        self.beat_nudge_entry = ttk.Entry(tap_frame, textvariable=self.beat_nudge_seconds_var, width=7)
+        self.beat_nudge_entry.pack(side="left", padx=(4, 0))
+        ttk.Label(tap_frame, text="s").pack(side="left", padx=(4, 0))
         ttk.Label(tap_frame, text="Part start").pack(side="left", padx=(14, 0))
         self.part_start_marker_entry = ttk.Entry(tap_frame, textvariable=self.part_start_marker_var, width=8)
         self.part_start_marker_entry.pack(side="left", padx=(6, 0))
@@ -3051,7 +3126,7 @@ class TempoWindow:
         self.set_export_state("normal")
         self.update_csv_button.configure(state="normal")
         plural = "s" if len(added_rows) != 1 else ""
-        self.result.configure(text=f"Added {len(added_rows)} dropped track{plural}; use Re-analyze selected when ready.")
+        self.result.configure(text=f"Added {len(added_rows)} dropped track{plural}; use Analyze selected when ready.")
         self.start_tag_refresh_for_rows(added_rows)
 
     def start_tag_refresh_for_rows(self, rows: list[AnalysisRow]) -> None:
@@ -3223,13 +3298,76 @@ class TempoWindow:
 
         self.set_export_state("disabled")
         self.update_csv_button.configure(state="disabled")
-        self.result.configure(text=f"Queued {len(new_tasks)} selected tracks for re-analysis")
+        self.result.configure(text=f"Queued {len(new_tasks)} selected tracks for analysis")
 
         if not self.is_analyzing:
             self.is_analyzing = True
             worker = threading.Thread(target=self._analyze_queue_in_background, daemon=True)
             worker.start()
             self.root.after(50, self.process_analysis_results)
+
+    def clear_selected_analysis_data(self) -> None:
+        selected_ids = set(self.table.selection())
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        cleared_count = 0
+        updated_rows = []
+        for row in self.rows:
+            row_id = self.row_id(row)
+            if row_id not in selected_ids:
+                updated_rows.append(row)
+                continue
+
+            updated_rows.append(
+                replace(
+                    row,
+                    bpm=None,
+                    uncertainty_bpm=None,
+                    tempo_agreement_score=None,
+                    tempo_agreement_detail="",
+                    confidence=None,
+                    tapped_bpm=None,
+                    chroma=None,
+                    chroma_similarity=None,
+                    chroma_tempo_similarity=None,
+                    method="",
+                    detail="",
+                    error="",
+                    analyzed_at="",
+                    beat_anchor_seconds=None,
+                    beat_anchor_source="",
+                    base_chroma_bin=None,
+                    user_beat_seconds=(),
+                    cue_points=(),
+                )
+            )
+            cleared_count += 1
+
+        if cleared_count == 0:
+            messagebox.showinfo("Chromatch", "No selected rows were found.")
+            return
+
+        self.rows = updated_rows
+        self.similarity_target_ids.difference_update(selected_ids)
+        for slot in self.waveform_slots:
+            if slot.row_id in selected_ids:
+                current_row = self.row_by_id(slot.row_id)
+                if current_row is not None:
+                    slot.row = current_row
+                    slot.downbeat_seconds = None
+                    slot.downbeat_source = ""
+        self.update_similarity_scores()
+        self.refresh_table()
+        for row_id in selected_ids:
+            if self.table.exists(row_id):
+                self.table.selection_add(row_id)
+        self.draw_all_waveforms()
+        self.set_export_state("normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.current_csv_path and self.rows else "disabled")
+        plural = "" if cleared_count == 1 else "s"
+        self.result.configure(text=f"Cleared analysis data for {cleared_count} selected track{plural}")
 
     def sort_by_column(self, column: str) -> None:
         if self.sort_column == column:
@@ -4780,7 +4918,7 @@ class TempoWindow:
 
         self.suppress_part_marker_update = True
         try:
-            self.tapped_tempo_var.set("" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}")
+            self.tapped_tempo_var.set("" if row.tapped_bpm is None else f"{row.tapped_bpm:.3f}")
             self.part_start_marker_var.set(format_seconds_compact(self.row_part_start(row)))
             slot = self.slot_by_row_id(selected_ids[0])
             end = self.row_part_end(row, None if slot is None else slot.duration)
@@ -6379,7 +6517,7 @@ class TempoWindow:
             return
 
         self.current_tapped_bpm = bpm
-        self.tapped_tempo_var.set(f"{bpm:.2f}")
+        self.tapped_tempo_var.set(f"{bpm:.3f}")
 
     def estimate_tapped_bpm(self) -> float | None:
         if len(self.tap_times) < 2:
@@ -6444,6 +6582,105 @@ class TempoWindow:
         self.update_target_tempo_from_waveforms()
         self.update_similarity_scores()
         self.refresh_table()
+
+    def selected_row_ids(self) -> set[str]:
+        return set(self.table.selection())
+
+    def nudge_selected_tempo(self, direction: int) -> None:
+        step = parse_optional_float(self.tempo_nudge_bpm_var.get())
+        if step is None or step <= 0:
+            messagebox.showinfo("Chromatch", "Enter a positive BPM nudge step first.")
+            return
+
+        selected_ids = self.selected_row_ids()
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        delta = step if direction >= 0 else -step
+        updated_rows = []
+        changed = 0
+        last_tempo = None
+        for row in self.rows:
+            if self.row_id(row) not in selected_ids:
+                updated_rows.append(row)
+                continue
+
+            current_tempo = self.row_tempo_for_matching(row)
+            if current_tempo is None:
+                updated_rows.append(row)
+                continue
+
+            nudged_tempo = max(0.001, current_tempo + delta)
+            updated_rows.append(replace(row, tapped_bpm=round(nudged_tempo, 6)))
+            changed += 1
+            last_tempo = nudged_tempo
+
+        if changed == 0:
+            messagebox.showinfo("Chromatch", "No selected rows have a tempo to nudge.")
+            return
+
+        self.rows = updated_rows
+        if last_tempo is not None:
+            self.current_tapped_bpm = last_tempo
+            if len(selected_ids) == 1:
+                self.tapped_tempo_var.set(f"{last_tempo:.3f}")
+        self.sync_waveform_rows()
+        self.update_target_tempo_from_waveforms()
+        self.update_similarity_scores()
+        self.refresh_table()
+        plural = "" if changed == 1 else "s"
+        self.result.configure(text=f"Nudged tempo for {changed} selected track{plural}")
+
+    def nudge_selected_beat_offset(self, direction: int) -> None:
+        step = parse_optional_float(self.beat_nudge_seconds_var.get())
+        if step is None or step <= 0:
+            messagebox.showinfo("Chromatch", "Enter a positive beat-offset nudge step first.")
+            return
+
+        selected_ids = self.selected_row_ids()
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        delta = step if direction >= 0 else -step
+        updated_rows = []
+        changed = 0
+        for row in self.rows:
+            if self.row_id(row) not in selected_ids:
+                updated_rows.append(row)
+                continue
+
+            if row.beat_anchor_seconds is None and not row.user_beat_seconds:
+                updated_rows.append(row)
+                continue
+
+            nudged_anchor = None
+            if row.beat_anchor_seconds is not None:
+                nudged_anchor = round(max(0.0, row.beat_anchor_seconds + delta), 6)
+            nudged_user_beats = tuple(
+                sorted({round(max(0.0, beat_seconds + delta), 6) for beat_seconds in row.user_beat_seconds})
+            )
+            updated_rows.append(
+                replace(
+                    row,
+                    beat_anchor_seconds=nudged_anchor,
+                    beat_anchor_source="user-nudge" if nudged_anchor is not None else row.beat_anchor_source,
+                    user_beat_seconds=nudged_user_beats,
+                )
+            )
+            changed += 1
+
+        if changed == 0:
+            messagebox.showinfo("Chromatch", "No selected rows have beat markers to nudge.")
+            return
+
+        self.rows = updated_rows
+        self.sync_waveform_rows()
+        self.refresh_table()
+        self.draw_all_zoomed_waveforms()
+        plural = "" if changed == 1 else "s"
+        self.result.configure(text=f"Nudged beat offset for {changed} selected track{plural}")
 
     def confirm_detected_tempo(self) -> None:
         selected_ids = set(self.table.selection())
@@ -6628,7 +6865,6 @@ class TempoWindow:
         replaced_count = 0
         last_processed = 0
         last_remaining = 0
-        last_replaced = False
         updated_row_ids: set[str] = set()
 
         for row, processed, remaining, _task_id in results:
@@ -6641,13 +6877,11 @@ class TempoWindow:
                 existing_row = self.rows[existing_index]
                 self.rows[existing_index] = replace(row, row_uid=existing_row.row_uid)
                 replaced_count += 1
-                last_replaced = True
             else:
                 stored_row = row if row.row_uid is not None else replace(row, row_uid=self.next_row_uid())
                 rows_by_id[row_id] = len(self.rows)
                 self.rows.append(stored_row)
                 any_added = True
-                last_replaced = False
 
         self.rebuild_known_path_ids()
 
@@ -6662,14 +6896,14 @@ class TempoWindow:
                 if row is not None and self.table.exists(row_id):
                     self.table.item(row_id, values=self.row_values(row))
             if len(results) == 1:
-                action = "Re-analyzed" if last_replaced else "Analyzed"
+                action = "Analyzed"
                 self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
             else:
                 added_count = len(results) - replaced_count
                 self.result.configure(
                     text=(
                         f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
-                        f"({replaced_count} re-analyzed, {added_count} analyzed)"
+                        f"({replaced_count} updated, {added_count} new)"
                     )
                 )
             return
@@ -6678,14 +6912,14 @@ class TempoWindow:
             self.update_similarity_scores()
         self.refresh_table()
         if len(results) == 1:
-            action = "Re-analyzed" if last_replaced else "Analyzed"
+            action = "Analyzed"
             self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
         else:
             added_count = len(results) - replaced_count
             self.result.configure(
                 text=(
                     f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
-                    f"({replaced_count} re-analyzed, {added_count} analyzed)"
+                    f"({replaced_count} updated, {added_count} new)"
                 )
             )
         if any_added:
@@ -6867,7 +7101,7 @@ class TempoWindow:
             "tempo_agreement_0_100": "" if row.tempo_agreement_score is None else f"{row.tempo_agreement_score:.0f}",
             "tempo_agreement_detail": row.tempo_agreement_detail,
             "confidence_0_100": "" if row.confidence is None else f"{row.confidence:.0f}",
-            "tapped_tempo_bpm": "" if row.tapped_bpm is None else f"{row.tapped_bpm:.2f}",
+            "tapped_tempo_bpm": "" if row.tapped_bpm is None else f"{row.tapped_bpm:.3f}",
             "part_start_seconds": "" if row.part_start_seconds is None else f"{row.part_start_seconds:.6f}",
             "part_end_seconds": "" if row.part_end_seconds is None else f"{row.part_end_seconds:.6f}",
             "part_index": "" if row.part_index is None else str(row.part_index),

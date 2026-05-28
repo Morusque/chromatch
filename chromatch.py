@@ -135,6 +135,8 @@ EXPORT_MODES = (
     EXPORT_TEMPO_REFERENCE_AUDIT,
     EXPORT_TRAKTOR_NML,
 )
+UNDEFINED_TEMPO_METHOD = "undefined tempo"
+UNDEFINED_BASE_CHROMA_BIN = -1
 @dataclass(frozen=True)
 class TempoEstimate:
     bpm: float
@@ -284,6 +286,14 @@ def fold_bpm(bpm: float) -> float:
     return bpm
 
 
+def fold_tapped_bpm(bpm: float) -> float:
+    while bpm < 40:
+        bpm *= 2
+    while bpm > 260:
+        bpm /= 2
+    return bpm
+
+
 def tapped_tempo_inertia(tap_count: int) -> float:
     if tap_count < 3:
         return 0.0
@@ -309,6 +319,22 @@ def refine_tempo_from_beats(beats: np.ndarray) -> float | None:
         return None
 
     return fold_bpm(60.0 / float(interval_seconds))
+
+
+def refine_tempo_from_taps(taps: np.ndarray) -> float | None:
+    if len(taps) < 3:
+        return None
+
+    tap_indexes = np.arange(len(taps), dtype=float)
+    try:
+        interval_seconds, _offset = np.polyfit(tap_indexes, taps, 1)
+    except Exception:
+        return None
+
+    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
+        return None
+
+    return fold_tapped_bpm(60.0 / float(interval_seconds))
 
 
 def fit_tempo_grid_from_user_beats(
@@ -1170,6 +1196,29 @@ def parse_base_chroma_value(value: str | None) -> int | None:
     if not np.isfinite(parsed):
         return None
     return int(round(parsed)) % CHROMA_BINS
+
+
+def is_base_chroma_undefined_input(value: str | None) -> bool:
+    if value is None:
+        return False
+    stripped = value.strip().lower()
+    if not stripped or stripped.endswith("hz"):
+        return False
+    try:
+        return float(stripped) == 0.0
+    except ValueError:
+        return False
+
+
+def parse_base_chroma_record(value: str | None) -> int | None:
+    if value is None:
+        return None
+    stripped = value.strip().lower()
+    if not stripped:
+        return None
+    if stripped == "undefined":
+        return UNDEFINED_BASE_CHROMA_BIN
+    return parse_optional_int(value)
 
 
 def strongest_chroma_peaks(histogram: np.ndarray, count: int = 3, min_strength: float = 0.05) -> list[int]:
@@ -3093,7 +3142,7 @@ class TempoWindow:
             analyzed_at=record.get("analyzed_at", ""),
             beat_anchor_seconds=parse_optional_float(record.get("beat_anchor_seconds")),
             beat_anchor_source=record.get("beat_anchor_source", ""),
-            base_chroma_bin=parse_optional_int(record.get("base_chroma_bin")),
+            base_chroma_bin=parse_base_chroma_record(record.get("base_chroma_bin")),
             user_beat_seconds=decode_float_tuple(record.get("user_beat_seconds")),
             part_start_seconds=parse_optional_float(record.get("part_start_seconds")),
             part_end_seconds=parse_optional_float(record.get("part_end_seconds")),
@@ -3903,6 +3952,14 @@ class TempoWindow:
         self.rows = updated_rows
         self.sync_waveform_rows()
 
+    def row_base_chroma_for_matching(self, row: AnalysisRow) -> int | None:
+        if self.is_undefined_base_row(row):
+            return None
+        return row.base_chroma_bin
+
+    def is_undefined_base_row(self, row: AnalysisRow) -> bool:
+        return row.base_chroma_bin == UNDEFINED_BASE_CHROMA_BIN
+
     def add_row_user_beat(self, row_id: str, beat_seconds: float) -> None:
         updated_rows = []
         for row in self.rows:
@@ -4091,11 +4148,16 @@ class TempoWindow:
         return max(0.0, min(100.0, similarity * 100.0))
 
     def row_tempo_for_matching(self, row: AnalysisRow) -> float | None:
+        if self.is_undefined_tempo_row(row):
+            return None
         tempo = row.tapped_bpm if row.tapped_bpm is not None else row.bpm
         if tempo is None or tempo <= 0:
             return None
 
         return tempo
+
+    def is_undefined_tempo_row(self, row: AnalysisRow) -> bool:
+        return row.method == UNDEFINED_TEMPO_METHOD
 
     def row_matches_similarity_tempo_gap(
         self,
@@ -4325,7 +4387,9 @@ class TempoWindow:
         return min(distance, CHROMA_BINS - distance)
 
     def shifted_base_distance_bins(self, row: AnalysisRow, target: AnalysisRow) -> float | None:
-        if row.base_chroma_bin is None or target.base_chroma_bin is None:
+        row_base = self.row_base_chroma_for_matching(row)
+        target_base = self.row_base_chroma_for_matching(target)
+        if row_base is None or target_base is None:
             return None
 
         row_tempo = self.row_tempo_for_matching(row)
@@ -4338,8 +4402,8 @@ class TempoWindow:
             return None
 
         pitch_shift_bins = CHROMA_BINS * math.log2(playback_rate)
-        shifted_base = (row.base_chroma_bin + pitch_shift_bins) % CHROMA_BINS
-        return self.cyclic_chroma_distance_bins(shifted_base, target.base_chroma_bin)
+        shifted_base = (row_base + pitch_shift_bins) % CHROMA_BINS
+        return self.cyclic_chroma_distance_bins(shifted_base, target_base)
 
     def base_bpm_distance_for_targets(self, row: AnalysisRow, targets: list[AnalysisRow] | None = None) -> float | None:
         if targets is None:
@@ -4394,9 +4458,12 @@ class TempoWindow:
         return f"{score:.1f}"
 
     def base_text_for_row(self, row: AnalysisRow) -> str:
-        if row.base_chroma_bin is None:
+        if self.is_undefined_base_row(row):
+            return "undefined"
+        base_chroma_bin = self.row_base_chroma_for_matching(row)
+        if base_chroma_bin is None:
             return ""
-        return chroma_bin_label(row.base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
+        return chroma_bin_label(base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
 
     def sort_key(self, row: AnalysisRow, similarity_targets: list[AnalysisRow] | None = None):
         missing_number = float("-inf") if self.sort_descending else float("inf")
@@ -4434,7 +4501,8 @@ class TempoWindow:
         if self.sort_column == "chroma":
             return simple_chroma_peaks(row.chroma).lower()
         if self.sort_column == "base":
-            return row.base_chroma_bin if row.base_chroma_bin is not None else missing_number
+            base_chroma_bin = self.row_base_chroma_for_matching(row)
+            return base_chroma_bin if base_chroma_bin is not None else missing_number
         if self.sort_column == "artist":
             return row.artist.lower()
         if self.sort_column == "title":
@@ -4630,7 +4698,7 @@ class TempoWindow:
             "Artist": row.artist,
             "Title": row.title,
             "Album": row.album,
-            "Tempo": "" if effective_tempo is None else f"{effective_tempo:.2f}",
+            "Tempo": "undefined" if self.is_undefined_tempo_row(row) else "" if effective_tempo is None else f"{effective_tempo:.2f}",
             "Agreement": self.tempo_agreement_text_for_row(row),
             "Similarity": self.similarity_text_for_row(row),
             "Chroma": simple_chroma_peaks(row.chroma),
@@ -4647,7 +4715,9 @@ class TempoWindow:
 
     def row_values(self, row: AnalysisRow) -> tuple[str, ...]:
         effective_tempo = self.row_tempo_for_matching(row)
-        if effective_tempo is None:
+        if self.is_undefined_tempo_row(row):
+            tempo_text = "undefined"
+        elif effective_tempo is None:
             tempo_text = ""
         elif row.tapped_bpm is None:
             tempo_text = f"{effective_tempo:.2f} (A)"
@@ -4680,6 +4750,8 @@ class TempoWindow:
         )
 
     def tempo_agreement_text_for_row(self, row: AnalysisRow) -> str:
+        if self.is_undefined_tempo_row(row):
+            return ""
         if row.tempo_agreement_score is not None:
             return f"{row.tempo_agreement_score:.0f}"
         if row.bpm is not None:
@@ -4992,6 +5064,9 @@ class TempoWindow:
             return
 
         row = self.row_by_id(selected_ids[-1])
+        if row is not None and self.is_undefined_tempo_row(row):
+            self.detected_selected_tempo_var.set("Selected detected: undefined")
+            return
         if row is None or row.bpm is None:
             self.detected_selected_tempo_var.set("Selected detected: -- BPM")
             return
@@ -5022,7 +5097,10 @@ class TempoWindow:
             slot = self.slot_by_row_id(selected_ids[0])
             end = self.row_part_end(row, None if slot is None else slot.duration)
             self.part_end_marker_var.set("" if end is None else format_seconds_compact(end))
-            self.base_chroma_var.set("" if row.base_chroma_bin is None else str(row.base_chroma_bin % CHROMA_BINS))
+            if self.is_undefined_base_row(row):
+                self.base_chroma_var.set("0")
+            else:
+                self.base_chroma_var.set("" if row.base_chroma_bin is None else str(row.base_chroma_bin % CHROMA_BINS))
         finally:
             self.suppress_part_marker_update = False
 
@@ -5530,8 +5608,9 @@ class TempoWindow:
             if note_index in (0, 3, 6, 9):
                 canvas.create_text(x + 2, 2, anchor="nw", text=note, fill="#555555", font=("Segoe UI", 7))
 
-        if slot.row.base_chroma_bin is not None:
-            display_bin = int(round((slot.row.base_chroma_bin + shift_bins) % CHROMA_BINS))
+        base_chroma_bin = self.row_base_chroma_for_matching(slot.row)
+        if base_chroma_bin is not None:
+            display_bin = int(round((base_chroma_bin + shift_bins) % CHROMA_BINS))
             x = display_bin * bar_width
             value = float(histogram[display_bin])
             bar_height = (value / peak) * (height - 12)
@@ -5915,16 +5994,18 @@ class TempoWindow:
 
         raw_value = self.base_chroma_var.get()
         base_chroma_bin = parse_base_chroma_value(raw_value)
-        if raw_value.strip() and base_chroma_bin is None:
+        base_is_undefined = is_base_chroma_undefined_input(raw_value)
+        if raw_value.strip() and base_chroma_bin is None and not base_is_undefined:
             if show_errors:
                 messagebox.showinfo("Chromatch", "Enter a base chroma bin, or a frequency with Hz.")
             return "break"
+        stored_base_chroma_bin = UNDEFINED_BASE_CHROMA_BIN if base_is_undefined else base_chroma_bin
 
         updated_rows = []
         applied = False
         for row in self.rows:
             if self.row_id(row) in selected_ids:
-                updated_rows.append(replace(row, base_chroma_bin=base_chroma_bin))
+                updated_rows.append(replace(row, base_chroma_bin=stored_base_chroma_bin))
                 applied = True
             else:
                 updated_rows.append(row)
@@ -5946,7 +6027,9 @@ class TempoWindow:
         else:
             self.base_chroma_var.set(raw_value)
         self.draw_all_waveforms()
-        if base_chroma_bin is None:
+        if base_is_undefined:
+            self.result.configure(text="Marked base undefined for selected rows.")
+        elif base_chroma_bin is None:
             self.result.configure(text="Cleared base for selected rows.")
         else:
             self.result.configure(text=f"Set base to {base_chroma_bin} for selected rows.")
@@ -6629,8 +6712,8 @@ class TempoWindow:
             return None
 
         median_interval = float(np.median(intervals))
-        regression_bpm = refine_tempo_from_beats(tap_times)
-        median_bpm = fold_bpm(60.0 / median_interval)
+        regression_bpm = refine_tempo_from_taps(tap_times)
+        median_bpm = fold_tapped_bpm(60.0 / median_interval)
         bpm = regression_bpm if regression_bpm is not None else median_bpm
 
         if self.current_tapped_bpm is not None:
@@ -6653,8 +6736,11 @@ class TempoWindow:
 
     def apply_tapped_tempo(self) -> None:
         manual_bpm = parse_optional_float(self.tapped_tempo_var.get())
-        if manual_bpm is None or manual_bpm <= 0:
+        if manual_bpm is None or manual_bpm < 0:
             messagebox.showinfo("Chromatch", "Tap or enter a tempo first.")
+            return
+        if manual_bpm == 0:
+            self.mark_selected_tempo_undefined()
             return
         self.current_tapped_bpm = manual_bpm
 
@@ -6667,7 +6753,14 @@ class TempoWindow:
         applied = False
         for row in self.rows:
             if self.row_id(row) in selected_ids:
-                updated_rows.append(replace(row, tapped_bpm=self.tapped_bpm_for_row(row, manual_bpm)))
+                updated_rows.append(
+                    replace(
+                        row,
+                        tapped_bpm=self.tapped_bpm_for_row(row, manual_bpm),
+                        method="" if self.is_undefined_tempo_row(row) else row.method,
+                        detail="" if self.is_undefined_tempo_row(row) else row.detail,
+                    )
+                )
                 applied = True
             else:
                 updated_rows.append(row)
@@ -6684,6 +6777,56 @@ class TempoWindow:
 
     def selected_row_ids(self) -> set[str]:
         return set(self.table.selection())
+
+    def mark_selected_tempo_undefined(self) -> None:
+        selected_ids = self.selected_row_ids()
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one or more rows first.")
+            return
+
+        updated_rows = []
+        changed = 0
+        for row in self.rows:
+            if self.row_id(row) not in selected_ids:
+                updated_rows.append(row)
+                continue
+
+            updated_rows.append(
+                replace(
+                    row,
+                    bpm=None,
+                    uncertainty_bpm=None,
+                    tempo_agreement_score=None,
+                    tempo_agreement_detail="",
+                    confidence=None,
+                    tapped_bpm=None,
+                    chroma_tempo_similarity=None,
+                    method=UNDEFINED_TEMPO_METHOD,
+                    detail="tempo marked undefined by user",
+                    beat_anchor_seconds=None,
+                    beat_anchor_source="",
+                    user_beat_seconds=(),
+                )
+            )
+            changed += 1
+
+        if changed == 0:
+            messagebox.showinfo("Chromatch", "No selected rows were found.")
+            return
+
+        self.rows = updated_rows
+        self.current_tapped_bpm = None
+        self.tapped_tempo_var.set("")
+        for slot in self.waveform_slots:
+            if slot.row_id in selected_ids:
+                slot.downbeat_seconds = None
+                slot.downbeat_source = ""
+        self.sync_waveform_rows()
+        self.update_target_tempo_from_waveforms()
+        self.update_similarity_scores()
+        self.refresh_table()
+        plural = "" if changed == 1 else "s"
+        self.result.configure(text=f"Marked tempo undefined for {changed} selected track{plural}")
 
     def nudge_selected_tempo(self, direction: int) -> None:
         step = parse_optional_float(self.tempo_nudge_bpm_var.get())
@@ -6711,7 +6854,14 @@ class TempoWindow:
                 continue
 
             nudged_tempo = max(0.001, current_tempo + delta)
-            updated_rows.append(replace(row, tapped_bpm=round(nudged_tempo, 6)))
+            updated_rows.append(
+                replace(
+                    row,
+                    tapped_bpm=round(nudged_tempo, 6),
+                    method="" if self.is_undefined_tempo_row(row) else row.method,
+                    detail="" if self.is_undefined_tempo_row(row) else row.detail,
+                )
+            )
             changed += 1
             last_tempo = nudged_tempo
 
@@ -6791,7 +6941,14 @@ class TempoWindow:
         applied = False
         for row in self.rows:
             if self.row_id(row) in selected_ids and row.bpm is not None:
-                updated_rows.append(replace(row, tapped_bpm=row.bpm))
+                updated_rows.append(
+                    replace(
+                        row,
+                        tapped_bpm=row.bpm,
+                        method="" if self.is_undefined_tempo_row(row) else row.method,
+                        detail="" if self.is_undefined_tempo_row(row) else row.detail,
+                    )
+                )
                 applied = True
             else:
                 updated_rows.append(row)
@@ -7211,7 +7368,13 @@ class TempoWindow:
             "part_index": "" if row.part_index is None else str(row.part_index),
             "beat_anchor_seconds": "" if row.beat_anchor_seconds is None else f"{row.beat_anchor_seconds:.6f}",
             "beat_anchor_source": row.beat_anchor_source,
-            "base_chroma_bin": "" if row.base_chroma_bin is None else str(row.base_chroma_bin),
+            "base_chroma_bin": (
+                ""
+                if row.base_chroma_bin is None
+                else "undefined"
+                if self.is_undefined_base_row(row)
+                else str(row.base_chroma_bin)
+            ),
             "user_beat_seconds": encode_float_tuple(row.user_beat_seconds),
             "cue_points_json": encode_cue_points(row.cue_points),
             "analyzed_at": row.analyzed_at,
@@ -7315,9 +7478,10 @@ class TempoWindow:
         return volume, directory, absolute.name
 
     def traktor_key_text_for_row(self, row: AnalysisRow) -> str:
-        if row.base_chroma_bin is None:
+        base_chroma_bin = self.row_base_chroma_for_matching(row)
+        if base_chroma_bin is None:
             return ""
-        return chroma_bin_label(row.base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
+        return chroma_bin_label(base_chroma_bin % CHROMA_BINS, CHROMA_BINS)
 
     def traktor_hotcue_element(
         self,
@@ -7565,7 +7729,9 @@ class TempoWindow:
         details = []
         if tempo is not None:
             details.append(f"{tempo:.2f} BPM")
-        if row.base_chroma_bin is not None:
+        if self.is_undefined_base_row(row):
+            details.append("base undefined")
+        elif row.base_chroma_bin is not None:
             details.append(f"base {row.base_chroma_bin}")
         return title if not details else f"{title}\\n{', '.join(details)}"
 
@@ -7579,7 +7745,9 @@ class TempoWindow:
         tempo = self.row_tempo_for_matching(row)
         if tempo is not None:
             details.append(f"{tempo:.2f} BPM")
-        if row.base_chroma_bin is not None:
+        if self.is_undefined_base_row(row):
+            details.append("base undefined")
+        elif row.base_chroma_bin is not None:
             details.append(f"base {self.base_text_for_row(row)}")
         return "\\n".join(details)
 
@@ -7841,8 +8009,9 @@ class TempoWindow:
         self.result.configure(text=f"Exported SVG graph: {Path(filename).name}")
 
     def map_base_bin_for_row(self, row: AnalysisRow) -> float | None:
-        if row.base_chroma_bin is not None:
-            return float(row.base_chroma_bin % CHROMA_BINS)
+        base_chroma_bin = self.row_base_chroma_for_matching(row)
+        if base_chroma_bin is not None:
+            return float(base_chroma_bin % CHROMA_BINS)
         if row.chroma is not None:
             return float(np.argmax(row.chroma.histogram))
         return None
@@ -7991,12 +8160,13 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
         for row in training_rows:
             if exclude_row_id is not None and self.row_id(row) == exclude_row_id:
                 continue
-            if row.base_chroma_bin is None:
+            base_chroma_bin = self.row_base_chroma_for_matching(row)
+            if base_chroma_bin is None:
                 continue
             histogram = self.normalized_chroma_histogram(row)
             if histogram is None:
                 continue
-            aligned_histograms.append(np.roll(histogram, -int(row.base_chroma_bin % CHROMA_BINS)))
+            aligned_histograms.append(np.roll(histogram, -int(base_chroma_bin % CHROMA_BINS)))
         if not aligned_histograms:
             return None
         profile = np.mean(np.vstack(aligned_histograms), axis=0)
@@ -8012,12 +8182,13 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             training_rows = self.rows
         priors = np.zeros(CHROMA_BINS, dtype=np.float64)
         for row in training_rows:
-            if row.base_chroma_bin is None or row.chroma is None:
+            base_chroma_bin = self.row_base_chroma_for_matching(row)
+            if base_chroma_bin is None or row.chroma is None:
                 continue
             peaks = self.chroma_peak_bins_for_row(row, peak_count)
             if not peaks:
                 continue
-            base_bin = row.base_chroma_bin % CHROMA_BINS
+            base_bin = base_chroma_bin % CHROMA_BINS
             max_value = float(max(row.chroma.histogram[peak] for peak in peaks)) or 1.0
             for rank, peak in enumerate(peaks):
                 offset = int((base_bin - peak) % CHROMA_BINS)
@@ -8081,7 +8252,9 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
     ) -> dict[str, str]:
         peak_bins = self.chroma_peak_bins_for_row(row)
         top_bin = peak_bins[0] if peak_bins else None
-        reviewed_base = row.base_chroma_bin % CHROMA_BINS if row.base_chroma_bin is not None else None
+        reviewed_base_value = self.row_base_chroma_for_matching(row)
+        reviewed_base = reviewed_base_value % CHROMA_BINS if reviewed_base_value is not None else None
+        reviewed_base_undefined = self.is_undefined_base_row(row)
         nearest_distance = self.nearest_chroma_peak_distance(reviewed_base, peak_bins)
         strongest_distance = (
             None
@@ -8104,8 +8277,8 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             "title": row.title,
             "part": self.row_part_label(row),
             "tempo_bpm": "" if self.row_tempo_for_matching(row) is None else f"{self.row_tempo_for_matching(row):.2f}",
-            "reviewed_base_bin": "" if reviewed_base is None else str(reviewed_base),
-            "reviewed_base": "" if reviewed_base is None else chroma_bin_label(reviewed_base, CHROMA_BINS),
+            "reviewed_base_bin": "undefined" if reviewed_base_undefined else "" if reviewed_base is None else str(reviewed_base),
+            "reviewed_base": "undefined" if reviewed_base_undefined else "" if reviewed_base is None else chroma_bin_label(reviewed_base, CHROMA_BINS),
             "detected_base_bin": "" if detected_bin is None else str(detected_bin),
             "detected_base": "" if detected_bin is None else chroma_bin_label(detected_bin, CHROMA_BINS),
             "detected_base_confidence": "" if detected_confidence is None else f"{detected_confidence:.3f}",
@@ -8230,7 +8403,7 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             if anchor_bpm is not None:
                 anchor_error = beat_phase_distance_seconds(anchor_seconds, manual_anchor, anchor_bpm)
 
-        base_bin = row.base_chroma_bin
+        base_bin = self.row_base_chroma_for_matching(row)
         return {
             "filename": row.path.name,
             "filepath": str(row.path),

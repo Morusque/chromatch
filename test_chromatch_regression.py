@@ -75,6 +75,8 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(42, chromatch.parse_base_chroma_value("42"))
         self.assertEqual(180, chromatch.parse_base_chroma_value("440 Hz"))
         self.assertIsNone(chromatch.parse_base_chroma_value("not a base"))
+        self.assertTrue(chromatch.is_base_chroma_undefined_input("0"))
+        self.assertFalse(chromatch.is_base_chroma_undefined_input("0 Hz"))
 
     def test_refine_tempo_from_beats_recovers_non_quantized_tempo(self):
         expected_bpm = 127.37
@@ -552,6 +554,61 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.nudge_selected_tempo(-1)
 
         self.assertAlmostEqual(120.0, self.app.rows[0].tapped_bpm)
+
+    def test_applying_zero_tempo_marks_selected_tempo_undefined(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=120.0),
+            uncertainty_bpm=1.0,
+            tempo_agreement_score=90.0,
+            tempo_agreement_detail="detail",
+            confidence=95.0,
+            tapped_bpm=121.0,
+            chroma_tempo_similarity=75.0,
+            beat_anchor_seconds=0.5,
+            beat_anchor_source="automatic",
+            user_beat_seconds=(0.5, 1.0),
+        )
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, downbeat_seconds=0.5)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.current_tapped_bpm = 121.0
+        self.app.tapped_tempo_var.set("121.000")
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.tapped_tempo_var.set("0")
+
+        self.app.apply_tapped_tempo()
+
+        updated = self.app.rows[0]
+        self.assertIsNone(updated.bpm)
+        self.assertIsNone(updated.tapped_bpm)
+        self.assertIsNone(updated.uncertainty_bpm)
+        self.assertIsNone(updated.tempo_agreement_score)
+        self.assertEqual("", updated.tempo_agreement_detail)
+        self.assertIsNone(updated.confidence)
+        self.assertIsNone(updated.chroma_tempo_similarity)
+        self.assertEqual(chromatch.UNDEFINED_TEMPO_METHOD, updated.method)
+        self.assertIsNone(updated.beat_anchor_seconds)
+        self.assertEqual("", updated.beat_anchor_source)
+        self.assertEqual((), updated.user_beat_seconds)
+        self.assertEqual("undefined", self.app.row_values(updated)[4])
+        self.assertEqual("", self.app.tapped_tempo_var.get())
+        self.assertIsNone(slot.downbeat_seconds)
+
+    def test_applying_tapped_tempo_clears_undefined_tempo_marker(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=None), method=chromatch.UNDEFINED_TEMPO_METHOD)
+        row_id = self.app.row_id(row)
+        self.app.rows = [row]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.tapped_tempo_var.set("120")
+
+        self.app.apply_tapped_tempo()
+
+        self.assertEqual(120.0, self.app.rows[0].tapped_bpm)
+        self.assertEqual("", self.app.rows[0].method)
+        self.assertEqual("120.00", self.app.row_values(self.app.rows[0])[4])
 
     def test_beat_offset_nudge_shifts_anchor_and_manual_beats(self):
         selected = chromatch.replace(
@@ -1195,6 +1252,15 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual("n/a", values[6])
 
+    def test_row_values_show_undefined_for_user_marked_tempo(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=None), method=chromatch.UNDEFINED_TEMPO_METHOD)
+
+        values = self.app.row_values(row)
+
+        self.assertEqual("undefined", values[4])
+        self.assertEqual("", values[6])
+        self.assertIsNone(self.app.row_tempo_for_matching(row))
+
     def test_tempo_audit_record_compares_automatic_to_manual_tempo_and_anchor(self):
         row = chromatch.replace(
             self.make_row("track.wav", bpm=119.5),
@@ -1640,6 +1706,21 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual((0.5, 1.0), row.user_beat_seconds)
         self.assertEqual(10.0, row.part_start_seconds)
         self.assertEqual(20.0, row.part_end_seconds)
+
+    def test_csv_roundtrip_preserves_undefined_base(self):
+        row = chromatch.replace(self.make_row("track.wav"), base_chroma_bin=chromatch.UNDEFINED_BASE_CHROMA_BIN)
+
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "analysis.csv"
+            self.app.rows = [row]
+            self.app.write_csv_path(path)
+            with path.open(encoding="utf-8") as csv_file:
+                record = next(chromatch.csv.DictReader(csv_file))
+                loaded = self.app.row_from_csv_record(record, path.parent)
+
+        self.assertEqual("undefined", record["base_chroma_bin"])
+        self.assertEqual(chromatch.UNDEFINED_BASE_CHROMA_BIN, loaded.base_chroma_bin)
+        self.assertEqual("undefined", self.app.base_text_for_row(loaded))
 
     def test_update_csv_writes_to_current_loaded_path(self):
         row = self.make_row("track.wav", bpm=123.45)
@@ -3220,6 +3301,37 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertIsNone(self.app.rows[0].base_chroma_bin)
         self.assertIsNone(slot.row.base_chroma_bin)
 
+    def test_apply_selected_base_chroma_zero_marks_base_undefined(self):
+        row = chromatch.replace(self.make_chroma_row("track.wav", 120, 80), base_chroma_bin=42)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.base_chroma_var.set("0")
+
+        self.app.apply_selected_base_chroma()
+
+        self.assertEqual(chromatch.UNDEFINED_BASE_CHROMA_BIN, self.app.rows[0].base_chroma_bin)
+        self.assertEqual(chromatch.UNDEFINED_BASE_CHROMA_BIN, slot.row.base_chroma_bin)
+        self.assertEqual("undefined", self.app.row_values(self.app.rows[0])[9])
+        self.assertIsNone(self.app.row_base_chroma_for_matching(self.app.rows[0]))
+
+    def test_clicking_chroma_can_still_set_real_zero_base_bin(self):
+        row = self.make_chroma_row("track.wav", 120, 80)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        slot.chroma_canvas = chromatch.tk.Canvas(self.app.root, width=240, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.play_chroma_preview = lambda _chroma_bin: None
+
+        self.app.set_base_chroma_from_click(slot, 0)
+
+        self.assertEqual(0, self.app.rows[0].base_chroma_bin)
+        self.assertEqual("C", self.app.base_text_for_row(self.app.rows[0]))
+
     def test_chroma_click_preview_uses_pitch_shifted_display_bin(self):
         row = self.make_chroma_row("track.wav", 100, 80)
         row_id = self.app.row_id(row)
@@ -3770,6 +3882,15 @@ class ChromatchRegressionTests(unittest.TestCase):
         bpm = self.app.estimate_tapped_bpm()
 
         self.assertAlmostEqual(117.0, bpm, places=2)
+
+    def test_tap_tempo_estimate_keeps_slow_manual_tempo(self):
+        interval = 60.0 / 70.0
+        self.app.tap_times = [index * interval for index in range(8)]
+        self.app.current_tapped_bpm = None
+
+        bpm = self.app.estimate_tapped_bpm()
+
+        self.assertAlmostEqual(70.0, bpm, places=2)
 
     def test_similarity_target_marker_persists_after_selection_changes(self):
         first = self.make_chroma_row("first.wav", 120, 0)

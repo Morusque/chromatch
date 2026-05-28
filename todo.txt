@@ -2,9 +2,7 @@
 to review :
 
 next tasks :
-- transient detection isn't ideally calibrated, it should ideally detect mostly places where beats can be placed (and a bit more if syncopeous sounds)
-- option to keep absolute and/or relative url of files
-- option to relink track with file
+- transient detection isn't ideally calibrated, it should ideally detect mostly places where beats can be placed (and a bit more if syncopeous sounds), also transients are very often detected a fixed fraction of a second too late and I'm not sure why
 - option to say "undefined tempo" when the track has none
 - tapping tempo is sometimes just plain wrong (eg detects about twice the tapped tempo)
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other

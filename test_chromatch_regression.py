@@ -1711,6 +1711,70 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), loaded.cue_points)
 
+    def test_csv_writer_keeps_absolute_and_relative_filepaths(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            audio_path = base / "music" / "track.wav"
+            row = self.make_row(audio_path)
+            path = base / "analysis.csv"
+            self.app.rows = [row]
+
+            self.app.write_csv_path(path)
+
+            with path.open(encoding="utf-8") as csv_file:
+                record = next(chromatch.csv.DictReader(csv_file))
+
+        self.assertEqual(str(audio_path), record["filepath"])
+        self.assertEqual(str(audio_path), record["absolute_filepath"])
+        self.assertEqual(str(Path("music") / "track.wav"), record["relative_filepath"])
+
+    def test_csv_loader_uses_relative_filepath_when_filepath_missing(self):
+        row = self.app.row_from_csv_record(
+            {
+                "relative_filepath": str(Path("music") / "track.wav"),
+            },
+            Path("library"),
+        )
+
+        self.assertEqual(Path("library") / "music" / "track.wav", row.path)
+
+    def test_csv_loader_uses_existing_relative_filepath_when_absolute_is_missing(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            audio_path = base / "music" / "track.wav"
+            audio_path.parent.mkdir()
+            audio_path.write_bytes(b"")
+
+            row = self.app.row_from_csv_record(
+                {
+                    "filepath": str(base / "missing.wav"),
+                    "absolute_filepath": str(base / "also-missing.wav"),
+                    "relative_filepath": str(Path("music") / "track.wav"),
+                },
+                base,
+            )
+
+        self.assertEqual(audio_path, row.path)
+
+    def test_csv_loader_prefers_existing_filepath(self):
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            preferred_path = base / "preferred.wav"
+            fallback_path = base / "fallback.wav"
+            preferred_path.write_bytes(b"")
+            fallback_path.write_bytes(b"")
+
+            row = self.app.row_from_csv_record(
+                {
+                    "filepath": str(preferred_path),
+                    "absolute_filepath": str(fallback_path),
+                    "relative_filepath": fallback_path.name,
+                },
+                base,
+            )
+
+        self.assertEqual(preferred_path, row.path)
+
     def test_capture_native_stderr_catches_fd_writes(self):
         def callback():
             chromatch.os.write(2, b"Note: Illegal Audio-MPEG-Header\\n")
@@ -3757,6 +3821,62 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.remove_selected_rows()
 
         self.assertEqual(set(), self.app.similarity_target_ids)
+
+    def test_relink_row_updates_path_and_preserves_analysis_metadata(self):
+        row = chromatch.replace(
+            self.make_row("old.wav", bpm=123.0),
+            row_uid=7,
+            artist="Artist",
+            title="Title",
+            tapped_bpm=124.0,
+            user_beat_seconds=(0.5,),
+        )
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+        self.app.similarity_target_ids = {row_id}
+        self.app.current_part_ids_by_group = {self.app.row_part_group_key(row): row_id}
+        self.app.refresh_table()
+        self.app.table.selection_set(row_id)
+        self.app.handle_table_selection = lambda: None
+
+        result = self.app.relink_row_to_path(row_id, Path("new.wav"))
+
+        updated = self.app.rows[0]
+        updated_id = self.app.row_id(updated)
+        self.assertTrue(result)
+        self.assertEqual(Path("new.wav"), updated.path)
+        self.assertEqual(7, updated.row_uid)
+        self.assertEqual("Artist", updated.artist)
+        self.assertEqual("Title", updated.title)
+        self.assertEqual(123.0, updated.bpm)
+        self.assertEqual(124.0, updated.tapped_bpm)
+        self.assertEqual((0.5,), updated.user_beat_seconds)
+        self.assertEqual({updated_id}, self.app.similarity_target_ids)
+        self.assertIn(chromatch.canonical_path_id(Path("new.wav")), self.app.known_path_ids)
+        self.assertNotIn(slot, self.app.waveform_slots)
+        self.assertEqual((updated_id,), self.app.table.selection())
+
+    def test_relink_row_rejects_duplicate_target_row_id(self):
+        first = self.make_row("first.wav")
+        second = self.make_row("second.wav")
+        first_id = self.app.row_id(first)
+        self.app.rows = [first, second]
+        self.app.refresh_table()
+        messages = []
+        original_showinfo = chromatch.messagebox.showinfo
+        chromatch.messagebox.showinfo = lambda title, message: messages.append((title, message))
+
+        try:
+            result = self.app.relink_row_to_path(first_id, Path("second.wav"))
+        finally:
+            chromatch.messagebox.showinfo = original_showinfo
+
+        self.assertFalse(result)
+        self.assertTrue(messages)
+        self.assertEqual(Path("first.wav"), self.app.rows[0].path)
+        self.assertEqual(Path("second.wav"), self.app.rows[1].path)
 
     def test_reanalyze_selected_rows_queues_existing_paths(self):
         row = self.make_row("first.wav")

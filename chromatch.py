@@ -135,8 +135,6 @@ EXPORT_MODES = (
     EXPORT_TEMPO_REFERENCE_AUDIT,
     EXPORT_TRAKTOR_NML,
 )
-
-
 @dataclass(frozen=True)
 class TempoEstimate:
     bpm: float
@@ -2364,6 +2362,44 @@ def canonical_path_id(path: Path) -> str:
     return os.path.normcase(str(path if path.is_absolute() else Path.cwd() / path))
 
 
+def absolute_path_text(path: Path) -> str:
+    return str(path if path.is_absolute() else Path.cwd() / path)
+
+
+def relative_path_text(path: Path, base_folder: Path) -> str:
+    absolute = Path(absolute_path_text(path))
+    base = base_folder if base_folder.is_absolute() else Path.cwd() / base_folder
+    try:
+        return os.path.relpath(absolute, base)
+    except ValueError:
+        return str(absolute)
+
+
+def data_file_path_candidate(value: str | None, data_folder: Path) -> Path | None:
+    if not value:
+        return None
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    return data_folder / path
+
+
+def resolve_data_file_audio_path(record: dict[str, str], data_folder: Path) -> Path:
+    candidates = [
+        data_file_path_candidate(record.get("filepath"), data_folder),
+        data_file_path_candidate(record.get("absolute_filepath"), data_folder),
+        data_file_path_candidate(record.get("relative_filepath"), data_folder),
+        data_file_path_candidate(record.get("path"), data_folder),
+        data_file_path_candidate(record.get("filename"), data_folder),
+    ]
+    candidates = [candidate for candidate in candidates if candidate is not None]
+    unique_candidates = list(dict.fromkeys(candidates))
+    for candidate in unique_candidates:
+        if candidate.exists():
+            return candidate
+    return unique_candidates[0] if unique_candidates else data_folder / "unknown"
+
+
 class TempoWindow:
     def __init__(self) -> None:
         self.root = TkinterDnD.Tk()
@@ -2493,6 +2529,9 @@ class TempoWindow:
 
         remove_selected = ttk.Button(primary_actions, text="Remove selected", command=self.remove_selected_rows)
         remove_selected.pack(side="left", padx=(8, 0))
+
+        relink_selected = ttk.Button(primary_actions, text="Relink selected", command=self.relink_selected_row)
+        relink_selected.pack(side="left", padx=(8, 0))
 
         analyze_selected = ttk.Button(primary_actions, text="Analyze selected", command=self.reanalyze_selected_rows)
         analyze_selected.pack(side="left", padx=(8, 0))
@@ -3002,10 +3041,7 @@ class TempoWindow:
         csv_folder: Path,
         refresh_missing_tags: bool = False,
     ) -> AnalysisRow:
-        filepath = record.get("filepath") or record.get("path") or record.get("filename") or "unknown"
-        path = Path(filepath)
-        if not path.is_absolute():
-            path = csv_folder / path
+        path = resolve_data_file_audio_path(record, csv_folder)
 
         compact_note_values = decode_array(record.get("chroma_note_values"))
         compact_bin_values = decode_array(record.get("chroma_histogram"))
@@ -3238,6 +3274,69 @@ class TempoWindow:
         self.set_export_state("normal" if self.rows else "disabled")
         self.update_csv_button.configure(state="normal" if self.rows else "disabled")
         self.result.configure(text=f"Removed {len(selected_ids)} tracks")
+
+    def relink_selected_row(self) -> None:
+        selected_ids = list(self.table.selection())
+        if len(selected_ids) != 1:
+            messagebox.showinfo("Chromatch", "Select exactly one row to relink.")
+            return
+
+        filename = filedialog.askopenfilename(filetypes=SUPPORTED_AUDIO_TYPES)
+        if not filename:
+            return
+
+        self.relink_row_to_path(selected_ids[0], Path(filename))
+
+    def relink_row_to_path(self, row_id: str, new_path: Path) -> bool:
+        target_index = None
+        target_row = None
+        for index, row in enumerate(self.rows):
+            if self.row_id(row) == row_id:
+                target_index = index
+                target_row = row
+                break
+
+        if target_index is None or target_row is None:
+            messagebox.showinfo("Chromatch", "No selected row was found.")
+            return False
+
+        updated_row = replace(target_row, path=new_path)
+        updated_id = self.row_id(updated_row)
+        existing_ids = {
+            self.row_id(row)
+            for index, row in enumerate(self.rows)
+            if index != target_index
+        }
+        if updated_id in existing_ids:
+            messagebox.showinfo("Chromatch", "Another row is already linked to that file and part.")
+            return False
+
+        old_group_key = self.row_part_group_key(target_row)
+        self.rows[target_index] = updated_row
+        self.rebuild_known_path_ids()
+        if row_id in self.similarity_target_ids:
+            self.similarity_target_ids.remove(row_id)
+            self.similarity_target_ids.add(updated_id)
+        if self.current_part_ids_by_group.get(old_group_key) == row_id:
+            self.current_part_ids_by_group.pop(old_group_key, None)
+            self.current_part_ids_by_group[self.row_part_group_key(updated_row)] = updated_id
+
+        for slot in list(self.waveform_slots):
+            if slot.row_id == row_id:
+                self.stop_waveform(slot)
+        with self.mixer_lock:
+            self.waveform_slots = [slot for slot in self.waveform_slots if slot.row_id != row_id]
+
+        self.update_similarity_scores()
+        self.refresh_table()
+        if self.table.exists(updated_id):
+            self.table.selection_set(updated_id)
+            self.table.see(updated_id)
+        self.handle_table_selection()
+        self.set_export_state("normal" if self.rows else "disabled")
+        self.update_csv_button.configure(state="normal" if self.current_csv_path and self.rows else "disabled")
+        self.result.configure(text=f"Relinked {target_row.path.name} to {new_path.name}")
+        return True
 
     def start_analysis(self, paths: list[Path]) -> None:
         audio_files = collect_audio_files(paths)
@@ -7088,10 +7187,15 @@ class TempoWindow:
 
         self.result.configure(text=f"Updated data: {self.current_csv_path.name}")
 
-    def row_export_record(self, row: AnalysisRow) -> dict[str, str]:
+    def row_export_record(self, row: AnalysisRow, data_folder: Path | None = None) -> dict[str, str]:
+        absolute_filepath = absolute_path_text(row.path)
+        relative_filepath = "" if data_folder is None else relative_path_text(row.path, data_folder)
+
         return {
             "row_uid": "" if row.row_uid is None else str(row.row_uid),
-            "filepath": str(row.path),
+            "filepath": absolute_filepath,
+            "absolute_filepath": absolute_filepath,
+            "relative_filepath": relative_filepath,
             "filename": row.path.name,
             "artist": row.artist,
             "title": row.title,
@@ -7128,6 +7232,8 @@ class TempoWindow:
         fieldnames = [
             "row_uid",
             "filepath",
+            "absolute_filepath",
+            "relative_filepath",
             "filename",
             "artist",
             "title",
@@ -7161,7 +7267,7 @@ class TempoWindow:
             writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
             writer.writeheader()
             for row in export_rows:
-                writer.writerow(self.row_export_record(row))
+                writer.writerow(self.row_export_record(row, path.parent))
         if write_sidecar:
             self.write_matches_path(matches_sidecar_path(path), export_rows)
 
@@ -7185,7 +7291,7 @@ class TempoWindow:
         payload = {
             "format": "chromatch-analysis",
             "version": 1,
-            "rows": [self.row_export_record(row) for row in export_rows],
+            "rows": [self.row_export_record(row, path.parent) for row in export_rows],
             "matches": [
                 {"a": first_uid, "b": second_uid, "score": score}
                 for (first_uid, second_uid), score in sorted(self.match_links.items())

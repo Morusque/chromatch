@@ -76,6 +76,7 @@ PLAYBACK_TRACK_GAIN = 0.45
 METRONOME_CLICK_GAIN = 0.22
 CHROMA_PREVIEW_GAIN = 0.18
 CHROMA_PREVIEW_SECONDS = 0.45
+BEAT_SYNC_DRIFT_THRESHOLD_BEATS = 0.025
 SIMILARITY_CHROMA = "Chroma"
 SIMILARITY_CHROMA_TEMPO = "Chroma/tempo"
 SIMILARITY_BASE_BPM = "Base/BPM + chroma"
@@ -6443,6 +6444,86 @@ class TempoWindow:
 
         return float((self.metronome_position_samples % samples_per_beat) / samples_per_beat)
 
+    def slot_current_beat_phase(self, slot: WaveformSlot) -> float | None:
+        beat_seconds = self.slot_beat_seconds(slot)
+        if beat_seconds is None or beat_seconds <= 0 or slot.duration <= 0:
+            return None
+
+        current_seconds = slot.playhead * slot.duration
+        grid = self.slot_resync_grid(slot, current_seconds)
+        if grid is None:
+            return None
+        anchor, beat_seconds = grid
+        if beat_seconds <= 0:
+            return None
+        return float(((current_seconds - anchor) / beat_seconds) % 1.0)
+
+    def set_metronome_phase_from_playing_slot_locked(self) -> bool:
+        tempo = self.effective_playback_target_tempo()
+        if tempo is None or tempo <= 0:
+            return False
+
+        samples_per_beat = self.mixer_sample_rate * 60.0 / tempo
+        if samples_per_beat <= 0:
+            return False
+
+        for slot in self.waveform_slots:
+            if not slot.is_playing:
+                continue
+            phase = self.slot_current_beat_phase(slot)
+            if phase is None:
+                continue
+            self.metronome_position_samples = phase * samples_per_beat
+            return True
+        return False
+
+    def beat_phase_delta(self, source_phase: float, target_phase: float) -> float:
+        return ((target_phase - source_phase + 0.5) % 1.0) - 0.5
+
+    def sync_metronome_phase_to_playing_slots_locked(self) -> bool:
+        if not self.beat_sync_enabled:
+            return False
+
+        tempo = self.effective_playback_target_tempo()
+        if tempo is None or tempo <= 0:
+            return False
+
+        samples_per_beat = self.mixer_sample_rate * 60.0 / tempo
+        if samples_per_beat <= 0:
+            return False
+
+        master_phase = self.metronome_beat_phase()
+        for slot in self.waveform_slots:
+            if not slot.is_playing:
+                continue
+            slot_phase = self.slot_current_beat_phase(slot)
+            if slot_phase is None:
+                continue
+            delta = self.beat_phase_delta(master_phase, slot_phase)
+            if abs(delta) >= BEAT_SYNC_DRIFT_THRESHOLD_BEATS:
+                self.metronome_position_samples = (slot_phase % 1.0) * samples_per_beat
+                return True
+            return False
+        return False
+
+    def keep_synced_playing_slots_on_master_phase_locked(self) -> bool:
+        if not self.beat_sync_enabled:
+            return False
+
+        corrected = False
+        master_phase = self.metronome_beat_phase()
+        for slot in self.waveform_slots:
+            if not slot.is_playing or slot.stinger_remaining_samples is not None:
+                continue
+            slot_phase = self.slot_current_beat_phase(slot)
+            if slot_phase is None:
+                continue
+            if abs(self.beat_phase_delta(master_phase, slot_phase)) < BEAT_SYNC_DRIFT_THRESHOLD_BEATS:
+                continue
+            self.sync_slot_to_master_beat(slot)
+            corrected = True
+        return corrected
+
     def synced_source_seconds_for_slot(self, slot: WaveformSlot, current_seconds: float) -> float:
         beat_seconds = self.slot_beat_seconds(slot)
         if beat_seconds is None or slot.duration <= 0:
@@ -6601,7 +6682,8 @@ class TempoWindow:
         with self.mixer_lock:
             self.metronome_enabled = True
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
-            self.metronome_position_samples = 0.0
+            if not (self.beat_sync_enabled and self.set_metronome_phase_from_playing_slot_locked()):
+                self.metronome_position_samples = 0.0
         self.ensure_mixer_stream()
         self.ensure_waveform_update_loop()
 
@@ -6730,6 +6812,12 @@ class TempoWindow:
             advance_tempo_glide = getattr(self, "advance_playback_tempo_glide_locked", None)
             if advance_tempo_glide is not None:
                 advance_tempo_glide(frames)
+            sync_metronome_phase = getattr(self, "sync_metronome_phase_to_playing_slots_locked", None)
+            if sync_metronome_phase is not None:
+                sync_metronome_phase()
+            keep_synced_slots = getattr(self, "keep_synced_playing_slots_on_master_phase_locked", None)
+            if keep_synced_slots is not None:
+                keep_synced_slots()
             slots = list(self.waveform_slots)
             for slot in slots:
                 if not slot.is_playing or slot.audio is None:

@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 import tempfile
 import xml.etree.ElementTree as ET
 import re
@@ -3515,6 +3516,95 @@ class ChromatchRegressionTests(unittest.TestCase):
         beat_seconds = 60.0 / 120.0
         self.assertAlmostEqual(0.25, (slot.playhead * slot.duration % beat_seconds) / beat_seconds)
         self.assertAlmostEqual(slot.playhead * len(slot.audio), slot.position_samples)
+
+    def test_enabling_metronome_keeps_playing_synced_track_phase(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5125,
+            duration=10.0,
+            is_playing=True,
+            audio=np.zeros((441_000, 2), dtype=np.float32),
+            sample_rate=44_100,
+        )
+        self.app.waveform_slots = [slot]
+        self.app.beat_sync_enabled_var.set(True)
+        self.app.metronome_enabled_var.set(True)
+        self.app.target_tempo_var.set("120")
+
+        with mock.patch.object(self.app, "ensure_sounddevice_available", return_value=True), mock.patch.object(
+            self.app, "ensure_mixer_stream"
+        ), mock.patch.object(self.app, "ensure_waveform_update_loop"):
+            self.app.toggle_metronome()
+
+        beat_seconds = 60.0 / 120.0
+        track_phase = (slot.playhead * slot.duration % beat_seconds) / beat_seconds
+        metronome_phase = self.app.metronome_beat_phase()
+        self.assertAlmostEqual(track_phase, metronome_phase)
+
+    def test_mixer_regularly_corrects_metronome_drift_to_synced_track(self):
+        row = self.make_row(bpm=120)
+        slot = chromatch.WaveformSlot(
+            row_id="track",
+            row=row,
+            playhead=0.5125,
+            duration=10.0,
+            is_playing=True,
+            audio=np.zeros((441_000, 2), dtype=np.float32),
+            sample_rate=44_100,
+        )
+        self.app.waveform_slots = [slot]
+        self.app.beat_sync_enabled = True
+        self.app.metronome_enabled = True
+        self.app.playback_target_tempo = 120.0
+        self.app.playback_effective_target_tempo = 120.0
+        self.app.metronome_position_samples = 0.0
+        slot.position_samples = self.app.slot_position_samples_for_playhead(slot)
+        outdata = np.zeros((1, 2), dtype=np.float32)
+
+        self.app.mixer_callback(outdata, 1, None, None)
+
+        beat_seconds = 60.0 / 120.0
+        track_phase = (slot.playhead * slot.duration % beat_seconds) / beat_seconds
+        metronome_phase = self.app.metronome_beat_phase()
+        self.assertAlmostEqual(track_phase, metronome_phase, places=4)
+
+    def test_mixer_regularly_corrects_synced_track_drift_to_master_phase(self):
+        first = chromatch.WaveformSlot(
+            row_id="first",
+            row=self.make_row("first.wav", bpm=120),
+            playhead=0.5125,
+            duration=10.0,
+            is_playing=True,
+            audio=np.zeros((441_000, 2), dtype=np.float32),
+            sample_rate=44_100,
+        )
+        second = chromatch.WaveformSlot(
+            row_id="second",
+            row=self.make_row("second.wav", bpm=120),
+            playhead=0.5,
+            duration=10.0,
+            is_playing=True,
+            audio=np.zeros((441_000, 2), dtype=np.float32),
+            sample_rate=44_100,
+        )
+        self.app.waveform_slots = [first, second]
+        self.app.beat_sync_enabled = True
+        self.app.metronome_enabled = True
+        self.app.playback_target_tempo = 120.0
+        self.app.playback_effective_target_tempo = 120.0
+        self.app.metronome_position_samples = 0.0
+        first.position_samples = self.app.slot_position_samples_for_playhead(first)
+        second.position_samples = self.app.slot_position_samples_for_playhead(second)
+        outdata = np.zeros((1, 2), dtype=np.float32)
+
+        self.app.mixer_callback(outdata, 1, None, None)
+
+        beat_seconds = 60.0 / 120.0
+        first_phase = (first.playhead * first.duration % beat_seconds) / beat_seconds
+        second_phase = (second.playhead * second.duration % beat_seconds) / beat_seconds
+        self.assertAlmostEqual(first_phase, second_phase, places=4)
 
     def test_late_started_beat_synced_slot_uses_advanced_master_phase(self):
         row = self.make_row(bpm=120)

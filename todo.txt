@@ -2,12 +2,13 @@
 to review :
 
 next tasks :
-- inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - still occasional playback glitches
-- analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
+- analysis to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
+- inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - handle variations in tempo and chroma (throughout a track)
 - detect cue points for structure parts and loops
 - automix (many things to define about this)
+- choose what column to include or not
 - clean the code
 
 tried already but could be better :

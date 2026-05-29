@@ -284,6 +284,78 @@ class WaveformSlot:
     filter_high_output_state: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float32))
 
 
+class StatusLog(tk.Frame):
+    def __init__(self, master, text: str = "", max_lines: int = 200, **kwargs) -> None:
+        super().__init__(master)
+        self.max_lines = max_lines
+        self.latest_text = ""
+        self.text = tk.Text(
+            self,
+            height=4,
+            wrap="word",
+            state="disabled",
+            font=("Segoe UI", 9),
+            relief="sunken",
+            borderwidth=1,
+            background="#ffffff",
+            foreground="#1f1f1f",
+            selectbackground="#b9d7ff",
+            selectforeground="#000000",
+            insertbackground="#1f1f1f",
+            padx=4,
+            pady=2,
+        )
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=scrollbar.set)
+        self.text.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+        if text:
+            self.append(text)
+        if kwargs:
+            self.configure(**kwargs)
+
+    def configure(self, cnf=None, **kwargs) -> None:
+        options = dict(cnf or {})
+        options.update(kwargs)
+        text = options.pop("text", None)
+        font = options.pop("font", None)
+        if font is not None:
+            self.text.configure(font=font)
+        options.pop("anchor", None)
+        options.pop("justify", None)
+        options.pop("wraplength", None)
+        if options:
+            try:
+                super().configure(**options)
+            except tk.TclError:
+                pass
+        if text is not None:
+            self.append(str(text))
+
+    config = configure
+
+    def cget(self, key: str):
+        if key == "text":
+            return self.latest_text
+        return super().cget(key)
+
+    def append(self, message: str) -> None:
+        self.latest_text = message
+        line = message.strip()
+        if not line:
+            return
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self.text.configure(state="normal")
+        if self.text.index("end-1c") != "1.0":
+            self.text.insert("end", "\n")
+        self.text.insert("end", f"{timestamp}  {line}")
+        first_line = int(float(self.text.index("end-1c")))
+        if first_line > self.max_lines:
+            self.text.delete("1.0", f"{first_line - self.max_lines}.0")
+        self.text.see("end")
+        self.text.configure(state="disabled")
+
+
 def fold_bpm(bpm: float) -> float:
     while bpm < 80:
         bpm *= 2
@@ -2567,6 +2639,7 @@ class TempoWindow:
         self.beat_nudge_seconds_var = tk.StringVar(value="0.010")
         self.quantize_cues_var = tk.BooleanVar(value=True)
         self.auto_target_tempo_var = tk.BooleanVar(value=True)
+        self.auto_adapt_playback_speeds_var = tk.BooleanVar(value=True)
         self.ignore_target_tempo_var = tk.BooleanVar(value=False)
         self.metronome_enabled_var = tk.BooleanVar(value=False)
         self.beat_sync_enabled_var = tk.BooleanVar(value=False)
@@ -2592,13 +2665,7 @@ class TempoWindow:
         self.suppress_target_slider_callback = False
         self.zoom_seconds = 8.0
         self.status_text = "Drop audio files or folders"
-        self.result = ttk.Label(
-            self.root,
-            text="Tempo results will appear below",
-            anchor="center",
-            justify="center",
-            wraplength=720,
-        )
+        self.result: StatusLog | None = None
 
         self._build_ui()
         self.root.bind_all("<KeyPress-Control_L>", self.set_ctrl_pressed)
@@ -2609,226 +2676,35 @@ class TempoWindow:
     def _build_ui(self) -> None:
         self.root.configure(bg="#f4f1ec")
 
-        main = ttk.Frame(self.root, padding=28)
+        main = ttk.Frame(self.root, padding=10)
         main.pack(fill="both", expand=True)
 
-        title = ttk.Label(main, text="Chromatch", font=("Segoe UI", 22, "bold"))
-        title.pack()
+        title = ttk.Label(main, text="Chromatch", font=("Segoe UI", 16, "bold"))
+        title.pack(anchor="w")
 
+        self._build_global_playback_panel(main)
         self._build_waveform_panel(main)
-
-        self.result.configure(font=("Segoe UI", 15))
-        self.result.pack(fill="x", pady=(0, 12))
-
+        self._build_track_list_tools(main)
         self._build_table(main)
-
-        actions = ttk.Frame(main)
-        actions.pack(fill="x", pady=(14, 0))
-        primary_actions = ttk.Frame(actions)
-        primary_actions.pack(fill="x")
-        secondary_actions = ttk.Frame(actions)
-        secondary_actions.pack(fill="x", pady=(4, 0))
-
-        browse = ttk.Button(primary_actions, text="Choose audio files", command=self.choose_files)
-        browse.pack(side="left")
-
-        folder = ttk.Button(primary_actions, text="Choose folder", command=self.choose_folder)
-        folder.pack(side="left", padx=(8, 0))
-
-        load_csv = ttk.Button(primary_actions, text="Load data", command=self.load_csv)
-        load_csv.pack(side="left", padx=(8, 0))
-
-        remove_selected = ttk.Button(primary_actions, text="Remove selected", command=self.remove_selected_rows)
-        remove_selected.pack(side="left", padx=(8, 0))
-
-        relink_selected = ttk.Button(primary_actions, text="Relink selected", command=self.relink_selected_row)
-        relink_selected.pack(side="left", padx=(8, 0))
-
-        analyze_selected = ttk.Button(primary_actions, text="Analyze selected", command=self.reanalyze_selected_rows)
-        analyze_selected.pack(side="left", padx=(8, 0))
-
-        clear_selected = ttk.Button(primary_actions, text="Clear selected", command=self.clear_selected_analysis_data)
-        clear_selected.pack(side="left", padx=(8, 0))
-
-        ttk.Label(primary_actions, text="Search").pack(side="left", padx=(12, 4))
-        self.search_entry = ttk.Entry(primary_actions, textvariable=self.search_text_var, width=22)
-        self.search_entry.pack(side="left")
-        self.search_entry.bind("<KeyRelease>", self.update_table_filter)
-        ttk.Button(primary_actions, text="X", width=3, command=self.clear_search).pack(side="left", padx=(4, 0))
-        self.search_field_combo = ttk.Combobox(
-            primary_actions,
-            textvariable=self.search_field_var,
-            values=SEARCH_FIELDS,
-            state="readonly",
-            width=10,
-        )
-        self.search_field_combo.pack(side="left", padx=(4, 0))
-        self.search_field_combo.bind("<<ComboboxSelected>>", self.update_table_filter)
-        ttk.Checkbutton(
-            primary_actions,
-            text="Matches only",
-            variable=self.show_matches_only_var,
-            command=self.update_table_filter,
-        ).pack(side="left", padx=(8, 0))
-
-        self.similarity_button = ttk.Button(
-            primary_actions,
-            text="Set target from selection",
-            command=self.set_similarity_target,
-            state="disabled",
-        )
-        self.similarity_button.pack(side="left", padx=(8, 0))
-        ttk.Label(primary_actions, text="Similarity").pack(side="left", padx=(12, 4))
-        self.similarity_mode_combo = ttk.Combobox(
-            primary_actions,
-            textvariable=self.similarity_mode_var,
-            values=SIMILARITY_MODES,
-            state="readonly",
-            width=18,
-        )
-        self.similarity_mode_combo.pack(side="left")
-        self.similarity_mode_combo.bind("<<ComboboxSelected>>", self.set_similarity_mode)
-        ttk.Label(primary_actions, text="Tempo gap").pack(side="left", padx=(8, 4))
-        self.similarity_tempo_gap_entry = ttk.Entry(
-            primary_actions,
-            textvariable=self.similarity_tempo_gap_var,
-            width=6,
-        )
-        self.similarity_tempo_gap_entry.pack(side="left")
-        self.similarity_tempo_gap_entry.bind("<KeyRelease>", self.update_similarity_tempo_gap)
-        self.similarity_tempo_gap_entry.bind("<FocusOut>", self.update_similarity_tempo_gap)
-        ttk.Label(primary_actions, text="BPM").pack(side="left", padx=(4, 0))
-
-        self.split_button = ttk.Button(
-            secondary_actions,
-            text="Split",
-            command=self.split_selected_at_playhead,
-            state="disabled",
-        )
-        self.split_button.pack(side="left")
-
-        self.next_part_button = ttk.Button(
-            secondary_actions,
-            text="Next part",
-            command=self.select_next_part,
-            state="disabled",
-        )
-        self.next_part_button.pack(side="left", padx=(8, 0))
-
-        self.match_cycle_button = ttk.Button(
-            secondary_actions,
-            textvariable=self.match_cycle_var,
-            command=self.cycle_selected_match_state,
-            state="disabled",
-        )
-        self.match_cycle_button.pack(side="left", padx=(8, 0))
-
-        self.update_csv_button = ttk.Button(
-            secondary_actions,
-            text="Update data",
-            command=self.update_csv,
-            state="disabled",
-        )
-        self.update_csv_button.pack(side="right", padx=(8, 0))
-
-        self.export_button = ttk.Button(
-            secondary_actions,
-            text="Export",
-            command=self.export_selected_mode,
-            state="disabled",
-        )
-        self.export_button.pack(side="right")
-
-        self.export_mode_combo = ttk.Combobox(
-            secondary_actions,
-            textvariable=self.export_mode_var,
-            values=EXPORT_MODES,
-            state="readonly",
-            width=16,
-        )
-        self.export_mode_combo.pack(side="right", padx=(8, 0))
-        self.export_mode_combo.bind("<<ComboboxSelected>>", self.refresh_export_controls)
-        ttk.Checkbutton(
-            secondary_actions,
-            text="Selected only",
-            variable=self.export_selected_only_var,
-        ).pack(side="right", padx=(8, 0))
-
-        tap_frame = ttk.Frame(main)
-        tap_frame.pack(fill="x", pady=(10, 0))
-
-        tap_button = ttk.Button(tap_frame, text="Tap tempo", command=self.tap_tempo)
-        tap_button.pack(side="left")
-
-        reset_tap = ttk.Button(tap_frame, text="Reset tap", command=self.reset_tap_tempo)
-        reset_tap.pack(side="left", padx=(8, 0))
-
-        apply_tap = ttk.Button(tap_frame, text="Apply tapped tempo", command=self.apply_tapped_tempo)
-        apply_tap.pack(side="left", padx=(8, 0))
-
-        confirm_detected = ttk.Button(
-            tap_frame,
-            text="Confirm detected tempo",
-            command=self.confirm_detected_tempo,
-        )
-        confirm_detected.pack(side="left", padx=(8, 0))
-
-        ttk.Label(tap_frame, textvariable=self.detected_selected_tempo_var).pack(side="left", padx=(14, 0))
-        ttk.Label(tap_frame, text="Tapped tempo").pack(side="left", padx=(14, 0))
-        self.tap_entry = ttk.Entry(tap_frame, textvariable=self.tapped_tempo_var, width=10)
-        self.tap_entry.pack(side="left", padx=(6, 0))
-        ttk.Label(tap_frame, text="BPM").pack(side="left", padx=(4, 0))
-        ttk.Label(tap_frame, text="Nudge").pack(side="left", padx=(10, 4))
-        ttk.Button(tap_frame, text="-", width=3, command=lambda: self.nudge_selected_tempo(-1)).pack(side="left")
-        ttk.Button(tap_frame, text="+", width=3, command=lambda: self.nudge_selected_tempo(1)).pack(side="left", padx=(2, 0))
-        self.tempo_nudge_entry = ttk.Entry(tap_frame, textvariable=self.tempo_nudge_bpm_var, width=7)
-        self.tempo_nudge_entry.pack(side="left", padx=(4, 0))
-        ttk.Label(tap_frame, text="BPM").pack(side="left", padx=(4, 0))
-        ttk.Label(tap_frame, text="Beat offset").pack(side="left", padx=(10, 4))
-        ttk.Button(tap_frame, text="-", width=3, command=lambda: self.nudge_selected_beat_offset(-1)).pack(side="left")
-        ttk.Button(tap_frame, text="+", width=3, command=lambda: self.nudge_selected_beat_offset(1)).pack(side="left", padx=(2, 0))
-        self.beat_nudge_entry = ttk.Entry(tap_frame, textvariable=self.beat_nudge_seconds_var, width=7)
-        self.beat_nudge_entry.pack(side="left", padx=(4, 0))
-        ttk.Label(tap_frame, text="s").pack(side="left", padx=(4, 0))
-        ttk.Label(tap_frame, text="Part start").pack(side="left", padx=(14, 0))
-        self.part_start_marker_entry = ttk.Entry(tap_frame, textvariable=self.part_start_marker_var, width=8)
-        self.part_start_marker_entry.pack(side="left", padx=(6, 0))
-        self.part_start_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
-        self.part_start_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
-        ttk.Button(tap_frame, text="Set start", command=self.set_selected_part_start).pack(side="left", padx=(8, 0))
-        ttk.Label(tap_frame, text="Part end").pack(side="left", padx=(14, 0))
-        self.part_end_marker_entry = ttk.Entry(tap_frame, textvariable=self.part_end_marker_var, width=8)
-        self.part_end_marker_entry.pack(side="left", padx=(6, 0))
-        self.part_end_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
-        self.part_end_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
-        ttk.Button(tap_frame, text="Set end", command=self.set_selected_part_end).pack(side="left", padx=(8, 0))
-        ttk.Label(tap_frame, text="Base").pack(side="left", padx=(14, 0))
-        self.base_chroma_entry = ttk.Entry(tap_frame, textvariable=self.base_chroma_var, width=8)
-        self.base_chroma_entry.pack(side="left", padx=(6, 0))
-        self.base_chroma_entry.bind("<Return>", self.apply_selected_base_chroma)
-        self.base_chroma_entry.bind("<KeyRelease>", self.schedule_selected_base_chroma_apply)
-        self.base_chroma_entry.bind("<FocusOut>", self.apply_selected_base_chroma_without_prompt)
-        ttk.Label(tap_frame, text="bin/Hz").pack(side="left", padx=(4, 0))
+        self._build_inspector_panel(main)
+        self._build_file_log_panel(main)
 
         self.table.drop_target_register(DND_FILES)
         self.table.dnd_bind("<<Drop>>", self.handle_drop)
         self.play_table.drop_target_register(DND_FILES)
         self.play_table.dnd_bind("<<Drop>>", self.handle_drop)
 
-    def _build_waveform_panel(self, parent: ttk.Frame) -> None:
-        panel = ttk.Frame(parent)
-        panel.pack(fill="x", pady=(16, 12))
+    def _build_global_playback_panel(self, parent: ttk.Frame) -> None:
+        section = ttk.LabelFrame(parent, text="Global playback", padding=5)
+        section.pack(fill="x", pady=(4, 4))
 
-        controls = ttk.Frame(panel)
-        controls.pack(fill="x")
-
-        ttk.Label(controls, text="Target tempo").pack(side="left")
-        self.target_tempo_entry = ttk.Entry(controls, textvariable=self.target_tempo_var, width=10)
+        ttk.Label(section, text="Target BPM").pack(side="left")
+        self.target_tempo_entry = ttk.Entry(section, textvariable=self.target_tempo_var, width=10)
         self.target_tempo_entry.pack(side="left", padx=(8, 8))
         self.target_tempo_entry.bind("<KeyRelease>", self.update_playback_target_tempo)
         self.target_tempo_entry.bind("<FocusOut>", self.update_playback_target_tempo)
         self.target_tempo_slider = ttk.Scale(
-            controls,
+            section,
             from_=60,
             to=260,
             orient="horizontal",
@@ -2837,59 +2713,251 @@ class TempoWindow:
             command=self.set_target_tempo_from_slider,
         )
         self.target_tempo_slider.bind("<Double-Button-1>", self.reset_target_tempo_slider)
-        self.target_tempo_slider.pack(side="left", padx=(0, 16))
-        ttk.Label(controls, text="Glide").pack(side="left", padx=(0, 4))
-        self.tempo_glide_entry = ttk.Entry(controls, textvariable=self.tempo_glide_seconds_var, width=6)
+        self.target_tempo_slider.pack(side="left", padx=(0, 6))
+        ttk.Checkbutton(
+            section,
+            text="Auto target",
+            variable=self.auto_target_tempo_var,
+            command=self.update_target_tempo_from_waveforms,
+        ).pack(side="left", padx=(0, 6))
+        ttk.Label(section, text="Glide").pack(side="left", padx=(2, 4))
+        self.tempo_glide_entry = ttk.Entry(section, textvariable=self.tempo_glide_seconds_var, width=6)
         self.tempo_glide_entry.pack(side="left", padx=(0, 4))
         self.tempo_glide_entry.bind("<KeyRelease>", self.update_playback_settings_from_ui)
         self.tempo_glide_entry.bind("<FocusOut>", self.update_playback_settings_from_ui)
-        ttk.Label(controls, text="s").pack(side="left", padx=(0, 16))
+        ttk.Label(section, text="s").pack(side="left", padx=(0, 6))
         ttk.Checkbutton(
-            controls,
-            text="Auto",
-            variable=self.auto_target_tempo_var,
-            command=self.update_target_tempo_from_waveforms,
-        ).pack(side="left")
-        ttk.Checkbutton(
-            controls,
-            text="Original tempo",
-            variable=self.ignore_target_tempo_var,
+            section,
+            text="Auto adapt playback speeds",
+            variable=self.auto_adapt_playback_speeds_var,
             command=self.update_playback_settings_from_ui,
-        ).pack(side="left", padx=(8, 0))
+        ).pack(side="left", padx=(0, 6))
         ttk.Checkbutton(
-            controls,
-            text="Metronome",
-            variable=self.metronome_enabled_var,
-            command=self.toggle_metronome,
-        ).pack(side="left", padx=(12, 0))
-        ttk.Checkbutton(
-            controls,
+            section,
             text="Beat sync",
             variable=self.beat_sync_enabled_var,
             command=self.update_playback_settings_from_ui,
-        ).pack(side="left", padx=(8, 0))
-        self.play_all_button = ttk.Button(controls, text="Play all", command=self.play_all_waveforms)
-        self.play_all_button.pack(side="left", padx=(16, 0))
-        self.stop_all_button = ttk.Button(controls, text="Stop all", command=self.stop_all_waveforms)
-        self.stop_all_button.pack(side="left", padx=(8, 0))
-        self.select_playing_button = ttk.Button(controls, text="Sel playing", command=self.select_playing_waveforms)
-        self.select_playing_button.pack(side="left", padx=(8, 0))
-        ttk.Label(controls, text="Beat step").pack(side="left", padx=(12, 4))
+        ).pack(side="left", padx=(6, 0))
+        ttk.Checkbutton(
+            section,
+            text="Metronome",
+            variable=self.metronome_enabled_var,
+            command=self.toggle_metronome,
+        ).pack(side="left", padx=(6, 0))
+        self.play_all_button = ttk.Button(section, text="Play all", command=self.play_all_waveforms)
+        self.play_all_button.pack(side="left", padx=(8, 0))
+        self.stop_all_button = ttk.Button(section, text="Stop all", command=self.stop_all_waveforms)
+        self.stop_all_button.pack(side="left", padx=(5, 0))
+        self.select_playing_button = ttk.Button(section, text="Sel playing", command=self.select_playing_waveforms)
+        self.select_playing_button.pack(side="left", padx=(5, 0))
+        ttk.Label(section, text="Beat jump").pack(side="left", padx=(8, 4))
         self.beat_jump_spinbox = ttk.Spinbox(
-            controls,
+            section,
             values=("0.125", "0.25", "0.5", "1", "2", "4", "8", "16", "32", "64"),
             width=12,
             textvariable=self.beat_jump_var,
         )
         self.beat_jump_spinbox.pack(side="left")
         ttk.Checkbutton(
-            controls,
+            section,
             text="Quantize cues",
             variable=self.quantize_cues_var,
+        ).pack(side="left", padx=(6, 0))
+
+    def _build_track_list_tools(self, parent: ttk.Frame) -> None:
+        section = ttk.LabelFrame(parent, text="Track list tools", padding=5)
+        section.pack(fill="x", pady=(0, 4))
+
+        ttk.Label(section, text="Search").pack(side="left", padx=(0, 4))
+        self.search_entry = ttk.Entry(section, textvariable=self.search_text_var, width=20)
+        self.search_entry.pack(side="left")
+        self.search_entry.bind("<KeyRelease>", self.update_table_filter)
+        ttk.Button(section, text="X", width=3, command=self.clear_search).pack(side="left", padx=(4, 0))
+        self.search_field_combo = ttk.Combobox(
+            section,
+            textvariable=self.search_field_var,
+            values=SEARCH_FIELDS,
+            state="readonly",
+            width=10,
+        )
+        self.search_field_combo.pack(side="left", padx=(4, 0))
+        self.search_field_combo.bind("<<ComboboxSelected>>", self.update_table_filter)
+        ttk.Checkbutton(
+            section,
+            text="Matches only",
+            variable=self.show_matches_only_var,
+            command=self.update_table_filter,
         ).pack(side="left", padx=(8, 0))
 
+        self.similarity_button = ttk.Button(
+            section,
+            text="Set target",
+            command=self.set_similarity_target,
+            state="disabled",
+        )
+        self.similarity_button.pack(side="left", padx=(8, 0))
+        ttk.Label(section, text="Similarity").pack(side="left", padx=(12, 4))
+        self.similarity_mode_combo = ttk.Combobox(
+            section,
+            textvariable=self.similarity_mode_var,
+            values=SIMILARITY_MODES,
+            state="readonly",
+            width=15,
+        )
+        self.similarity_mode_combo.pack(side="left")
+        self.similarity_mode_combo.bind("<<ComboboxSelected>>", self.set_similarity_mode)
+        ttk.Label(section, text="Tempo gap").pack(side="left", padx=(8, 4))
+        self.similarity_tempo_gap_entry = ttk.Entry(
+            section,
+            textvariable=self.similarity_tempo_gap_var,
+            width=6,
+        )
+        self.similarity_tempo_gap_entry.pack(side="left")
+        self.similarity_tempo_gap_entry.bind("<KeyRelease>", self.update_similarity_tempo_gap)
+        self.similarity_tempo_gap_entry.bind("<FocusOut>", self.update_similarity_tempo_gap)
+        ttk.Label(section, text="BPM").pack(side="left", padx=(4, 0))
+
+    def _build_inspector_panel(self, parent: ttk.Frame) -> None:
+        section = ttk.LabelFrame(parent, text="Inspector / edit selected", padding=5)
+        section.pack(fill="x", pady=(4, 4))
+
+        action_row = ttk.Frame(section)
+        action_row.pack(fill="x")
+        analyze_selected = ttk.Button(action_row, text="Analyze", command=self.reanalyze_selected_rows)
+        analyze_selected.pack(side="left")
+        analyze_selected.bind("<Button-3>", lambda _event: self.clear_selected_analysis_data())
+        clear_selected = ttk.Button(action_row, text="Clear", command=self.clear_selected_analysis_data)
+        clear_selected.pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Remove", command=self.remove_selected_rows).pack(side="left", padx=(8, 0))
+        ttk.Button(action_row, text="Relink", command=self.relink_selected_row).pack(side="left", padx=(8, 0))
+        self.split_button = ttk.Button(
+            action_row,
+            text="Split",
+            command=self.split_selected_at_playhead,
+            state="disabled",
+        )
+        self.split_button.pack(side="left", padx=(8, 0))
+        self.next_part_button = ttk.Button(
+            action_row,
+            text="Next part",
+            command=self.select_next_part,
+            state="disabled",
+        )
+        self.next_part_button.pack(side="left", padx=(8, 0))
+        self.match_cycle_button = ttk.Button(
+            action_row,
+            textvariable=self.match_cycle_var,
+            command=self.cycle_selected_match_state,
+            state="disabled",
+        )
+        self.match_cycle_button.pack(side="left", padx=(8, 0))
+
+        ttk.Label(action_row, text="Base").pack(side="left", padx=(12, 0))
+        self.base_chroma_entry = ttk.Entry(action_row, textvariable=self.base_chroma_var, width=7)
+        self.base_chroma_entry.pack(side="left", padx=(6, 0))
+        self.base_chroma_entry.bind("<Return>", self.apply_selected_base_chroma)
+        self.base_chroma_entry.bind("<KeyRelease>", self.schedule_selected_base_chroma_apply)
+        self.base_chroma_entry.bind("<FocusOut>", self.apply_selected_base_chroma_without_prompt)
+        ttk.Label(action_row, text="bin/Hz").pack(side="left", padx=(4, 8))
+        ttk.Label(action_row, text="Start").pack(side="left")
+        self.part_start_marker_entry = ttk.Entry(action_row, textvariable=self.part_start_marker_var, width=7)
+        self.part_start_marker_entry.pack(side="left", padx=(6, 0))
+        self.part_start_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
+        self.part_start_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
+        ttk.Button(action_row, text="Set", command=self.set_selected_part_start).pack(side="left", padx=(4, 0))
+        ttk.Label(action_row, text="End").pack(side="left", padx=(8, 0))
+        self.part_end_marker_entry = ttk.Entry(action_row, textvariable=self.part_end_marker_var, width=7)
+        self.part_end_marker_entry.pack(side="left", padx=(6, 0))
+        self.part_end_marker_entry.bind("<KeyRelease>", self.apply_part_marker_entries)
+        self.part_end_marker_entry.bind("<FocusOut>", self.apply_part_marker_entries_and_refresh)
+        ttk.Button(action_row, text="Set", command=self.set_selected_part_end).pack(side="left", padx=(4, 0))
+
+        rhythm_row = ttk.Frame(section)
+        rhythm_row.pack(fill="x", pady=(4, 0))
+        ttk.Label(rhythm_row, textvariable=self.detected_selected_tempo_var).pack(side="left")
+        ttk.Button(
+            rhythm_row,
+            text="Confirm detected",
+            command=self.confirm_detected_tempo,
+        ).pack(side="left", padx=(8, 0))
+        ttk.Label(rhythm_row, text="Tapped/manual").pack(side="left", padx=(14, 0))
+        self.tap_entry = ttk.Entry(rhythm_row, textvariable=self.tapped_tempo_var, width=10)
+        self.tap_entry.pack(side="left", padx=(6, 0))
+        ttk.Label(rhythm_row, text="BPM").pack(side="left", padx=(4, 0))
+        tap_button = ttk.Button(rhythm_row, text="Tap tempo", command=self.tap_tempo)
+        tap_button.pack(side="left")
+        tap_button.bind("<Button-3>", lambda _event: self.reset_tap_tempo())
+        apply_tap = ttk.Button(rhythm_row, text="Apply", command=self.apply_tapped_tempo)
+        apply_tap.pack(side="left", padx=(8, 0))
+        ttk.Label(rhythm_row, text="Nudge").pack(side="left", padx=(10, 4))
+        ttk.Button(rhythm_row, text="- BPM", width=6, command=lambda: self.nudge_selected_tempo(-1)).pack(side="left")
+        ttk.Button(rhythm_row, text="+ BPM", width=6, command=lambda: self.nudge_selected_tempo(1)).pack(side="left", padx=(2, 0))
+        self.tempo_nudge_entry = ttk.Entry(rhythm_row, textvariable=self.tempo_nudge_bpm_var, width=7)
+        self.tempo_nudge_entry.pack(side="left", padx=(4, 0))
+        ttk.Button(rhythm_row, text="Fit BPM", command=self.fit_selected_bpm_from_user_beats).pack(side="left", padx=(8, 0))
+        ttk.Label(rhythm_row, text="Beat offset").pack(side="left", padx=(10, 4))
+        ttk.Button(rhythm_row, text="< Beat", width=7, command=lambda: self.nudge_selected_beat_offset(-1)).pack(side="left")
+        ttk.Button(rhythm_row, text="Beat >", width=7, command=lambda: self.nudge_selected_beat_offset(1)).pack(side="left", padx=(2, 0))
+        self.beat_nudge_entry = ttk.Entry(rhythm_row, textvariable=self.beat_nudge_seconds_var, width=7)
+        self.beat_nudge_entry.pack(side="left", padx=(4, 0))
+        ttk.Label(rhythm_row, text="s").pack(side="left", padx=(4, 0))
+
+    def _build_file_log_panel(self, parent: ttk.Frame) -> None:
+        row = ttk.Frame(parent)
+        row.pack(fill="x", pady=(0, 0))
+        file_section = ttk.LabelFrame(row, text="File", padding=5)
+        file_section.pack(side="left", fill="y")
+
+        load_button = ttk.Menubutton(file_section, text="Load")
+        load_menu = tk.Menu(load_button, tearoff=False)
+        load_menu.add_command(label="Audio files", command=self.choose_files)
+        load_menu.add_command(label="Folder", command=self.choose_folder)
+        load_menu.add_command(label="Data file", command=self.load_csv)
+        load_button.configure(menu=load_menu)
+        load_button.grid(row=0, column=0, sticky="w")
+
+        self.update_csv_button = ttk.Button(
+            file_section,
+            text="Update data",
+            command=self.update_csv,
+            state="disabled",
+        )
+        self.update_csv_button.grid(row=0, column=4, sticky="w", padx=(8, 0))
+
+        ttk.Checkbutton(
+            file_section,
+            text="Selected only",
+            variable=self.export_selected_only_var,
+        ).grid(row=0, column=1, sticky="w", padx=(10, 0))
+        self.export_mode_combo = ttk.Combobox(
+            file_section,
+            textvariable=self.export_mode_var,
+            values=EXPORT_MODES,
+            state="readonly",
+            width=24,
+        )
+        self.export_mode_combo.grid(row=0, column=2, sticky="w", padx=(8, 0))
+        self.export_mode_combo.bind("<<ComboboxSelected>>", self.refresh_export_controls)
+        self.export_button = ttk.Button(
+            file_section,
+            text="Export",
+            command=self.export_selected_mode,
+            state="disabled",
+        )
+        self.export_button.grid(row=0, column=3, sticky="w", padx=(8, 0))
+
+        log_section = ttk.LabelFrame(row, text="Log", padding=5)
+        log_section.pack(side="left", fill="both", expand=True, padx=(6, 0))
+        self.result = StatusLog(log_section, text="Log ready")
+        self.result.configure(font=("Segoe UI", 9), anchor="w", justify="left")
+        self.result.pack(fill="both", expand=True)
+
+    def _build_waveform_panel(self, parent: ttk.Frame) -> None:
+        panel = ttk.LabelFrame(parent, text="Decks / waveforms", padding=5)
+        panel.pack(fill="x", pady=(0, 4))
+
         self.waveform_container = ttk.Frame(panel)
-        self.waveform_container.pack(fill="x", pady=(8, 0))
+        self.waveform_container.pack(fill="x")
 
         hint = ttk.Label(
             self.waveform_container,
@@ -4365,6 +4433,7 @@ class TempoWindow:
             self.set_playback_target_tempo_locked(tempo)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
+        self.sync_auto_adapted_playback_speeds()
 
     def set_target_tempo_from_slider(self, value: str) -> None:
         if self.suppress_target_slider_callback:
@@ -4378,6 +4447,7 @@ class TempoWindow:
             self.set_playback_target_tempo_locked(tempo)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
+        self.sync_auto_adapted_playback_speeds()
         self.draw_all_waveforms()
 
     def reset_target_tempo_slider(self, _event=None) -> None:
@@ -4388,6 +4458,7 @@ class TempoWindow:
             self.set_playback_target_tempo_locked(120.0)
             self.playback_ignore_target_tempo = self.ignore_target_tempo_var.get()
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
+        self.sync_auto_adapted_playback_speeds()
         self.draw_all_waveforms()
 
     def update_playback_settings_from_ui(self) -> None:
@@ -4398,7 +4469,25 @@ class TempoWindow:
             self.beat_sync_enabled = self.beat_sync_enabled_var.get()
             if self.beat_sync_enabled and not was_beat_sync_enabled:
                 self.sync_playing_slots_to_master_beat()
+        self.sync_auto_adapted_playback_speeds()
         self.draw_all_waveforms()
+
+    def sync_auto_adapted_playback_speeds(self) -> None:
+        if not self.auto_adapt_playback_speeds_var.get():
+            return
+
+        target_tempo = self.effective_playback_target_tempo()
+        if target_tempo is None or target_tempo <= 0:
+            return
+
+        for slot in self.waveform_slots:
+            if slot.use_original_tempo:
+                self.set_slot_tempo_multiplier(slot, "1.0", user_initiated=False)
+                continue
+            row_tempo = self.row_tempo_for_matching(slot.row)
+            if row_tempo is None or row_tempo <= 0:
+                continue
+            self.set_slot_tempo_multiplier(slot, str(target_tempo / row_tempo), user_initiated=False)
 
     def calculate_chroma_tempo_similarity(self, row: AnalysisRow, targets: list[AnalysisRow]) -> float | None:
         if row.chroma is None:
@@ -5235,11 +5324,11 @@ class TempoWindow:
             slot.frame = frame
 
             controls = ttk.Frame(frame)
-            controls.pack(side="left", padx=(0, 8))
+            controls.pack(fill="x", pady=(0, 2))
             top_controls = ttk.Frame(controls)
-            top_controls.pack(anchor="w")
+            top_controls.pack(side="left", anchor="w")
             bottom_controls = ttk.Frame(controls)
-            bottom_controls.pack(anchor="w", pady=(2, 0))
+            bottom_controls.pack(side="left", anchor="w", padx=(8, 0))
 
             slot.button = ttk.Button(
                 top_controls,
@@ -5249,6 +5338,12 @@ class TempoWindow:
             )
             slot.button.pack(side="left")
             slot.button.bind("<Button-3>", lambda event, slot=slot: self.start_waveform_stinger_from_event(slot))
+            ttk.Button(
+                top_controls,
+                text="<|",
+                width=4,
+                command=lambda slot=slot: self.rewind_waveform(slot),
+            ).pack(side="left", padx=(4, 0))
             select_button = ttk.Button(top_controls, text="Select", width=7)
             select_button.pack(side="left", padx=(4, 0))
             select_button.bind("<Button-1>", lambda event, slot=slot: self.select_waveform_row_from_event(slot, event))
@@ -5348,22 +5443,17 @@ class TempoWindow:
                 command=lambda slot=slot: self.set_slot_loop_point(slot),
             ).pack(side="left", padx=(4, 0))
 
-            chroma_canvas = tk.Canvas(
-                frame,
-                width=CHROMA_CANVAS_WIDTH,
-                height=54,
-                bg="#ffffff",
-                highlightthickness=1,
-                highlightbackground="#c9c1b8",
-            )
-            chroma_canvas.pack(side="right", padx=(8, 0))
-            slot.chroma_canvas = chroma_canvas
-            chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
-            chroma_canvas.bind("<Button-1>", lambda event, slot=slot: self.set_base_chroma_from_click(slot, event.x))
-            chroma_canvas.bind("<Button-3>", lambda event, slot=slot: self.clear_base_chroma(slot))
+            media = ttk.Frame(frame)
+            media.pack(fill="x")
 
-            zoom_canvas = tk.Canvas(frame, width=260, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
-            zoom_canvas.pack(side="right", padx=(8, 0))
+            canvas = tk.Canvas(media, width=150, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            canvas.pack(side="left", padx=(0, 6))
+            slot.canvas = canvas
+            canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
+            canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
+
+            zoom_canvas = tk.Canvas(media, width=260, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
+            zoom_canvas.pack(side="left", fill="x", expand=True, padx=(0, 6))
             slot.zoom_canvas = zoom_canvas
             zoom_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_zoomed_waveform(slot))
             zoom_canvas.bind("<Button-1>", lambda event, slot=slot: self.begin_zoom_drag(slot, event.x))
@@ -5374,11 +5464,20 @@ class TempoWindow:
             zoom_canvas.bind("<Button-4>", lambda event, slot=slot: self.zoom_waveform_view(slot, 120))
             zoom_canvas.bind("<Button-5>", lambda event, slot=slot: self.zoom_waveform_view(slot, -120))
 
-            canvas = tk.Canvas(frame, width=360, height=54, bg="#ffffff", highlightthickness=1, highlightbackground="#c9c1b8")
-            canvas.pack(side="left", fill="x", expand=True)
-            slot.canvas = canvas
-            canvas.bind("<Configure>", lambda event, slot=slot: self.draw_waveform(slot))
-            canvas.bind("<Button-1>", lambda event, slot=slot: self.seek_waveform(slot, event.x))
+            chroma_canvas = tk.Canvas(
+                media,
+                width=CHROMA_CANVAS_WIDTH,
+                height=54,
+                bg="#ffffff",
+                highlightthickness=1,
+                highlightbackground="#c9c1b8",
+            )
+            chroma_canvas.pack(side="right")
+            slot.chroma_canvas = chroma_canvas
+            chroma_canvas.bind("<Configure>", lambda event, slot=slot: self.draw_chroma_histogram(slot))
+            chroma_canvas.bind("<Button-1>", lambda event, slot=slot: self.set_base_chroma_from_click(slot, event.x))
+            chroma_canvas.bind("<Button-3>", lambda event, slot=slot: self.clear_base_chroma(slot))
+
             self.draw_waveform(slot)
             self.draw_zoomed_waveform(slot)
             self.draw_chroma_histogram(slot)
@@ -5758,6 +5857,18 @@ class TempoWindow:
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
 
+    def rewind_waveform(self, slot: WaveformSlot) -> None:
+        with self.mixer_lock:
+            slot.playhead = 0.0
+            slot.stinger_remaining_samples = None
+            slot.stinger_restore_position_samples = None
+            slot.stinger_restore_playhead = None
+            if slot.audio is not None:
+                slot.position_samples = 0.0
+        self.draw_waveform(slot)
+        self.draw_zoomed_waveform(slot)
+        self.draw_chroma_histogram(slot)
+
     def seek_zoomed_waveform(self, slot: WaveformSlot, x: int) -> None:
         if slot.zoom_canvas is None or slot.duration <= 0:
             return
@@ -5919,6 +6030,17 @@ class TempoWindow:
             before_drift, after_drift = drift
             message += f" (grid drift {before_drift:.3f}s -> {after_drift:.3f}s)"
         self.result.configure(text=message)
+
+    def fit_selected_bpm_from_user_beats(self) -> None:
+        selected_ids = list(self.table.selection())
+        if not selected_ids:
+            messagebox.showinfo("Chromatch", "Select one row first.")
+            return
+        slot = self.slot_by_row_id(selected_ids[-1])
+        if slot is None:
+            messagebox.showinfo("Chromatch", "Load the selected track in a deck first.")
+            return
+        self.fit_slot_bpm_from_user_beats(slot)
 
     def selected_waveform_slot(self) -> WaveformSlot | None:
         selected_ids = list(self.table.selection())
@@ -6214,18 +6336,27 @@ class TempoWindow:
         except (TypeError, ValueError, tk.TclError):
             return 4.0
 
-    def set_slot_tempo_multiplier(self, slot: WaveformSlot, value: str) -> None:
+    def set_slot_tempo_multiplier(
+        self,
+        slot: WaveformSlot,
+        value: str,
+        user_initiated: bool = True,
+        redraw: bool = True,
+    ) -> None:
         multiplier = max(0.5, min(2.0, float(value)))
         multiplier = round(multiplier, 3 if self.ctrl_pressed else 2)
+        if user_initiated:
+            self.auto_adapt_playback_speeds_var.set(False)
         with self.mixer_lock:
             slot.tempo_multiplier = multiplier
         if slot.tempo_multiplier_var is not None and abs(slot.tempo_multiplier_var.get() - multiplier) > 1e-9:
             slot.tempo_multiplier_var.set(multiplier)
         if slot.tempo_multiplier_label is not None:
             slot.tempo_multiplier_label.configure(text=f"x{multiplier:.2f}")
-        self.draw_waveform(slot)
-        self.draw_zoomed_waveform(slot)
-        self.draw_chroma_histogram(slot)
+        if redraw:
+            self.draw_waveform(slot)
+            self.draw_zoomed_waveform(slot)
+            self.draw_chroma_histogram(slot)
 
     def reset_slot_tempo_multiplier(self, slot: WaveformSlot) -> None:
         if slot.tempo_multiplier_var is not None:
@@ -6283,6 +6414,10 @@ class TempoWindow:
         slot.use_original_tempo = (
             bool(slot.original_tempo_var.get()) if slot.original_tempo_var is not None else not slot.use_original_tempo
         )
+        if slot.use_original_tempo:
+            self.set_slot_tempo_multiplier(slot, "1.0", user_initiated=False, redraw=False)
+        else:
+            self.sync_auto_adapted_playback_speeds()
         self.draw_waveform(slot)
         self.draw_zoomed_waveform(slot)
         self.draw_chroma_histogram(slot)
@@ -6295,14 +6430,7 @@ class TempoWindow:
         self.update_target_tempo_from_waveforms()
 
     def playback_rate_for_slot(self, slot: WaveformSlot) -> float:
-        if self.playback_ignore_target_tempo or slot.use_original_tempo:
-            return slot.tempo_multiplier
-
-        target_tempo = self.effective_playback_target_tempo()
-        row_tempo = self.row_tempo_for_matching(slot.row)
-        if target_tempo is None or row_tempo is None:
-            return slot.tempo_multiplier
-        return (target_tempo / row_tempo) * slot.tempo_multiplier
+        return slot.tempo_multiplier
 
     def metronome_beat_phase(self) -> float:
         tempo = self.effective_playback_target_tempo()
@@ -7051,7 +7179,7 @@ class TempoWindow:
                 processed += 1
                 path = task.path
                 task_id = self.analysis_task_id(task)
-                self.result_queue.put(("started", path.name, remaining))
+                self.result_queue.put(("started", path.name, processed, remaining))
 
                 def analyze_task():
                     estimate = None
@@ -7142,7 +7270,7 @@ class TempoWindow:
         pending_rows: list[tuple[AnalysisRow, int, int, str | None]] = []
         worker_done = False
         worker_error = None
-        last_started: tuple[str, int] | None = None
+        last_started: tuple[str, int, int] | None = None
         processed_messages = 0
         while processed_messages < ANALYSIS_RESULT_MAX_MESSAGES_PER_TICK:
             if len(pending_rows) >= ANALYSIS_RESULT_MAX_ROWS_PER_TICK:
@@ -7155,8 +7283,12 @@ class TempoWindow:
             processed_messages += 1
             kind = message[0]
             if kind == "started":
-                _, filename, remaining = message
-                last_started = (filename, remaining)
+                if len(message) >= 4:
+                    _, filename, processed, remaining = message
+                else:
+                    _, filename, remaining = message
+                    processed = 1
+                last_started = (filename, processed, remaining)
             elif kind == "row":
                 _, row, processed, remaining, task_id = message
                 pending_rows.append((row, processed, remaining, task_id))
@@ -7170,8 +7302,9 @@ class TempoWindow:
         elif worker_error is not None:
             self.result.configure(text=f"Analysis worker failed: {worker_error}")
         elif last_started is not None:
-            filename, remaining = last_started
-            self.result.configure(text=f"Analyzing {filename} ({remaining} queued)")
+            filename, processed, remaining = last_started
+            total = processed + remaining
+            self.result.configure(text=f"Analyzing {processed}/{total}: {filename} ({remaining} queued)")
 
         if worker_done:
             self._finish_analysis()
@@ -7228,12 +7361,14 @@ class TempoWindow:
                     self.table.item(row_id, values=self.row_values(row))
             if len(results) == 1:
                 action = "Analyzed"
-                self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
+                total = last_processed + last_remaining
+                self.result.configure(text=f"{action} {last_processed}/{total}; {last_remaining} queued")
             else:
                 added_count = len(results) - replaced_count
+                total = last_processed + last_remaining
                 self.result.configure(
                     text=(
-                        f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
+                        f"Processed {len(results)} results; {last_processed}/{total} analyzed; {last_remaining} queued "
                         f"({replaced_count} updated, {added_count} new)"
                     )
                 )
@@ -7244,12 +7379,14 @@ class TempoWindow:
         self.refresh_table()
         if len(results) == 1:
             action = "Analyzed"
-            self.result.configure(text=f"{action} {last_processed}; {last_remaining} queued")
+            total = last_processed + last_remaining
+            self.result.configure(text=f"{action} {last_processed}/{total}; {last_remaining} queued")
         else:
             added_count = len(results) - replaced_count
+            total = last_processed + last_remaining
             self.result.configure(
                 text=(
-                    f"Processed {len(results)} results; {last_processed} total; {last_remaining} queued "
+                    f"Processed {len(results)} results; {last_processed}/{total} analyzed; {last_remaining} queued "
                     f"({replaced_count} updated, {added_count} new)"
                 )
             )

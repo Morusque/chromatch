@@ -378,16 +378,27 @@ class ChromatchRegressionTests(unittest.TestCase):
         finally:
             self.app.draw_all_waveforms = original_draw
 
-    def test_playback_rate_uses_cached_original_tempo_flag(self):
+    def test_playback_rate_uses_per_slot_multiplier_only(self):
         row = self.make_row(bpm=100)
         slot = chromatch.WaveformSlot(row_id="track", row=row, tempo_multiplier=1.5)
 
         self.app.target_tempo_var.set("150")
         self.app.update_playback_target_tempo()
-        self.assertAlmostEqual(2.25, self.app.playback_rate_for_slot(slot))
+        self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
 
         self.app.ignore_target_tempo_var.set(True)
         self.app.update_playback_settings_from_ui()
+        self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
+
+    def test_auto_adapt_playback_speeds_sets_slot_multiplier(self):
+        row = self.make_row(bpm=100)
+        slot = chromatch.WaveformSlot(row_id="track", row=row)
+        self.app.waveform_slots = [slot]
+
+        self.app.target_tempo_var.set("150")
+        self.app.update_playback_target_tempo()
+
+        self.assertAlmostEqual(1.5, slot.tempo_multiplier)
         self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
 
     def test_tempo_glide_delays_effective_playback_tempo(self):
@@ -407,12 +418,12 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.advance_playback_tempo_glide_locked(self.app.mixer_sample_rate)
 
         self.assertAlmostEqual(150.0, self.app.playback_effective_target_tempo)
-        self.assertAlmostEqual(1.25, self.app.playback_rate_for_slot(slot))
+        self.assertAlmostEqual(1.0, self.app.playback_rate_for_slot(slot))
 
         self.app.advance_playback_tempo_glide_locked(self.app.mixer_sample_rate)
 
         self.assertAlmostEqual(180.0, self.app.playback_effective_target_tempo)
-        self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
+        self.assertAlmostEqual(1.0, self.app.playback_rate_for_slot(slot))
 
     def test_zero_tempo_glide_applies_target_immediately(self):
         self.app.target_tempo_var.set("120")
@@ -424,16 +435,19 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual(180.0, self.app.playback_effective_target_tempo)
         self.assertEqual(0, self.app.playback_tempo_glide_remaining_samples)
 
-    def test_playback_rate_uses_per_track_original_tempo_flag(self):
+    def test_per_track_original_tempo_resets_slot_multiplier(self):
         row = self.make_row(bpm=100)
         slot = chromatch.WaveformSlot(row_id="track", row=row, tempo_multiplier=1.5)
+        slot.original_tempo_var = chromatch.tk.BooleanVar(master=self.app.root, value=True)
 
         self.app.target_tempo_var.set("150")
         self.app.update_playback_target_tempo()
-        self.assertAlmostEqual(2.25, self.app.playback_rate_for_slot(slot))
-
-        slot.use_original_tempo = True
         self.assertAlmostEqual(1.5, self.app.playback_rate_for_slot(slot))
+
+        self.app.set_waveform_original_tempo(slot)
+
+        self.assertTrue(slot.use_original_tempo)
+        self.assertAlmostEqual(1.0, self.app.playback_rate_for_slot(slot))
 
     def test_set_waveform_original_tempo_updates_slot_and_redraws(self):
         row = self.make_row(bpm=100)
@@ -3547,7 +3561,8 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.app.set_slot_tempo_multiplier(slot, "0.75")
 
         self.assertAlmostEqual(0.75, slot.tempo_multiplier)
-        self.assertAlmostEqual(1.125, self.app.playback_rate_for_slot(slot))
+        self.assertAlmostEqual(0.75, self.app.playback_rate_for_slot(slot))
+        self.assertFalse(self.app.auto_adapt_playback_speeds_var.get())
 
     def test_ctrl_slider_mode_keeps_finer_multiplier_precision(self):
         row = self.make_row(bpm=100)
@@ -4371,8 +4386,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         row = self.make_row(bpm=100)
         slot = chromatch.WaveformSlot(row_id="track", row=row, duration=100.0)
         self.app.zoom_seconds = 8.0
-        self.app.target_tempo_var.set("150")
-        self.app.update_playback_target_tempo()
+        slot.tempo_multiplier = 1.5
 
         self.assertAlmostEqual(12.0, self.app.zoom_seconds_for_slot(slot))
 

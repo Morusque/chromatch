@@ -2,9 +2,8 @@
 to review :
 
 next tasks :
-- transient detection isn't ideally calibrated, it should ideally detect mostly places where beats can be placed (and a bit more if syncopeous sounds), also transients are very often detected a fixed fraction of a second too late and I'm not sure why
-- inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - reorganize the UI in sections that make more sense
+- inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - still occasional playback glitches
 - analysis and variable to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
 - handle variations in tempo and chroma (throughout a track)

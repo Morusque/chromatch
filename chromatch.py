@@ -121,6 +121,7 @@ EXPORT_CLOSEST_PAIRS = "Closest pairs"
 EXPORT_BASE_AUDIT = "Base audit"
 EXPORT_TEMPO_AUDIT = "Tempo audit"
 EXPORT_TEMPO_REFERENCE_AUDIT = "Tempo reference audit"
+EXPORT_TRANSIENT_REFERENCE_AUDIT = "Transient reference audit"
 EXPORT_TRAKTOR_NML = "Traktor NML"
 EXPORT_MODES = (
     EXPORT_CSV,
@@ -133,7 +134,12 @@ EXPORT_MODES = (
     EXPORT_BASE_AUDIT,
     EXPORT_TEMPO_AUDIT,
     EXPORT_TEMPO_REFERENCE_AUDIT,
+    EXPORT_TRANSIENT_REFERENCE_AUDIT,
     EXPORT_TRAKTOR_NML,
+)
+REFERENCE_EXPORT_MODES = (
+    EXPORT_TEMPO_REFERENCE_AUDIT,
+    EXPORT_TRANSIENT_REFERENCE_AUDIT,
 )
 UNDEFINED_TEMPO_METHOD = "undefined tempo"
 UNDEFINED_BASE_CHROMA_BIN = -1
@@ -1516,7 +1522,62 @@ def transient_token_times(
         if all(abs(index - existing) >= min_spacing_indexes for existing in selected):
             selected.append(index)
 
-    return tuple(round(index * seconds_per_sample, 6) for index in sorted(selected))
+    refined = [
+        refine_transient_token_index_to_attack(peaks, index, seconds_per_sample)
+        for index in selected
+    ]
+    return tuple(round(index * seconds_per_sample, 6) for index in sorted(set(refined)))
+
+
+def refine_transient_token_index_to_attack(
+    peaks: np.ndarray,
+    token_index: int,
+    seconds_per_sample: float,
+    search_before_seconds: float = 0.08,
+    attack_fraction: float = 0.1,
+) -> int:
+    if peaks.size < 3 or seconds_per_sample <= 0:
+        return token_index
+
+    index = max(0, min(peaks.size - 1, token_index))
+    start = max(0, index - int(round(search_before_seconds / seconds_per_sample)))
+    if index - start < 2:
+        return index
+
+    local = peaks[start : index + 1]
+    floor = float(np.percentile(local, 20))
+    peak = float(peaks[index])
+    if peak <= floor + 1e-6:
+        return index
+
+    threshold = floor + (peak - floor) * attack_fraction
+    attack_index = index
+    while attack_index > start and peaks[attack_index - 1] >= threshold:
+        attack_index -= 1
+    return attack_index
+
+
+def transient_token_times_for_file(
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+    pixels_per_second: int = ZOOM_WAVEFORM_PIXELS_PER_SECOND,
+) -> tuple[float, ...]:
+    audio, sample_rate = load_audio_mono(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    duration = len(audio) / sample_rate if sample_rate > 0 else 0.0
+    if duration <= 0:
+        return ()
+
+    width = zoom_waveform_width(duration, pixels_per_second=pixels_per_second)
+    waveform = waveform_peaks_for_duration(audio, sample_rate, width, duration)
+    offset = 0.0 if start_seconds is None else max(0.0, start_seconds)
+    return tuple(round(offset + seconds, 6) for seconds in transient_token_times(waveform, duration))
+
+
+def nearest_transient_token(target_seconds: float, tokens: tuple[float, ...]) -> float | None:
+    if not tokens:
+        return None
+    return min(tokens, key=lambda token: abs(token - target_seconds))
 
 
 def refine_beat_anchor_to_transient(
@@ -2479,6 +2540,7 @@ class TempoWindow:
         self.search_field_var = tk.StringVar(value="All")
         self.match_cycle_var = tk.StringVar(value="Match: --")
         self.export_mode_var = tk.StringVar(value=EXPORT_CSV)
+        self.export_controls_state = "disabled"
         self.show_matches_only_var = tk.BooleanVar(value=False)
         self.export_selected_only_var = tk.BooleanVar(value=False)
         self.match_count_by_uid: dict[int, int] = {}
@@ -2685,6 +2747,7 @@ class TempoWindow:
             width=16,
         )
         self.export_mode_combo.pack(side="right", padx=(8, 0))
+        self.export_mode_combo.bind("<<ComboboxSelected>>", self.refresh_export_controls)
         ttk.Checkbutton(
             secondary_actions,
             text="Selected only",
@@ -2932,8 +2995,20 @@ class TempoWindow:
         self.ctrl_pressed = False
 
     def set_export_state(self, state: str) -> None:
-        self.export_button.configure(state=state)
-        self.export_mode_combo.configure(state="readonly" if state == "normal" else "disabled")
+        self.export_controls_state = state
+        self.refresh_export_controls()
+
+    def refresh_export_controls(self, _event=None) -> None:
+        if self.is_analyzing:
+            self.export_button.configure(state="disabled")
+            self.export_mode_combo.configure(state="disabled")
+            return
+
+        mode = self.export_mode_var.get()
+        can_export_loaded_rows = self.export_controls_state == "normal" and bool(self.rows)
+        can_export_reference_audit = mode in REFERENCE_EXPORT_MODES
+        self.export_button.configure(state="normal" if can_export_loaded_rows or can_export_reference_audit else "disabled")
+        self.export_mode_combo.configure(state="readonly")
 
     def sync_table_scroll(self, scrollbar: ttk.Scrollbar, first: str, last: str) -> None:
         scrollbar.set(first, last)
@@ -7216,6 +7291,7 @@ class TempoWindow:
             EXPORT_BASE_AUDIT: self.export_base_audit,
             EXPORT_TEMPO_AUDIT: self.export_tempo_audit,
             EXPORT_TEMPO_REFERENCE_AUDIT: self.export_tempo_reference_audit,
+            EXPORT_TRANSIENT_REFERENCE_AUDIT: self.export_transient_reference_audit,
             EXPORT_TRAKTOR_NML: self.export_traktor_nml,
         }
         actions.get(mode, self.export_csv)()
@@ -8431,6 +8507,54 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             "analysis_error": analysis_error,
         }
 
+    def transient_reference_audit_records(
+        self,
+        row: AnalysisRow,
+        transient_tokens: tuple[float, ...],
+        analysis_error: str = "",
+    ) -> list[dict[str, str]]:
+        manual_beats = tuple(beat for beat in row.user_beat_seconds if np.isfinite(beat))
+        if not manual_beats:
+            return []
+
+        records = []
+        manual_bpm = row.tapped_bpm
+        for index, manual_beat in enumerate(manual_beats, start=1):
+            nearest_token = nearest_transient_token(manual_beat, transient_tokens)
+            nearest_error = None if nearest_token is None else nearest_token - manual_beat
+            beat_phase_error = None
+            double_phase_error = None
+            if nearest_token is not None and manual_bpm is not None and manual_bpm > 0:
+                beat_phase_error = beat_phase_distance_seconds(nearest_token, manual_beat, manual_bpm)
+                double_phase_error = beat_phase_distance_seconds(nearest_token, manual_beat, manual_bpm * 2.0)
+
+            records.append(
+                {
+                    "filename": row.path.name,
+                    "filepath": str(row.path),
+                    "artist": row.artist,
+                    "title": row.title,
+                    "part": self.row_part_label(row),
+                    "manual_bpm": "" if manual_bpm is None else f"{manual_bpm:.2f}",
+                    "manual_beat_index": str(index),
+                    "manual_beat_seconds": f"{manual_beat:.6f}",
+                    "nearest_transient_seconds": "" if nearest_token is None else f"{nearest_token:.6f}",
+                    "nearest_transient_error_seconds": "" if nearest_error is None else f"{nearest_error:.6f}",
+                    "nearest_transient_abs_error_seconds": "" if nearest_error is None else f"{abs(nearest_error):.6f}",
+                    "nearest_beat_phase_error_seconds": "" if beat_phase_error is None else f"{beat_phase_error:.6f}",
+                    "nearest_beat_phase_abs_error_seconds": "" if beat_phase_error is None else f"{abs(beat_phase_error):.6f}",
+                    "nearest_double_tempo_phase_error_seconds": ""
+                    if double_phase_error is None
+                    else f"{double_phase_error:.6f}",
+                    "nearest_double_tempo_phase_abs_error_seconds": ""
+                    if double_phase_error is None
+                    else f"{abs(double_phase_error):.6f}",
+                    "transient_count": str(len(transient_tokens)),
+                    "analysis_error": analysis_error,
+                }
+            )
+        return records
+
     def export_tempo_audit(self) -> None:
         rows = [
             row
@@ -8569,6 +8693,75 @@ svg {{ background: #fff; border: 1px solid #c9c1b8; }}
             return
 
         self.result.configure(text=f"Exported tempo reference audit: {Path(filename).name}")
+
+    def export_transient_reference_audit(self) -> None:
+        reference_filename = filedialog.askopenfilename(
+            filetypes=(("Chromatch JSON", "*.json"), ("All files", "*.*")),
+            initialfile="proven files 01.json",
+        )
+        if not reference_filename:
+            return
+
+        try:
+            _payload, rows = self.read_json_rows(Path(reference_filename))
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not load transient reference JSON:\n{exc}")
+            return
+
+        rows = [row for row in rows if row.user_beat_seconds]
+        if not rows:
+            messagebox.showinfo("Chromatch", "No manual beats found in the reference file.")
+            return
+
+        filename = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+            initialfile="chromatch-transient-reference-audit.csv",
+        )
+        if not filename:
+            return
+
+        fieldnames = [
+            "filename",
+            "filepath",
+            "artist",
+            "title",
+            "part",
+            "manual_bpm",
+            "manual_beat_index",
+            "manual_beat_seconds",
+            "nearest_transient_seconds",
+            "nearest_transient_error_seconds",
+            "nearest_transient_abs_error_seconds",
+            "nearest_beat_phase_error_seconds",
+            "nearest_beat_phase_abs_error_seconds",
+            "nearest_double_tempo_phase_error_seconds",
+            "nearest_double_tempo_phase_abs_error_seconds",
+            "transient_count",
+            "analysis_error",
+        ]
+        try:
+            with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+                writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+                writer.writeheader()
+                for row in rows:
+                    tokens = ()
+                    error = ""
+                    try:
+                        tokens = transient_token_times_for_file(
+                            row.path,
+                            start_seconds=row.part_start_seconds,
+                            end_seconds=row.part_end_seconds,
+                        )
+                    except Exception as exc:
+                        error = str(exc)
+                    for record in self.transient_reference_audit_records(row, tokens, error):
+                        writer.writerow(record)
+        except OSError as exc:
+            messagebox.showerror("Chromatch", f"Could not export transient reference audit:\n{exc}")
+            return
+
+        self.result.configure(text=f"Exported transient reference audit: {Path(filename).name}")
 
     def export_closest_pairs(self) -> None:
         source_rows = self.export_rows_for_scope()

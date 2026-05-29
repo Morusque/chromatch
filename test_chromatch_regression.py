@@ -1096,6 +1096,16 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(1.0, tokens[0], delta=0.03)
         self.assertAlmostEqual(5.0, tokens[1], delta=0.03)
 
+    def test_transient_token_times_moves_ramp_peak_to_attack_start(self):
+        waveform = np.zeros(1000, dtype=np.float32)
+        waveform[100:109] = np.linspace(0.0, 1.0, 9, dtype=np.float32)
+        waveform[109:160] = 1.0
+
+        tokens = chromatch.transient_token_times(waveform, duration=10.0)
+
+        self.assertEqual(1, len(tokens))
+        self.assertAlmostEqual(1.0, tokens[0], delta=0.04)
+
     def test_refine_beat_anchor_to_transient_moves_late_anchor_to_attack(self):
         sample_rate = 8_000
         audio = np.zeros(sample_rate, dtype=np.float32)
@@ -1307,6 +1317,33 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("0.500", record["current_tempo_abs_error_bpm"])
         self.assertEqual("0.020000", record["current_anchor_phase_abs_error_seconds"])
         self.assertEqual("58", record["manual_base_bin"])
+
+    def test_reference_audit_export_can_run_without_loaded_rows(self):
+        self.app.rows = []
+        self.app.set_export_state("disabled")
+
+        self.app.export_mode_var.set(chromatch.EXPORT_TRANSIENT_REFERENCE_AUDIT)
+        self.app.refresh_export_controls()
+
+        self.assertEqual("normal", str(self.app.export_button["state"]))
+        self.assertEqual("readonly", str(self.app.export_mode_combo["state"]))
+
+    def test_transient_reference_audit_record_compares_manual_beats_to_tokens(self):
+        row = chromatch.replace(
+            self.make_row("track.wav"),
+            tapped_bpm=120.0,
+            user_beat_seconds=(1.0, 1.5),
+        )
+
+        records = self.app.transient_reference_audit_records(row, (1.02, 1.25))
+
+        self.assertEqual(2, len(records))
+        self.assertEqual("1.020000", records[0]["nearest_transient_seconds"])
+        self.assertEqual("0.020000", records[0]["nearest_transient_abs_error_seconds"])
+        self.assertEqual("0.020000", records[0]["nearest_beat_phase_abs_error_seconds"])
+        self.assertEqual("1.250000", records[1]["nearest_transient_seconds"])
+        self.assertEqual("0.250000", records[1]["nearest_beat_phase_abs_error_seconds"])
+        self.assertEqual("0.000000", records[1]["nearest_double_tempo_phase_abs_error_seconds"])
 
     def test_read_json_rows_loads_chromatch_reference_file(self):
         payload = {

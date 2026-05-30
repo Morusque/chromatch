@@ -89,6 +89,7 @@ SEARCH_FIELDS = (
     "Album",
     "Tempo",
     "Agreement",
+    "Mix",
     "Similarity",
     "Chroma",
     "Base",
@@ -357,20 +358,20 @@ class StatusLog(tk.Frame):
         self.text.configure(state="disabled")
 
 
-def fold_bpm(bpm: float) -> float:
-    while bpm < 80:
+def _fold_bpm(bpm: float, low: float, high: float = 260.0) -> float:
+    while bpm < low:
         bpm *= 2
-    while bpm > 260:
+    while bpm > high:
         bpm /= 2
     return bpm
+
+
+def fold_bpm(bpm: float) -> float:
+    return _fold_bpm(bpm, 80.0)
 
 
 def fold_tapped_bpm(bpm: float) -> float:
-    while bpm < 40:
-        bpm *= 2
-    while bpm > 260:
-        bpm /= 2
-    return bpm
+    return _fold_bpm(bpm, 40.0)
 
 
 def tapped_tempo_inertia(tap_count: int) -> float:
@@ -384,42 +385,35 @@ def confidence_from_uncertainty(bpm: float, uncertainty_bpm: float) -> float:
     return max(0.0, min(100.0, 100.0 - ratio * 300.0))
 
 
-def refine_tempo_from_beats(beats: np.ndarray) -> float | None:
-    if len(beats) < 3:
+def _refine_tempo_from_timestamps(timestamps: np.ndarray, fold_fn) -> float | None:
+    if len(timestamps) < 3:
         return None
 
-    beat_indexes = np.arange(len(beats), dtype=float)
+    indexes = np.arange(len(timestamps), dtype=float)
     try:
-        interval_seconds, _offset = np.polyfit(beat_indexes, beats, 1)
+        interval_seconds, _offset = np.polyfit(indexes, timestamps, 1)
     except Exception:
         return None
 
     if not np.isfinite(interval_seconds) or interval_seconds <= 0:
         return None
 
-    return fold_bpm(60.0 / float(interval_seconds))
+    return fold_fn(60.0 / float(interval_seconds))
+
+
+def refine_tempo_from_beats(beats: np.ndarray) -> float | None:
+    return _refine_tempo_from_timestamps(beats, fold_bpm)
 
 
 def refine_tempo_from_taps(taps: np.ndarray) -> float | None:
-    if len(taps) < 3:
-        return None
-
-    tap_indexes = np.arange(len(taps), dtype=float)
-    try:
-        interval_seconds, _offset = np.polyfit(tap_indexes, taps, 1)
-    except Exception:
-        return None
-
-    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
-        return None
-
-    return fold_tapped_bpm(60.0 / float(interval_seconds))
+    return _refine_tempo_from_timestamps(taps, fold_tapped_bpm)
 
 
-def fit_tempo_grid_from_user_beats(
+def _polyfit_beat_grid(
     beat_seconds: tuple[float, ...],
     current_bpm: float,
-) -> tuple[float, float] | None:
+) -> tuple[float, float, np.ndarray, np.ndarray, float] | None:
+    """Shared setup for beat-grid polyfit. Returns (interval_s, anchor_s, beat_indexes, beats, current_interval)."""
     if len(beat_seconds) < 2 or current_bpm <= 0:
         return None
 
@@ -428,41 +422,6 @@ def fit_tempo_grid_from_user_beats(
         return None
 
     current_interval = 60.0 / current_bpm
-    if current_interval <= 0:
-        return None
-
-    beat_indexes = np.rint((beats - beats[0]) / current_interval).astype(float)
-    if np.unique(beat_indexes).size < 2:
-        return None
-
-    try:
-        interval_seconds, anchor_seconds = np.polyfit(beat_indexes, beats, 1)
-    except Exception:
-        return None
-
-    if not np.isfinite(interval_seconds) or interval_seconds <= 0:
-        return None
-    if not np.isfinite(anchor_seconds):
-        return None
-
-    return fold_bpm(60.0 / float(interval_seconds)), float(anchor_seconds)
-
-
-def tempo_grid_fit_drift_seconds(
-    beat_seconds: tuple[float, ...],
-    current_bpm: float,
-) -> tuple[float, float] | None:
-    if len(beat_seconds) < 2 or current_bpm <= 0:
-        return None
-
-    beats = np.array(sorted(beat_seconds), dtype=float)
-    if not np.all(np.isfinite(beats)):
-        return None
-
-    current_interval = 60.0 / current_bpm
-    if current_interval <= 0:
-        return None
-
     beat_indexes = np.rint((beats - beats[0]) / current_interval).astype(float)
     if np.unique(beat_indexes).size < 2:
         return None
@@ -475,6 +434,28 @@ def tempo_grid_fit_drift_seconds(
     if not np.isfinite(interval_seconds) or interval_seconds <= 0 or not np.isfinite(anchor_seconds):
         return None
 
+    return interval_seconds, anchor_seconds, beat_indexes, beats, current_interval
+
+
+def fit_tempo_grid_from_user_beats(
+    beat_seconds: tuple[float, ...],
+    current_bpm: float,
+) -> tuple[float, float] | None:
+    result = _polyfit_beat_grid(beat_seconds, current_bpm)
+    if result is None:
+        return None
+    interval_seconds, anchor_seconds, _, _, _ = result
+    return fold_bpm(60.0 / float(interval_seconds)), float(anchor_seconds)
+
+
+def tempo_grid_fit_drift_seconds(
+    beat_seconds: tuple[float, ...],
+    current_bpm: float,
+) -> tuple[float, float] | None:
+    result = _polyfit_beat_grid(beat_seconds, current_bpm)
+    if result is None:
+        return None
+    interval_seconds, anchor_seconds, beat_indexes, beats, current_interval = result
     current_grid = beats[0] + beat_indexes * current_interval
     fitted_grid = anchor_seconds + beat_indexes * interval_seconds
     return (
@@ -1080,10 +1061,17 @@ def analyze_chroma_histogram(
     smoothing: float = CHROMA_SMOOTHING,
     start_seconds: float | None = None,
     end_seconds: float | None = None,
+    *,
+    _mono: np.ndarray | None = None,
+    _sample_rate: int = 0,
 ) -> np.ndarray:
-    audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
-    mono = audio.mean(axis=1)
-    mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
+    if _mono is not None and _sample_rate > 0:
+        mono = _mono
+        sample_rate = _sample_rate
+    else:
+        audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+        mono = audio.mean(axis=1)
+        mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
 
     if mono.size < fft_size:
         raise ValueError("The file is too short to estimate chroma.")
@@ -1102,7 +1090,7 @@ def analyze_chroma_histogram(
     else:
         weights = np.ones_like(valid_freqs)
 
-    for start in range(0, len(mono) - fft_size, hop_size):
+    for start in range(0, len(mono) - fft_size + 1, hop_size):
         frame = mono[start : start + fft_size] * window
         spectrum = np.abs(np.fft.rfft(frame))[valid]
         histogram += np.bincount(bin_indices, weights=spectrum * weights, minlength=bins)
@@ -1220,6 +1208,18 @@ def merge_to_12_notes(histogram: np.ndarray) -> np.ndarray:
     return values
 
 
+def chroma_stability_score(chroma: ChromaEstimate) -> float:
+    """0-100: how concentrated the 12-note chroma is (proxy for harmonic stability over the track)."""
+    values = np.asarray(chroma.note_values, dtype=float)
+    total = float(np.sum(values))
+    if total <= 0:
+        return 0.0
+    probs = values / total
+    probs = probs[probs > 0]
+    entropy = float(-np.sum(probs * np.log(probs)))
+    return max(0.0, min(100.0, (1.0 - entropy / math.log(12)) * 100.0))
+
+
 def chroma_bin_label(bin_index: int, bins: int) -> str:
     pitch_class = (bin_index / bins) * 12.0
     nearest_pitch_class = math.floor(pitch_class + 0.5)
@@ -1325,7 +1325,16 @@ def estimate_chroma(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
 ) -> ChromaEstimate:
-    histogram = analyze_chroma_histogram(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
+    mono = audio.mean(axis=1)
+    mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
+    histogram = analyze_chroma_histogram(
+        path,
+        start_seconds=start_seconds,
+        end_seconds=end_seconds,
+        _mono=mono,
+        _sample_rate=sample_rate,
+    )
     if np.max(histogram) > 0:
         histogram = histogram / np.max(histogram)
 
@@ -1727,6 +1736,7 @@ def detect_beat_anchor_seconds(
         return None
 
     beat_seconds = float(beats[0])
+
     beat_seconds = refine_beat_anchor_to_transient(audio, sample_rate, beat_seconds)
     return offset + beat_seconds
 
@@ -1762,6 +1772,10 @@ def choose_stable_beat_anchor_seconds(
     if fallback_anchor is not None:
         fallback_phase_distance = beat_phase_distance_seconds(fallback_anchor, anchor_seconds, bpm)
         if fallback_phase_distance is not None and fallback_phase_distance <= 0.08:
+            # A fallback at essentially t=0 is an artifact (beats[0] placed at the first
+            # audio sample by librosa). In that case prefer the multi-window circular mean.
+            if fallback_anchor < 0.001:
+                return round(anchor_seconds, 6)
             return round(fallback_anchor, 6)
         if anchor_spread > anchor_limit:
             if (
@@ -2369,6 +2383,100 @@ def detect_stable_tempo_grid(
     )
 
 
+def beat_anchor_from_transients(
+    path: Path,
+    bpm: float,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float | None:
+    """Derive beat anchor from transient times using per-window analysis.
+
+    Uses the same window structure as detect_stable_beat_anchor_seconds to avoid
+    BPM-drift phase accumulation over long tracks (at 0.15% BPM error, drift
+    reaches 1 beat after ~6 minutes, making full-track phase averaging unreliable).
+    Within each ~45 s window the drift is small enough for a reliable circular mean.
+    Returns None if the windows don't converge.
+    """
+    if bpm <= 0:
+        return None
+
+    duration = audio_file_duration(path)
+    if duration is None:
+        return None
+
+    windows = tempo_analysis_windows(duration, start_seconds=start_seconds, end_seconds=end_seconds)
+    if len(windows) < 3:
+        return None
+
+    beat_period = 60.0 / bpm
+    half_period = beat_period / 2.0
+
+    window_anchors: list[float] = []
+    for ws, we in windows:
+        tokens = transient_token_times_for_file(path, start_seconds=ws, end_seconds=we)
+        if len(tokens) < 4:
+            continue
+        res = circular_mean_period(list(tokens), beat_period)
+        if res is not None and res[1] <= beat_period * 0.25:
+            window_anchors.append(res[0])
+            continue
+        # Spread too high — try half-period with majority-vote disambiguation.
+        res_half = circular_mean_period(list(tokens), half_period)
+        if res_half is None:
+            continue
+        half_anchor = res_half[0]
+        cand1 = half_anchor
+        cand2 = (half_anchor + half_period) % beat_period
+        tol = beat_period * 0.12
+
+        def count_near(c: float, tok: tuple = tokens) -> int:
+            return sum(
+                1 for t in tok
+                if min(abs(t % beat_period - c), beat_period - abs(t % beat_period - c)) <= tol
+            )
+
+        n1, n2 = count_near(cand1), count_near(cand2)
+        majority, minority = max(n1, n2), min(n1, n2)
+        if majority == 0 or (minority > 0 and majority < minority * 1.5):
+            continue
+        window_anchors.append(cand1 if n1 >= n2 else cand2)
+
+    if len(window_anchors) < 3:
+        return None
+
+    window_anchors = _robust_anchor_filter(window_anchors, bpm)
+    result = circular_mean_period(window_anchors, beat_period)
+    if result is None:
+        return None
+    anchor, spread = result
+    if spread > beat_period * 0.2:
+        return None
+    return round(anchor, 6)
+
+
+def _robust_anchor_filter(anchors: list[float], bpm: float) -> list[float]:
+    """Remove per-window anchors that are outliers relative to the majority phase.
+
+    Uses the median phase as a robust center, then keeps only anchors within
+    beat_period * 0.16 of that median. Falls back to the original list when
+    there are fewer than 4 anchors or no majority survives filtering.
+    """
+    if len(anchors) < 4 or bpm <= 0:
+        return anchors
+
+    beat_period = 60.0 / bpm
+    phases = [a % beat_period for a in anchors]
+    sorted_phases = sorted(phases)
+    median_phase = sorted_phases[len(sorted_phases) // 2]
+
+    tol = beat_period * 0.16
+    consistent = [
+        a for a, p in zip(anchors, phases)
+        if min(abs(p - median_phase), beat_period - abs(p - median_phase)) <= tol
+    ]
+    return consistent if len(consistent) >= 3 else anchors
+
+
 def detect_stable_beat_anchor_seconds(
     path: Path,
     bpm: float | None = None,
@@ -2407,6 +2515,7 @@ def detect_stable_beat_anchor_seconds(
             if half_anchor is not None and np.isfinite(half_anchor):
                 half_anchors.append(float(half_anchor))
 
+    anchors = _robust_anchor_filter(anchors, bpm)
     chosen_anchor = choose_stable_beat_anchor_seconds(bpm, fallback_anchor, anchors, half_anchors)
     return keep_stronger_fallback_anchor(path, bpm, fallback_anchor, chosen_anchor)
 
@@ -2455,6 +2564,12 @@ def detect_stable_beat_anchor_for_estimate(
 ) -> float | None:
     if estimate is None:
         return detect_stable_beat_anchor_seconds(path, None, start_seconds=start_seconds, end_seconds=end_seconds)
+
+    transient_anchor = beat_anchor_from_transients(
+        path, estimate.bpm, start_seconds=start_seconds, end_seconds=end_seconds
+    )
+    if transient_anchor is not None:
+        return transient_anchor
 
     if allow_loose_anchor_check is None:
         allow_loose_anchor_check = (
@@ -2607,6 +2722,7 @@ class TempoWindow:
         self.sort_descending = False
         self.similarity_target_ids: set[str] = set()
         self.table_headings: dict[str, str] = {}
+        self.column_visible_vars: dict[str, tk.BooleanVar] = {}
         self.similarity_mode_var = tk.StringVar(value=SIMILARITY_BASE_BPM)
         self.similarity_tempo_gap_var = tk.StringVar(value="")
         self.search_text_var = tk.StringVar(value="")
@@ -2803,7 +2919,7 @@ class TempoWindow:
             textvariable=self.similarity_mode_var,
             values=SIMILARITY_MODES,
             state="readonly",
-            width=15,
+            width=20,
         )
         self.similarity_mode_combo.pack(side="left")
         self.similarity_mode_combo.bind("<<ComboboxSelected>>", self.set_similarity_mode)
@@ -2990,6 +3106,7 @@ class TempoWindow:
             "tempo",
             "uncertainty",
             "tempo_agreement",
+            "mix",
             "similarity",
             "chroma",
             "base",
@@ -3006,6 +3123,7 @@ class TempoWindow:
             "tempo": "Tempo",
             "uncertainty": "Uncertainty",
             "tempo_agreement": "Agree",
+            "mix": "Mix",
             "similarity": "Sim",
             "chroma": "Chroma peaks",
             "base": "Base",
@@ -3020,6 +3138,9 @@ class TempoWindow:
                 text=text,
                 command=lambda column=column: self.sort_by_column(column),
             )
+        for column in columns:
+            if column != "filename":
+                self.column_visible_vars[column] = tk.BooleanVar(value=True)
 
         self.table.column("filename", width=260, anchor="w")
         self.table.column("part", width=55, anchor="center", stretch=False)
@@ -3028,6 +3149,7 @@ class TempoWindow:
         self.table.column("tempo", width=95, anchor="center")
         self.table.column("uncertainty", width=120, anchor="center")
         self.table.column("tempo_agreement", width=70, anchor="center", stretch=False)
+        self.table.column("mix", width=55, anchor="center", stretch=False)
         self.table.column("similarity", width=105, anchor="center")
         self.table.column("chroma", width=95, anchor="center")
         self.table.column("base", width=75, anchor="center", stretch=False)
@@ -3737,7 +3859,22 @@ class TempoWindow:
             self.table.selection_set(ids)
         return "break"
 
+    def _update_table_displaycolumns(self) -> None:
+        all_columns = list(self.table["columns"])
+        visible = [c for c in all_columns if self.column_visible_vars.get(c, tk.BooleanVar(value=True)).get()]
+        self.table["displaycolumns"] = visible if visible else all_columns[:1]
+
+    def _show_column_menu(self, event) -> None:
+        menu = tk.Menu(self.root, tearoff=False)
+        for col, var in self.column_visible_vars.items():
+            label = self.table_headings.get(col, col)
+            menu.add_checkbutton(label=label, variable=var, command=self._update_table_displaycolumns)
+        menu.tk_popup(event.x_root, event.y_root)
+
     def handle_target_right_click(self, event) -> str:
+        if self.table.identify_region(event.x, event.y) == "heading":
+            self._show_column_menu(event)
+            return "break"
         row_id = event.widget.identify_row(event.y)
         if not row_id:
             return "break"
@@ -4663,6 +4800,9 @@ class TempoWindow:
                 )
             score = self.similarity_score_for_row(row)
             return score if score is not None else missing_number
+        if self.sort_column == "mix":
+            score = self.row_mixability_score(row)
+            return score if score is not None else missing_number
         if self.sort_column == "chroma":
             return simple_chroma_peaks(row.chroma).lower()
         if self.sort_column == "base":
@@ -4865,6 +5005,7 @@ class TempoWindow:
             "Album": row.album,
             "Tempo": "undefined" if self.is_undefined_tempo_row(row) else "" if effective_tempo is None else f"{effective_tempo:.2f}",
             "Agreement": self.tempo_agreement_text_for_row(row),
+            "Mix": self.mixability_text_for_row(row),
             "Similarity": self.similarity_text_for_row(row),
             "Chroma": simple_chroma_peaks(row.chroma),
             "Base": self.base_text_for_row(row),
@@ -4891,6 +5032,7 @@ class TempoWindow:
 
         uncertainty_text = "" if row.uncertainty_bpm is None else f"+/- {row.uncertainty_bpm:.1f} BPM"
         agreement_text = self.tempo_agreement_text_for_row(row)
+        mix_text = self.mixability_text_for_row(row)
         similarity_text = self.similarity_text_for_row(row)
         chroma_text = simple_chroma_peaks(row.chroma)
         base_text = self.base_text_for_row(row)
@@ -4906,6 +5048,7 @@ class TempoWindow:
             tempo_text,
             uncertainty_text,
             agreement_text,
+            mix_text,
             similarity_text,
             chroma_text,
             base_text,
@@ -4922,6 +5065,23 @@ class TempoWindow:
         if row.bpm is not None:
             return "n/a"
         return ""
+
+    def row_mixability_score(self, row: AnalysisRow) -> float | None:
+        chroma_score = chroma_stability_score(row.chroma) if row.chroma is not None else None
+        tempo_score = row.tempo_agreement_score
+        if chroma_score is None and tempo_score is None:
+            return None
+        if chroma_score is None:
+            return tempo_score
+        if tempo_score is None:
+            return chroma_score
+        return (chroma_score + tempo_score) / 2.0
+
+    def mixability_text_for_row(self, row: AnalysisRow) -> str:
+        score = self.row_mixability_score(row)
+        if score is None:
+            return ""
+        return f"{score:.0f}"
 
     def handle_play_click(self, event) -> None:
         row_id = self.play_table.identify_row(event.y)
@@ -5157,8 +5317,8 @@ class TempoWindow:
             sample_rate = 0
             try:
                 audio, sample_rate = sf.read(slot.row.path, always_2d=True, dtype="float32")
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"Audio load error ({slot.row.path.name}): {exc}", file=sys.stderr)
 
             def complete(redraw: bool = True) -> None:
                 with self.mixer_lock:
@@ -5410,13 +5570,6 @@ class TempoWindow:
             )
             filter_scale.bind("<Double-Button-1>", lambda event, slot=slot: self.reset_slot_filter(slot))
             filter_scale.pack(side="left")
-            slot.original_tempo_var = tk.BooleanVar(value=slot.use_original_tempo)
-            ttk.Checkbutton(
-                bottom_controls,
-                text="Orig",
-                variable=slot.original_tempo_var,
-                command=lambda slot=slot: self.set_waveform_original_tempo(slot),
-            ).pack(side="left", padx=(4, 0))
             slot.keep_var = tk.BooleanVar(value=slot.kept)
             ttk.Checkbutton(
                 bottom_controls,
@@ -6840,7 +6993,7 @@ class TempoWindow:
                     valid = np.ones(frames, dtype=bool)
                 else:
                     sample_positions = positions
-                    valid = positions < max_index
+                    valid = (positions >= 0) & (positions < max_index)
                 if stinger_remaining is not None:
                     source_offsets = np.abs(positions - slot.position_samples)
                     valid &= source_offsets < stinger_remaining
@@ -6949,18 +7102,18 @@ class TempoWindow:
     def update_waveform_playheads(self) -> None:
         any_playing = self.metronome_enabled
         with self.mixer_lock:
-            slots = list(self.waveform_slots)
+            slot_states = [(slot, slot.is_playing, slot.playhead) for slot in self.waveform_slots]
             preview_active = self.preview_tone_frequency is not None
         if preview_active:
             any_playing = True
 
-        for slot in slots:
-            if slot.is_playing:
+        for slot, is_playing, playhead in slot_states:
+            if is_playing:
                 any_playing = True
                 self.draw_waveform(slot)
                 self.draw_zoomed_waveform(slot)
                 self.draw_chroma_histogram(slot)
-                if slot.playhead >= 1.0:
+                if playhead >= 1.0:
                     self.stop_waveform(slot)
             elif slot.button is not None:
                 slot.button.configure(text="Play")
@@ -6968,7 +7121,9 @@ class TempoWindow:
         if any_playing:
             self.root.after(50, self.update_waveform_playheads)
         else:
-            if not any(slot.is_playing for slot in self.waveform_slots) and not self.metronome_enabled:
+            with self.mixer_lock:
+                any_still_playing = any(slot.is_playing for slot in self.waveform_slots)
+            if not any_still_playing and not self.metronome_enabled:
                 self.stop_mixer_stream()
             self.waveform_update_active = False
 

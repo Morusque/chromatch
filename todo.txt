@@ -2,20 +2,18 @@
 to review :
 
 next tasks :
+- detect cue points for structure parts and loops (eg a group of a given number of bars that loops nicely, a sudden change in gain density or harmony, etc)
+- automix (many things to define about this)
 - still occasional playback glitches
-- analysis to state if a track is strongly correlated with its tempo or not and has stable chroma (ie easily "mixable") define a score for this
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - handle variations in tempo and chroma (throughout a track)
-- detect cue points for structure parts and loops
-- automix (many things to define about this)
-- choose what column to include or not
-- clean the code
 
 tried already but could be better :
 - auto beat detection could still be better, maybe refine this kind of detection on proven files
 - handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
 - revise graphviz graphs further
-- investigate automatic base detection, if this is ever possible
+- investigate automatic base detection, if this is ever possible → investigated peak + Krumhansl-Schmuckler: K-S gives 19.4% exact vs 21.2% for plain peak (458 tracks). Many worst errors are tritone-apart because the dominant chroma note genuinely IS the tritone of the user's base (eg K298.mp3 in D has G# as top note). Root cause: chromatch "base" is an editorial mix-point concept, not the global statistical key — so whole-track histogram methods cannot work reliably. Would need bass-register-only analysis or temporal/cadential data.
+- revise how the "mixable" score works
 
 check this :
 - decide if Mixxx export is still needed after Traktor NML, and which Mixxx import target should be used if yes

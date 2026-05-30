@@ -735,7 +735,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         values = self.app.row_values(row)
 
-        self.assertEqual(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS), values[9])
+        self.assertEqual(chromatch.chroma_bin_label(5, chromatch.CHROMA_BINS), values[10])
 
     def test_base_column_is_sortable_by_chroma_bin(self):
         low = chromatch.replace(self.make_row("low.wav"), base_chroma_bin=5)
@@ -1261,7 +1261,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("", values[3])
         self.assertEqual("123.03 (A)", values[4])
         self.assertNotIn("BPM", values[4])
-        self.assertEqual(3, len(values[8].split()))
+        self.assertEqual(3, len(values[9].split()))
 
     def test_row_values_show_tempo_agreement_score(self):
         row = chromatch.replace(self.make_row("track.wav"), tempo_agreement_score=87.4)
@@ -3367,7 +3367,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertEqual(chromatch.UNDEFINED_BASE_CHROMA_BIN, self.app.rows[0].base_chroma_bin)
         self.assertEqual(chromatch.UNDEFINED_BASE_CHROMA_BIN, slot.row.base_chroma_bin)
-        self.assertEqual("undefined", self.app.row_values(self.app.rows[0])[9])
+        self.assertEqual("undefined", self.app.row_values(self.app.rows[0])[10])
         self.assertIsNone(self.app.row_base_chroma_for_matching(self.app.rows[0]))
 
     def test_clicking_chroma_can_still_set_real_zero_base_bin(self):
@@ -4062,6 +4062,7 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         class Event:
             widget = Widget()
+            x = 0
             y = 0
 
         self.app.refresh_table()

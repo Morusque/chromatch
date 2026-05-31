@@ -6094,8 +6094,9 @@ class TempoWindow:
 
         base_chroma_bin = self.row_base_chroma_for_matching(slot.row)
         if base_chroma_bin is not None:
-            display_bin = int(round((base_chroma_bin + shift_bins) % CHROMA_BINS))
-            x = display_bin * bar_width
+            display_bin = int(round((base_chroma_bin + shift_bins) % CHROMA_BINS)) % CHROMA_BINS
+            x = (display_bin + 0.5) * bar_width
+            x = max(4, min(width - 4, x))
             value = float(histogram[display_bin])
             bar_height = (value / peak) * (height - 12)
             y = max(4, height - bar_height - 5)

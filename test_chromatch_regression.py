@@ -3371,12 +3371,34 @@ class ChromatchRegressionTests(unittest.TestCase):
         ]
         self.assertEqual(1, len(marker_items))
         marker_x0, _y0, marker_x1, _y1 = slot.chroma_canvas.coords(marker_items[0])
-        self.assertAlmostEqual(83.0, (marker_x0 + marker_x1) / 2)
+        self.assertAlmostEqual(83.5, (marker_x0 + marker_x1) / 2)
 
         result = self.app.clear_base_chroma(slot)
 
         self.assertEqual("break", result)
         self.assertIsNone(self.app.rows[0].base_chroma_bin)
+
+    def test_chroma_base_marker_stays_visible_at_wrapping_edges(self):
+        row = chromatch.replace(self.make_chroma_row("track.wav", 120, 80), base_chroma_bin=0)
+        row_id = self.app.row_id(row)
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row)
+        slot.chroma_canvas = chromatch.tk.Canvas(self.app.root, width=240, height=54)
+        self.app.rows = [row]
+        self.app.waveform_slots = [slot]
+
+        for base_bin, expected_x in ((0, 4.0), (chromatch.CHROMA_BINS - 1, 236.0)):
+            slot.row = chromatch.replace(slot.row, base_chroma_bin=base_bin)
+            self.app.rows = [slot.row]
+            self.app.draw_chroma_histogram(slot)
+            marker_items = [
+                item
+                for item in slot.chroma_canvas.find_all()
+                if slot.chroma_canvas.type(item) == "oval"
+                and slot.chroma_canvas.itemcget(item, "fill") == "#c40020"
+            ]
+            self.assertEqual(1, len(marker_items))
+            marker_x0, _y0, marker_x1, _y1 = slot.chroma_canvas.coords(marker_items[0])
+            self.assertAlmostEqual(expected_x, (marker_x0 + marker_x1) / 2)
 
     def test_apply_selected_base_chroma_updates_selected_rows_and_waveform_slots(self):
         row = self.make_chroma_row("track.wav", 120, 80)

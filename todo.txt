@@ -7,6 +7,7 @@ next tasks :
 - still occasional playback glitches
 - inverse associate with eq profile (define a whole eq profile (not cycling like chroma) broadly, not very detailled) so we can check tracks that compensate each other
 - handle variations in tempo and chroma (throughout a track)
+- changing the fft window size when doing chromagram seems to result in drastically different outcomes, find out why and what's best
 
 tried already but could be better :
 - auto beat detection could still be better, maybe refine this kind of detection on proven files

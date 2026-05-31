@@ -2015,6 +2015,7 @@ class ChromatchRegressionTests(unittest.TestCase):
         first = chromatch.replace(
             self.make_row("first.wav", bpm=120.0),
             row_uid=10,
+            last_modified_at="2026-05-31T20:00:00+02:00",
             cue_points=(chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)),
         )
         second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
@@ -2029,8 +2030,57 @@ class ChromatchRegressionTests(unittest.TestCase):
             self.app.load_json_path(path)
 
         self.assertEqual([10, 20], [row.row_uid for row in self.app.rows])
+        self.assertEqual("2026-05-31T20:00:00+02:00", self.app.rows[0].last_modified_at)
         self.assertEqual((chromatch.CuePoint(3.5), chromatch.CuePoint(8.0, 16.0)), self.app.rows[0].cue_points)
         self.assertEqual({(10, 20): 2}, self.app.match_links)
+
+    def test_manual_tempo_edit_updates_last_modified_at_and_table_value(self):
+        row = chromatch.replace(self.make_row("track.wav", bpm=120.0), row_uid=10)
+        row_id = self.app.row_id(row)
+        original_timestamp = chromatch.analysis_timestamp
+
+        try:
+            chromatch.analysis_timestamp = lambda: "2026-05-31T21:22:23+02:00"
+            self.app.rows = [row]
+            self.app.refresh_table()
+            self.app.table.selection_set(row_id)
+            self.app.tapped_tempo_var.set("121.5")
+
+            self.app.apply_tapped_tempo()
+        finally:
+            chromatch.analysis_timestamp = original_timestamp
+
+        self.assertEqual("2026-05-31T21:22:23+02:00", self.app.rows[0].last_modified_at)
+        values = self.app.table.item(row_id, "values")
+        self.assertEqual("2026-05-31T21:22:23+02:00", values[-1])
+
+    def test_append_json_adds_new_rows_without_replacing_current_data(self):
+        first = chromatch.replace(self.make_row("first.wav", bpm=120.0), row_uid=10)
+        second = chromatch.replace(self.make_row("second.wav", bpm=121.0), row_uid=20)
+        duplicate_first = chromatch.replace(self.make_row("first.wav", bpm=130.0), row_uid=99)
+        third = chromatch.replace(self.make_row("third.wav", bpm=122.0), row_uid=10)
+
+        with tempfile.TemporaryDirectory() as folder:
+            base = Path(folder)
+            current_path = base / "current.json"
+            append_path = base / "append.json"
+            self.app.rows = [first, second]
+            self.app.set_match(10, 20, 2)
+            self.app.write_json_path(current_path)
+            self.app.write_json_path(append_path, [duplicate_first, third])
+
+            self.app.rows = []
+            self.app.match_links = {}
+            self.app.load_json_path(current_path)
+            self.app.append_json_path(append_path)
+
+        self.assertEqual(["first.wav", "second.wav", "third.wav"], [row.path.name for row in self.app.rows])
+        self.assertEqual(120.0, self.app.rows[0].bpm)
+        self.assertEqual({(10, 20): 2}, self.app.match_links)
+        self.assertEqual(3, len({row.row_uid for row in self.app.rows}))
+        self.assertEqual("normal", str(self.app.update_csv_button["state"]))
+        self.assertIn("Appended 1 rows", self.app.result.cget("text"))
+        self.assertIn("skipped 1", self.app.result.cget("text"))
 
     def test_traktor_nml_export_contains_track_tempo_grid_cues_and_loops(self):
         row = chromatch.replace(

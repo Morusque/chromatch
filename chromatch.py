@@ -96,6 +96,7 @@ SEARCH_FIELDS = (
     "Marks",
     "Matches",
     "Part",
+    "Modified",
 )
 BASE_BPM_CLOSE_DISTANCE_BINS = CHROMA_BINS / 24
 THREE_TWO_TEMPO_RATIO_TOLERANCE = 0.055
@@ -214,6 +215,7 @@ class AnalysisRow:
     detail: str
     error: str = ""
     analyzed_at: str = ""
+    last_modified_at: str = ""
     beat_anchor_seconds: float | None = None
     beat_anchor_source: str = ""
     base_chroma_bin: int | None = None
@@ -755,6 +757,10 @@ def format_seconds_compact(seconds: float) -> str:
 
 def analysis_timestamp() -> str:
     return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def mark_row_modified(row: AnalysisRow, timestamp: str | None = None, **changes) -> AnalysisRow:
+    return replace(row, last_modified_at=timestamp or analysis_timestamp(), **changes)
 
 
 def capture_native_stderr(callback):
@@ -3119,6 +3125,7 @@ class TempoWindow:
         load_menu.add_command(label="Audio files", command=self.choose_files)
         load_menu.add_command(label="Folder", command=self.choose_folder)
         load_menu.add_command(label="Data file", command=self.load_csv)
+        load_menu.add_command(label="Append JSON", command=self.append_json)
         load_button.configure(menu=load_menu)
         load_button.grid(row=0, column=0, sticky="w")
 
@@ -3202,6 +3209,7 @@ class TempoWindow:
             "artist",
             "title",
             "album",
+            "modified",
         )
         self.table = ttk.Treeview(table_frame, columns=columns, show="headings", height=10)
         headings = {
@@ -3219,6 +3227,7 @@ class TempoWindow:
             "artist": "Artist",
             "title": "Title",
             "album": "Album",
+            "modified": "Modified",
         }
         self.table_headings = headings
         for column, text in headings.items():
@@ -3245,6 +3254,7 @@ class TempoWindow:
         self.table.column("artist", width=150, anchor="w")
         self.table.column("title", width=180, anchor="w")
         self.table.column("album", width=150, anchor="w")
+        self.table.column("modified", width=155, anchor="center")
 
         scrollbar = ttk.Scrollbar(table_frame, orient="vertical", command=self.scroll_tables)
         horizontal_scrollbar = ttk.Scrollbar(table_frame, orient="horizontal", command=self.table.xview)
@@ -3312,6 +3322,16 @@ class TempoWindow:
             return
 
         self.load_data_path(Path(filename))
+
+    def append_json(self) -> None:
+        filename = filedialog.askopenfilename(
+            filetypes=(("Chromatch JSON", "*.json"), ("All files", "*.*")),
+            initialfile="chromatch-analysis.json",
+        )
+        if not filename:
+            return
+
+        self.append_json_path(Path(filename))
 
     def load_data_path(self, path: Path) -> None:
         if path.suffix.lower() == ".json":
@@ -3395,6 +3415,43 @@ class TempoWindow:
         self.similarity_button.configure(state="disabled")
         self.refresh_table()
         self.result.configure(text=f"Loaded {len(self.rows)} rows from JSON")
+
+    def append_json_path(self, json_path: Path) -> None:
+        if self.is_analyzing:
+            messagebox.showinfo("Chromatch", "Analysis is already running.")
+            return
+
+        try:
+            _payload, rows = self.read_json_rows(json_path)
+        except Exception as exc:
+            messagebox.showerror("Chromatch", f"Could not append JSON:\n{exc}")
+            return
+
+        existing_ids = {self.row_id(row) for row in self.rows}
+        appended_rows = []
+        skipped_count = 0
+        for row in rows:
+            row_id = self.row_id(row)
+            if row_id in existing_ids:
+                skipped_count += 1
+                continue
+            existing_ids.add(row_id)
+            appended_rows.append(replace(row, row_uid=self.next_row_uid()))
+
+        if not appended_rows:
+            self.result.configure(text=f"Appended 0 rows from JSON ({skipped_count} already loaded)")
+            return
+
+        self.rows.extend(appended_rows)
+        self.ensure_row_uids()
+        self.rebuild_known_path_ids()
+        self.prune_match_links()
+        self.update_similarity_scores()
+        self.refresh_table()
+        self.set_export_state("normal")
+        self.update_csv_button.configure(state="normal" if self.current_csv_path and self.rows else "disabled")
+        skipped_text = f"; skipped {skipped_count} already loaded" if skipped_count else ""
+        self.result.configure(text=f"Appended {len(appended_rows)} rows from JSON{skipped_text}")
 
     def read_json_rows(self, json_path: Path) -> tuple[dict, list[AnalysisRow]]:
         payload = json.loads(json_path.read_text(encoding="utf-8"))
@@ -3495,6 +3552,7 @@ class TempoWindow:
             detail=record.get("detail", ""),
             error=record.get("error", ""),
             analyzed_at=record.get("analyzed_at", ""),
+            last_modified_at=record.get("last_modified_at", ""),
             beat_anchor_seconds=parse_optional_float(record.get("beat_anchor_seconds")),
             beat_anchor_source=record.get("beat_anchor_source", ""),
             base_chroma_bin=parse_base_chroma_record(record.get("base_chroma_bin")),
@@ -3626,12 +3684,17 @@ class TempoWindow:
         updated_row = None
         for row in self.rows:
             if self.row_id(row) == row_id:
-                next_row = replace(
-                    row,
-                    artist=row.artist or artist,
-                    title=row.title or title,
-                    album=row.album or album,
-                )
+                next_artist = row.artist or artist
+                next_title = row.title or title
+                next_album = row.album or album
+                next_row = row
+                if (next_artist, next_title, next_album) != (row.artist, row.title, row.album):
+                    next_row = mark_row_modified(
+                        row,
+                        artist=next_artist,
+                        title=next_title,
+                        album=next_album,
+                    )
                 changed = changed or next_row != row
                 updated_row = next_row
                 updated_rows.append(next_row)
@@ -3704,7 +3767,7 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "No selected row was found.")
             return False
 
-        updated_row = replace(target_row, path=new_path)
+        updated_row = mark_row_modified(target_row, path=new_path)
         updated_id = self.row_id(updated_row)
         existing_ids = {
             self.row_id(row)
@@ -3824,7 +3887,7 @@ class TempoWindow:
                 continue
 
             updated_rows.append(
-                replace(
+                mark_row_modified(
                     row,
                     bpm=None,
                     uncertainty_bpm=None,
@@ -4302,7 +4365,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) == row_id:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         beat_anchor_seconds=beat_anchor_seconds,
                         beat_anchor_source=row.beat_anchor_source if source is None else source,
@@ -4316,7 +4379,7 @@ class TempoWindow:
         updated_rows = []
         for row in self.rows:
             if self.row_id(row) == row_id:
-                updated_rows.append(replace(row, base_chroma_bin=base_chroma_bin))
+                updated_rows.append(mark_row_modified(row, base_chroma_bin=base_chroma_bin))
             else:
                 updated_rows.append(row)
         self.rows = updated_rows
@@ -4335,7 +4398,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) == row_id:
                 beats = tuple(sorted(set(row.user_beat_seconds + (round(beat_seconds, 6),))))
-                updated_rows.append(replace(row, user_beat_seconds=beats))
+                updated_rows.append(mark_row_modified(row, user_beat_seconds=beats))
             else:
                 updated_rows.append(row)
         self.rows = updated_rows
@@ -4365,7 +4428,7 @@ class TempoWindow:
                 refined if abs(beat - old_anchor) < 0.002 else beat
                 for beat in existing.user_beat_seconds
             )
-            updated_row = replace(
+            updated_row = mark_row_modified(
                 existing,
                 beat_anchor_seconds=refined,
                 beat_anchor_source="traktor-refined",
@@ -4384,7 +4447,7 @@ class TempoWindow:
                 nearest = min(row.user_beat_seconds, key=lambda value: abs(value - seconds))
                 if abs(nearest - seconds) <= max_distance_seconds:
                     beats = tuple(value for value in row.user_beat_seconds if value != nearest)
-                    updated_rows.append(replace(row, user_beat_seconds=beats))
+                    updated_rows.append(mark_row_modified(row, user_beat_seconds=beats))
                     changed = True
                 else:
                     updated_rows.append(row)
@@ -4432,7 +4495,7 @@ class TempoWindow:
 
             if cue_candidate is not None and cue_distance <= max_distance_seconds and cue_distance <= beat_distance:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         cue_points=tuple(cue for cue in row.cue_points if cue != cue_candidate),
                     )
@@ -4440,7 +4503,7 @@ class TempoWindow:
                 changed_kind = "loop" if cue_candidate.length_beats is not None else "cue"
             elif beat_candidate is not None and beat_distance <= max_distance_seconds:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         user_beat_seconds=tuple(value for value in row.user_beat_seconds if value != beat_candidate),
                     )
@@ -4463,7 +4526,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) == row_id:
                 cue_points = tuple(sorted(set(row.cue_points + (cue_point,)), key=lambda cue: (cue.seconds, cue.length_beats or 0.0)))
-                updated_rows.append(replace(row, cue_points=cue_points))
+                updated_rows.append(mark_row_modified(row, cue_points=cue_points))
             else:
                 updated_rows.append(row)
         self.rows = updated_rows
@@ -4903,6 +4966,8 @@ class TempoWindow:
             return row.title.lower()
         if self.sort_column == "album":
             return row.album.lower()
+        if self.sort_column == "modified":
+            return row.last_modified_at or ("0" if self.sort_descending else "z")
 
         return len(self.rows)
 
@@ -5101,6 +5166,7 @@ class TempoWindow:
             "Marks": self.row_marker_summary(row),
             "Matches": str(self.match_count_for(row.row_uid)) if row.row_uid is not None else "",
             "Part": self.row_part_label(row),
+            "Modified": row.last_modified_at,
         }
 
     def clear_tables(self) -> None:
@@ -5144,6 +5210,7 @@ class TempoWindow:
             row.artist,
             row.title,
             row.album,
+            row.last_modified_at,
         )
 
     def tempo_agreement_text_for_row(self, row: AnalysisRow) -> str:
@@ -6253,7 +6320,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) == slot.row_id:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         tapped_bpm=fitted_bpm,
                         beat_anchor_seconds=anchor_seconds,
@@ -6329,7 +6396,7 @@ class TempoWindow:
             return False
 
         old_id = slot.row_id
-        updated = replace(
+        updated = mark_row_modified(
             row,
             part_start_seconds=None if part_start <= 0 else part_start,
             part_end_seconds=None if abs(part_end - slot.duration) < 1e-6 else part_end,
@@ -6445,7 +6512,7 @@ class TempoWindow:
         applied = False
         for row in self.rows:
             if self.row_id(row) in selected_ids:
-                updated_rows.append(replace(row, base_chroma_bin=stored_base_chroma_bin))
+                updated_rows.append(mark_row_modified(row, base_chroma_bin=stored_base_chroma_bin))
                 applied = True
             else:
                 updated_rows.append(row)
@@ -6499,7 +6566,7 @@ class TempoWindow:
             messagebox.showinfo("Chromatch", "Move the playhead inside this track part before splitting.")
             return
 
-        first = replace(
+        first = mark_row_modified(
             row,
             row_uid=self.next_row_uid(),
             part_start_seconds=None if start <= 0 and row.part_start_seconds is None else start,
@@ -6507,7 +6574,7 @@ class TempoWindow:
             user_beat_seconds=tuple(beat for beat in row.user_beat_seconds if start <= beat <= split_seconds),
             cue_points=tuple(cue for cue in row.cue_points if start <= cue.seconds <= split_seconds),
         )
-        second = replace(
+        second = mark_row_modified(
             row,
             row_uid=self.next_row_uid(),
             part_start_seconds=split_seconds,
@@ -7289,7 +7356,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) in selected_ids:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         tapped_bpm=self.tapped_bpm_for_row(row, manual_bpm),
                         method="" if self.is_undefined_tempo_row(row) else row.method,
@@ -7327,7 +7394,7 @@ class TempoWindow:
                 continue
 
             updated_rows.append(
-                replace(
+                mark_row_modified(
                     row,
                     bpm=None,
                     uncertainty_bpm=None,
@@ -7390,7 +7457,7 @@ class TempoWindow:
 
             nudged_tempo = max(0.001, current_tempo + delta)
             updated_rows.append(
-                replace(
+                mark_row_modified(
                     row,
                     tapped_bpm=round(nudged_tempo, 6),
                     method="" if self.is_undefined_tempo_row(row) else row.method,
@@ -7446,7 +7513,7 @@ class TempoWindow:
                 sorted({round(max(0.0, beat_seconds + delta), 6) for beat_seconds in row.user_beat_seconds})
             )
             updated_rows.append(
-                replace(
+                mark_row_modified(
                     row,
                     beat_anchor_seconds=nudged_anchor,
                     beat_anchor_source="user-nudge" if nudged_anchor is not None else row.beat_anchor_source,
@@ -7477,7 +7544,7 @@ class TempoWindow:
         for row in self.rows:
             if self.row_id(row) in selected_ids and row.bpm is not None:
                 updated_rows.append(
-                    replace(
+                    mark_row_modified(
                         row,
                         tapped_bpm=row.bpm,
                         method="" if self.is_undefined_tempo_row(row) else row.method,
@@ -7567,6 +7634,7 @@ class TempoWindow:
                 if decoder_warnings:
                     errors.append(f"decoder warnings: {compact_decoder_warnings(decoder_warnings)}")
 
+                analyzed_at = analysis_timestamp()
                 row = AnalysisRow(
                     row_uid=None,
                     path=path,
@@ -7585,7 +7653,8 @@ class TempoWindow:
                     method="" if estimate is None else estimate.method,
                     detail="" if estimate is None else estimate.detail,
                     error="; ".join(errors),
-                    analyzed_at=analysis_timestamp(),
+                    analyzed_at=analyzed_at,
+                    last_modified_at=analyzed_at,
                     beat_anchor_seconds=beat_anchor_seconds,
                     beat_anchor_source="automatic" if beat_anchor_seconds is not None else "",
                     part_start_seconds=task.part_start_seconds,
@@ -7934,6 +8003,7 @@ class TempoWindow:
             "user_beat_seconds": encode_float_tuple(row.user_beat_seconds),
             "cue_points_json": encode_cue_points(row.cue_points),
             "analyzed_at": row.analyzed_at,
+            "last_modified_at": row.last_modified_at,
             "chroma_similarity_0_100": "" if row.chroma_similarity is None else f"{row.chroma_similarity:.2f}",
             "chroma_tempo_similarity_0_100": "" if row.chroma_tempo_similarity is None else f"{row.chroma_tempo_similarity:.2f}",
             "chroma_top_peaks": "" if row.chroma is None else row.chroma.top_peaks,
@@ -7972,6 +8042,7 @@ class TempoWindow:
             "user_beat_seconds",
             "cue_points_json",
             "analyzed_at",
+            "last_modified_at",
             "chroma_similarity_0_100",
             "chroma_tempo_similarity_0_100",
             "chroma_top_peaks",

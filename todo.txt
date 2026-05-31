@@ -10,6 +10,7 @@ next tasks :
 
 tried already but could be better :
 - auto beat detection could still be better, maybe refine this kind of detection on proven files
+- beat anchor still completely off-phase for some tracks (eg Black Tears) despite several fixes this session: robust window filtering, transient-based detection, t=0 artifact fix, advance-to-first-transient. Root cause unclear — the phase the algorithm lands on seems genuinely wrong, not just a same-phase-different-beat display issue. Benchmark (tools/tempo_anchor_benchmark.py) can help reproduce.
 - handle case where tempo is tapped over a modified tempo (because of tempo or multiplier) check if this really works, not sure
 - revise graphviz graphs further
 - investigate automatic base detection, if this is ever possible → investigated peak + Krumhansl-Schmuckler: K-S gives 19.4% exact vs 21.2% for plain peak (458 tracks). Many worst errors are tritone-apart because the dominant chroma note genuinely IS the tritone of the user's base (eg K298.mp3 in D has G# as top note). Root cause: chromatch "base" is an editorial mix-point concept, not the global statistical key — so whole-track histogram methods cannot work reliably. Would need bass-register-only analysis or temporal/cadential data.

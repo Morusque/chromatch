@@ -2555,6 +2555,35 @@ def beat_anchor_phase_spread_seconds(
     return phase[1]
 
 
+def _advance_anchor_to_first_transient(
+    anchor: float,
+    bpm: float,
+    path: Path,
+    start_seconds: float | None = None,
+    end_seconds: float | None = None,
+) -> float:
+    """Advance anchor by whole beat periods so it lands near the first audible transient.
+
+    The raw anchor phase is in [0, beat_period) but may fall in silence before
+    the music starts. Advancing by n whole beat periods gives the same beat grid
+    but places the displayed anchor marker at a musically meaningful position.
+    """
+    if bpm <= 0:
+        return anchor
+    try:
+        tokens = transient_token_times_for_file(path, start_seconds=start_seconds, end_seconds=end_seconds)
+    except Exception:
+        return anchor
+    if not tokens:
+        return anchor
+    first_transient = tokens[0]
+    if anchor >= first_transient:
+        return anchor
+    beat_period = 60.0 / bpm
+    n = round((first_transient - anchor) / beat_period)
+    return round(anchor + n * beat_period, 6)
+
+
 def detect_stable_beat_anchor_for_estimate(
     path: Path,
     estimate: TempoEstimate | None,
@@ -2563,13 +2592,14 @@ def detect_stable_beat_anchor_for_estimate(
     allow_loose_anchor_check: bool | None = None,
 ) -> float | None:
     if estimate is None:
-        return detect_stable_beat_anchor_seconds(path, None, start_seconds=start_seconds, end_seconds=end_seconds)
+        anchor = detect_stable_beat_anchor_seconds(path, None, start_seconds=start_seconds, end_seconds=end_seconds)
+        return anchor
 
     transient_anchor = beat_anchor_from_transients(
         path, estimate.bpm, start_seconds=start_seconds, end_seconds=end_seconds
     )
     if transient_anchor is not None:
-        return transient_anchor
+        return _advance_anchor_to_first_transient(transient_anchor, estimate.bpm, path, start_seconds, end_seconds)
 
     if allow_loose_anchor_check is None:
         allow_loose_anchor_check = (
@@ -2577,12 +2607,15 @@ def detect_stable_beat_anchor_for_estimate(
             or estimate.segment_agreement_score < ANCHOR_LOOSE_TEMPO_MAX_AGREEMENT_SCORE
         )
     if not allow_loose_anchor_check:
-        return detect_stable_beat_anchor_seconds(
+        anchor = detect_stable_beat_anchor_seconds(
             path,
             estimate.bpm,
             start_seconds=start_seconds,
             end_seconds=end_seconds,
         )
+        if anchor is not None:
+            anchor = _advance_anchor_to_first_transient(anchor, estimate.bpm, path, start_seconds, end_seconds)
+        return anchor
 
     try:
         loose_estimate = estimate_tempo_with_librosa(
@@ -2615,19 +2648,25 @@ def detect_stable_beat_anchor_for_estimate(
                 and tight_spread >= ANCHOR_LOOSE_TEMPO_MIN_SPREAD_SECONDS
                 and loose_spread < tight_spread
             ):
-                return detect_stable_beat_anchor_seconds(
+                anchor = detect_stable_beat_anchor_seconds(
                     path,
                     aligned_loose_bpm,
                     start_seconds=start_seconds,
                     end_seconds=end_seconds,
                 )
+                if anchor is not None:
+                    anchor = _advance_anchor_to_first_transient(anchor, aligned_loose_bpm, path, start_seconds, end_seconds)
+                return anchor
 
-    return detect_stable_beat_anchor_seconds(
+    anchor = detect_stable_beat_anchor_seconds(
         path,
         estimate.bpm,
         start_seconds=start_seconds,
         end_seconds=end_seconds,
     )
+    if anchor is not None:
+        anchor = _advance_anchor_to_first_transient(anchor, estimate.bpm, path, start_seconds, end_seconds)
+    return anchor
 
 
 def collect_audio_files(paths: list[Path]) -> list[Path]:

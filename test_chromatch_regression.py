@@ -207,6 +207,11 @@ class ChromatchRegressionTests(unittest.TestCase):
 
         self.assertAlmostEqual(0.525, interval)
 
+    def test_align_bpm_to_reference_handles_three_two_and_three_four_folds(self):
+        self.assertAlmostEqual(134.835, chromatch.align_bpm_to_reference(89.89, 133.5), places=3)
+        self.assertAlmostEqual(101.73, chromatch.align_bpm_to_reference(135.64, 100.0), places=3)
+        self.assertAlmostEqual(133.44, chromatch.align_bpm_to_reference(66.72, 133.43), places=3)
+
     def test_stable_tempo_grid_uses_segment_consensus_to_correct_bpm_and_anchor(self):
         segments = [
             chromatch.TempoGridSegment(0.0, 20.0, 120.1, 0.24, 90.0),
@@ -233,6 +238,24 @@ class ChromatchRegressionTests(unittest.TestCase):
         result = chromatch.stable_tempo_grid_from_segments(120.0, 6.0, 50.0, segments)
 
         self.assertIsNone(result)
+
+    def test_transient_vote_phase_prefers_dense_beat_grid_over_subdivisions(self):
+        beat_period = 0.5
+        beat_phase = 0.041
+        tokens = []
+        for index in range(90):
+            beat = beat_phase + index * beat_period
+            tokens.append(beat)
+            if index % 2 == 0:
+                tokens.append(beat + beat_period / 2.0)
+            if index % 5 == 0:
+                tokens.append(beat + 0.125)
+
+        phase = chromatch.beat_phase_from_transient_votes(tuple(tokens), beat_period, window_seconds=45.0)
+
+        self.assertIsNotNone(phase)
+        assert phase is not None
+        self.assertAlmostEqual(beat_phase, phase, places=3)
 
     def test_tempo_segment_agreement_scores_stable_segments_higher_than_conflicting_segments(self):
         stable = [
@@ -3865,6 +3888,36 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertTrue(self.app.analysis_table_refresh_pending)
         self.assertAlmostEqual(123.45, self.app.rows[0].bpm)
         self.assertEqual("88", self.app.table.item(row_id, "values")[6])
+
+    def test_analysis_result_updates_loaded_waveform_anchor_while_running(self):
+        row = chromatch.replace(
+            self.make_row("track.wav", bpm=None),
+            row_uid=5,
+            beat_anchor_seconds=None,
+        )
+        row_id = self.app.row_id(row)
+        updated = chromatch.replace(row, bpm=120.0, beat_anchor_seconds=3.05249, beat_anchor_source="automatic")
+        slot = chromatch.WaveformSlot(row_id=row_id, row=row, downbeat_seconds=None)
+        draws = []
+        original_draw_zoom = self.app.draw_zoomed_waveform
+        original_draw_chroma = self.app.draw_chroma_histogram
+
+        try:
+            self.app.rows = [row]
+            self.app.waveform_slots = [slot]
+            self.app.refresh_table()
+            self.app.is_analyzing = True
+            self.app.draw_zoomed_waveform = lambda updated_slot: draws.append(("zoom", updated_slot))
+            self.app.draw_chroma_histogram = lambda updated_slot: draws.append(("chroma", updated_slot))
+
+            self.app._add_result(updated, 1, 0, row_id)
+        finally:
+            self.app.draw_zoomed_waveform = original_draw_zoom
+            self.app.draw_chroma_histogram = original_draw_chroma
+
+        self.assertAlmostEqual(120.0, slot.row.bpm)
+        self.assertAlmostEqual(3.05249, slot.downbeat_seconds)
+        self.assertEqual([("zoom", slot), ("chroma", slot)], draws)
 
     def test_finish_analysis_refreshes_pending_table_once(self):
         row = self.make_row("track.wav", bpm=120.0)

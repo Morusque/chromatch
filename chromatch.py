@@ -111,6 +111,7 @@ DISAGREEMENT_SEGMENT_SUPPORT_MIN_CONFIDENCE = 60.0
 DISAGREEMENT_SEGMENT_SUPPORT_MIN_MARGIN = 25.0
 TEMPOGRAM_RESCUE_MAX_AGREEMENT_SCORE = 60.0
 TEMPOGRAM_RESCUE_MIN_CONFIDENCE = 75.0
+TEMPO_ALIGNMENT_RATIOS = (0.5, 2.0 / 3.0, 0.75, 1.0, 4.0 / 3.0, 1.5, 2.0)
 ANALYSIS_RESULT_MAX_MESSAGES_PER_TICK = 150
 ANALYSIS_RESULT_MAX_ROWS_PER_TICK = 50
 EXPORT_CSV = "CSV"
@@ -497,7 +498,7 @@ def align_bpm_to_reference(bpm: float, reference_bpm: float) -> float:
     if bpm <= 0 or reference_bpm <= 0:
         return bpm
 
-    candidates = [bpm / 2.0, bpm, bpm * 2.0]
+    candidates = [bpm * ratio for ratio in TEMPO_ALIGNMENT_RATIOS]
     return min(candidates, key=lambda candidate: abs(candidate - reference_bpm))
 
 
@@ -2383,6 +2384,51 @@ def detect_stable_tempo_grid(
     )
 
 
+def beat_phase_from_transient_votes(
+    tokens: tuple[float, ...],
+    beat_period: float,
+    window_seconds: float | None = None,
+) -> float | None:
+    if len(tokens) < 4 or beat_period <= 0:
+        return None
+
+    tolerance = max(0.015, min(0.035, beat_period * 0.07))
+    phases = sorted(set(round(float(token) % beat_period, 6) for token in tokens if np.isfinite(token)))
+    if not phases:
+        return None
+
+    expected_beats = 0.0
+    if window_seconds is not None and window_seconds > 0:
+        expected_beats = window_seconds / beat_period
+    min_support = max(4, int(expected_beats * 0.20))
+
+    best: tuple[int, float, float, list[float]] | None = None
+    for phase in phases:
+        nearby = [
+            float(token)
+            for token in tokens
+            if abs(((float(token) % beat_period - phase + beat_period / 2.0) % beat_period) - beat_period / 2.0)
+            <= tolerance
+        ]
+        if len(nearby) < min_support:
+            continue
+        total_error = sum(
+            abs(((float(token) % beat_period - phase + beat_period / 2.0) % beat_period) - beat_period / 2.0)
+            for token in nearby
+        )
+        candidate = (len(nearby), -total_error, phase, nearby)
+        if best is None or candidate[:3] > best[:3]:
+            best = candidate
+
+    if best is None:
+        return None
+
+    refined = circular_mean_period(best[3], beat_period)
+    if refined is None:
+        return best[2]
+    return round(refined[0], 6)
+
+
 def beat_anchor_from_transients(
     path: Path,
     bpm: float,
@@ -2415,6 +2461,10 @@ def beat_anchor_from_transients(
     for ws, we in windows:
         tokens = transient_token_times_for_file(path, start_seconds=ws, end_seconds=we)
         if len(tokens) < 4:
+            continue
+        voted_anchor = beat_phase_from_transient_votes(tokens, beat_period, we - ws)
+        if voted_anchor is not None:
+            window_anchors.append(voted_anchor)
             continue
         res = circular_mean_period(list(tokens), beat_period)
         if res is not None and res[1] <= beat_period * 0.25:
@@ -7631,9 +7681,14 @@ class TempoWindow:
 
         self.rebuild_known_path_ids()
 
+        updated_slots: list[WaveformSlot] = []
         for slot in self.waveform_slots:
             if slot.row_id in updated_row_ids:
-                slot.row = self.row_by_id(slot.row_id) or slot.row
+                updated_row = self.row_by_id(slot.row_id)
+                if updated_row is not None:
+                    slot.row = updated_row
+                    slot.downbeat_seconds = updated_row.beat_anchor_seconds
+                    updated_slots.append(slot)
 
         if self.is_analyzing:
             self.analysis_table_refresh_pending = True
@@ -7641,6 +7696,9 @@ class TempoWindow:
                 row = self.row_by_id(row_id)
                 if row is not None and self.table.exists(row_id):
                     self.table.item(row_id, values=self.row_values(row))
+            for slot in updated_slots:
+                self.draw_zoomed_waveform(slot)
+                self.draw_chroma_histogram(slot)
             if len(results) == 1:
                 action = "Analyzed"
                 total = last_processed + last_remaining
@@ -7659,6 +7717,9 @@ class TempoWindow:
         if self.current_similarity_target_rows() or self.table.selection():
             self.update_similarity_scores()
         self.refresh_table()
+        for slot in updated_slots:
+            self.draw_zoomed_waveform(slot)
+            self.draw_chroma_histogram(slot)
         if len(results) == 1:
             action = "Analyzed"
             total = last_processed + last_remaining

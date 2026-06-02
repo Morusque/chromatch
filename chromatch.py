@@ -70,6 +70,7 @@ CHROMA_MIN_FREQ = 20
 CHROMA_MAX_FREQ = 10_000
 CHROMA_ATTENUATION_EXPONENT = 0.5
 CHROMA_SMOOTHING = 0.2
+CHROMA_STABLE_MIN_FREQ_CYCLES = 16
 ZOOM_WAVEFORM_PIXELS_PER_SECOND = 2_400
 ZOOM_WAVEFORM_MAX_WIDTH = 720_000
 PLAYBACK_TRACK_GAIN = 0.45
@@ -1057,6 +1058,42 @@ def freq_to_cyclic_octave_position(freq: np.ndarray) -> np.ndarray:
     return pitch_class / 12.0
 
 
+def chroma_stable_fft_size(sample_rate: int, min_freq: float) -> int:
+    needed = int(np.ceil(sample_rate * CHROMA_STABLE_MIN_FREQ_CYCLES / max(float(min_freq), 20.0)))
+    return 1 << max(12, int(np.ceil(np.log2(needed))))
+
+
+def smooth_cyclic_histogram(histogram: np.ndarray, smoothing: float) -> np.ndarray:
+    bins = len(histogram)
+    if smoothing <= 0 or bins <= 12:
+        return histogram
+
+    sigma = smoothing * (bins / 12.0)
+    x = np.arange(bins)
+    dist = np.minimum(x, bins - x)
+    kernel = np.exp(-0.5 * (dist / sigma) ** 2)
+    kernel /= np.sum(kernel)
+    return np.fft.ifft(np.fft.fft(histogram) * np.fft.fft(kernel)).real
+
+
+def add_soft_chroma_bins(
+    histogram: np.ndarray,
+    positions: np.ndarray,
+    magnitudes: np.ndarray,
+    width_bins: float = 1.0,
+) -> None:
+    bins = len(histogram)
+    bin_positions = positions * bins
+    centers = np.round(bin_positions).astype(int)
+    offsets = np.arange(-2, 3)
+    all_indices = (centers[:, None] + offsets[None, :]) % bins
+    dist = np.abs(all_indices - bin_positions[:, None])
+    dist = np.minimum(dist, bins - dist)
+    local_weights = np.exp(-0.5 * (dist / width_bins) ** 2)
+    local_weights /= np.sum(local_weights, axis=1, keepdims=True)
+    np.add.at(histogram, all_indices.ravel(), (magnitudes[:, None] * local_weights).ravel())
+
+
 def analyze_chroma_histogram(
     path: Path,
     bins: int = CHROMA_BINS,
@@ -1080,40 +1117,36 @@ def analyze_chroma_histogram(
         mono = audio.mean(axis=1)
         mono = slice_audio_segment(mono, sample_rate, start_seconds, end_seconds)
 
-    if mono.size < fft_size:
+    analysis_size = chroma_stable_fft_size(sample_rate, min_freq)
+    if mono.size < analysis_size:
         raise ValueError("The file is too short to estimate chroma.")
 
     histogram = np.zeros(bins)
-    window = np.hanning(fft_size)
-    freqs = np.fft.rfftfreq(fft_size, 1 / sample_rate)
+    window = np.hanning(analysis_size)
+    freqs = np.fft.rfftfreq(analysis_size, 1 / sample_rate)
 
     valid = (freqs >= min_freq) & (freqs <= max_freq)
     valid_freqs = freqs[valid]
+    if valid_freqs.size == 0:
+        raise ValueError("No usable frequency bins were found.")
+
     positions = freq_to_cyclic_octave_position(valid_freqs)
-    bin_positions = positions * bins
-    bin_indices = np.round(bin_positions).astype(int) % bins
     if attenuation_exponent > 0:
         weights = (min_freq / valid_freqs) ** attenuation_exponent
     else:
         weights = np.ones_like(valid_freqs)
 
-    for start in range(0, len(mono) - fft_size + 1, hop_size):
-        frame = mono[start : start + fft_size] * window
+    hop = min(hop_size, analysis_size // 4)
+    width_bins = max(1.0, bins / 180.0)
+    for start in range(0, len(mono) - analysis_size + 1, hop):
+        frame = mono[start : start + analysis_size] * window
         spectrum = np.abs(np.fft.rfft(frame))[valid]
-        histogram += np.bincount(bin_indices, weights=spectrum * weights, minlength=bins)
+        add_soft_chroma_bins(histogram, positions, spectrum * weights, width_bins=width_bins)
 
     if np.max(histogram) > 0:
         histogram /= np.max(histogram)
 
-    if smoothing > 0 and bins > 12:
-        sigma = smoothing * (bins / 12.0)
-        x = np.arange(bins)
-        dist = np.minimum(x, bins - x)
-        kernel = np.exp(-0.5 * (dist / sigma) ** 2)
-        kernel /= np.sum(kernel)
-        histogram = np.fft.ifft(np.fft.fft(histogram) * np.fft.fft(kernel)).real
-
-    return histogram
+    return smooth_cyclic_histogram(histogram, smoothing)
 
 
 def render_evolving_chromagram(
@@ -1132,44 +1165,40 @@ def render_evolving_chromagram(
 
     audio, sample_rate = sf.read(path, always_2d=True, dtype="float32")
     mono = audio.mean(axis=1)
-    if mono.size < fft_size:
+    analysis_size = chroma_stable_fft_size(sample_rate, min_freq)
+    if mono.size < analysis_size:
         raise ValueError("The file is too short to render a chromagram.")
 
-    window = np.hanning(fft_size)
-    freqs = np.fft.rfftfreq(fft_size, 1 / sample_rate)
+    window = np.hanning(analysis_size)
+    freqs = np.fft.rfftfreq(analysis_size, 1 / sample_rate)
     valid = (freqs >= min_freq) & (freqs <= max_freq)
     valid_freqs = freqs[valid]
     if valid_freqs.size == 0:
         raise ValueError("No usable frequency bins were found.")
 
     positions = freq_to_cyclic_octave_position(valid_freqs)
-    bin_indices = np.round(positions * bins).astype(int) % bins
     if attenuation_exponent > 0:
         weights = (min_freq / valid_freqs) ** attenuation_exponent
     else:
         weights = np.ones_like(valid_freqs)
 
-    frame_starts = range(0, mono.size - fft_size + 1, hop_size)
+    hop = min(hop_size, analysis_size // 4)
+    width_bins = max(1.0, bins / 180.0)
+    frame_starts = range(0, mono.size - analysis_size + 1, hop)
     columns = []
     for start in frame_starts:
-        frame = mono[start : start + fft_size] * window
+        frame = mono[start : start + analysis_size] * window
         spectrum = np.abs(np.fft.rfft(frame))[valid]
-        columns.append(np.bincount(bin_indices, weights=spectrum * weights, minlength=bins))
+        column = np.zeros(bins)
+        add_soft_chroma_bins(column, positions, spectrum * weights, width_bins=width_bins)
+        columns.append(column)
 
     if not columns:
         raise ValueError("No chromagram frames were rendered.")
 
     chromagram = np.stack(columns, axis=1)
     if smoothing > 0 and bins > 12:
-        sigma = smoothing * (bins / 12.0)
-        x = np.arange(bins)
-        dist = np.minimum(x, bins - x)
-        kernel = np.exp(-0.5 * (dist / sigma) ** 2)
-        kernel /= np.sum(kernel)
-        chromagram = np.fft.ifft(
-            np.fft.fft(chromagram, axis=0) * np.fft.fft(kernel)[:, None],
-            axis=0,
-        ).real
+        chromagram = np.apply_along_axis(smooth_cyclic_histogram, 0, chromagram, smoothing)
 
     if chromagram.shape[1] > max_width:
         factor = math.ceil(chromagram.shape[1] / max_width)

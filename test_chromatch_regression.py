@@ -977,6 +977,39 @@ class ChromatchRegressionTests(unittest.TestCase):
         self.assertEqual("break", result)
         self.assertEqual(set(self.app.table.get_children()), set(self.app.table.selection()))
 
+    def test_chroma_histogram_is_stable_across_requested_fft_sizes(self):
+        sample_rate = 8_000
+        seconds = 1.5
+        t = np.linspace(0.0, seconds, int(sample_rate * seconds), endpoint=False)
+        audio = (
+            0.6 * np.sin(2 * np.pi * 220.0 * t)
+            + 0.3 * np.sin(2 * np.pi * 330.0 * t)
+            + 0.2 * np.sin(2 * np.pi * 440.0 * t)
+        ).astype(np.float32)
+
+        first = chromatch.analyze_chroma_histogram(
+            Path("tone.wav"),
+            bins=48,
+            fft_size=512,
+            hop_size=256,
+            min_freq=80,
+            max_freq=3500,
+            _mono=audio,
+            _sample_rate=sample_rate,
+        )
+        second = chromatch.analyze_chroma_histogram(
+            Path("tone.wav"),
+            bins=48,
+            fft_size=4096,
+            hop_size=256,
+            min_freq=80,
+            max_freq=3500,
+            _mono=audio,
+            _sample_rate=sample_rate,
+        )
+
+        np.testing.assert_allclose(first, second)
+
     def test_evolving_chromagram_renderer_exports_image(self):
         sample_rate = 8_000
         seconds = 1.0
@@ -992,6 +1025,7 @@ class ChromatchRegressionTests(unittest.TestCase):
                 bins=48,
                 fft_size=1024,
                 hop_size=256,
+                min_freq=80,
                 max_width=120,
                 max_freq=3500,
             )

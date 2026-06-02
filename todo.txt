@@ -1,8 +1,8 @@
 
 to review :
+- changing the fft window size when doing chromagram seems to result in drastically different outcomes, find out why and what's best -> chroma now uses affineChromagram-style stable analysis: the analysis FFT size is derived from sample rate + minimum frequency, user FFT size no longer changes stored chroma, and frequency bins are softly spread across neighboring chroma bins before cyclic smoothing
 
 next tasks :
-- changing the fft window size when doing chromagram seems to result in drastically different outcomes, find out why and what's best
 - detect cue points for structure parts and loops (eg a group of a given number of bars that loops nicely, a sudden change in gain density or harmony, etc)
 - automix (many things to define about this)
 - still occasional playback glitches
